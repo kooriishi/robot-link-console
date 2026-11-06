@@ -1,0 +1,37 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "RoboLink",
+  "version": "0.2.0",
+  "identifier": "dev.robolink.console",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "RoboLink · 机器人调试台",
+        "width": 1440,
+        "height": 960,
+        "minWidth": 960,
+        "minHeight": 680,
+        "center": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' asset: http://asset.localhost; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage"],
+    "category": "Utility",
+    "shortDescription": "Linux 调试台，用于无头机器人 SSH 与外设调试",
+    "longDescription": "运行在 Linux 开发机上的机器人调试控制台，支持直连以太网与 OpenSSH。",
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.png"]
+  }
+}

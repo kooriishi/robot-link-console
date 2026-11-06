@@ -1,0 +1,23 @@
+[package]
+name = "robot-link-console"
+version = "0.2.0"
+description = "Linux desktop console for headless robot debugging over direct Ethernet and SSH"
+authors = ["RoboLink contributors"]
+edition = "2021"
+
+[lib]
+name = "robot_link_console_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portable-pty = "0.9"
+regex = "1"
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+socket2 = "0.6"
