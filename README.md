@@ -1,59 +1,71 @@
 # RoboLink · 机器人调试台
 
-RoboLink 是运行在 Linux 开发机上的桌面 GUI，用 SSH 管理 Linux 机器人。目标拓扑是开发机与机器人用一根以太网线直接相连，不经过路由器或交换机；机器人内部 Wi‑Fi 是独立的远端控制对象。
+RoboLink 是运行在 Linux 开发机上的桌面 GUI，用 SSH 管理 Linux 机器人。目标拓扑是开发机与机器人用一根以太网线直接相连，不经过路由器或交换机；机器人内部 Wi-Fi 是独立的远端控制对象。发现、选择策略、配置临时地址、启动/停止 DHCP 和建立 SSH 连接都在图形界面中完成，不提供面向用户的发现 CLI。
 
 ## 版本状态
 
-当前源码版本为 **v0.3.0 测试候选**。这一版新增多网口 ARP 被动发现、设备候选 IP/MAC/网卡标注，以及用户确认后给开发机物理有线接口添加和清理临时 IPv4 地址的流程。尚未完成真实硬件验收，**没有创建 GitHub Release**；收到测试包后请先在自己的 Ubuntu 22.04 机器人上验证，再决定是否发布。
+当前源码为 **v0.4.0 测试候选**，在 v0.3.0 基础上把需求中的四组设备发现策略接入“网络与 Wi-Fi”页面，并修正扫描时的链路检测与授权错误分类。**没有创建 GitHub Release**，也没有真实机器人硬件验收；请先在自己的 Ubuntu 22.04.5 开发机和机器人上试用，再决定是否发布。
 
-## 主要功能
+已完成桌面后端 13 项、网络 helper 21 项单元测试，两部分零警告 Clippy 检查，以及 TypeScript/Vite 生产构建。最终 Debian 包已在隔离 Ubuntu 22.04 用户空间安装，并以普通用户启动出 1440×960 原生窗口；应用与 helper 的 GLIBC 最高要求均为 2.34。这些仅是自动化、模拟界面与启动冒烟检查，不表示已验证真机发现、DHCP 分配或 SSH 登录。
 
-- 通过 SSH 管理多个 Linux 机器人。首次连接需经可信渠道核对 SSH 主机指纹；后续指纹变化会阻断连接。
-- 同时监听所有已连接的物理有线网口 8 秒，展示 ARP 源 IP、MAC、来源网卡和证据类型；只探测用户选择的单个 TCP 端口（默认 22），且仅当系统路由指向该直连接口时报告端口状态。
-- 可在明确确认后给选定的开发机有线网口增加一条临时 IPv4。授权 helper 会检查地址格式、重复地址和重叠路由；默认在 SSH 会话结束时清理，也可以选择保持并手动移除。
-- 通过已验证的 SSH 连接读取机器人概览、systemd 服务、NetworkManager Wi‑Fi、BlueZ 蓝牙、PipeWire/PulseAudio 默认音频设备与音量，以及 ALSA 硬件 PCM 端点。
-- 提供 SSH 交互终端、高风险命令确认、多行粘贴预览、本地诊断记录和浅色/深色模式。
+## 可选设备发现策略
 
-RoboLink 不提供 DHCP server、不猜测任意静态 IP、不自动修改机器人端网络，也不会替开发机改 Wi‑Fi、DNS、默认网关或防火墙。ARP 只是一种发现证据：不发 ARP 的静默设备可能无法扫描到；MAC/IP/TCP 端口也不能替代 SSH 身份核验。
+| 策略 | GUI 中的选择与行为 |
+|---|---|
+| A · 被动发现 | ARP Request/Reply、Gratuitous ARP、ARP Probe；DHCP Discover/Request；IPv6 Neighbor Discovery；mDNS 报文源地址。分别选择，展示接口、IP、MAC 与证据。 |
+| B · 主动验证 | 对已知候选进行定向 ARP、可选 ICMP 和指定单个 TCP 端口验证，默认 SSH 端口 22，可自定义。不会遍历任意子网或端口范围；Ping 失败不等于设备离线。 |
+| C · DHCP 发现 | 默认不启动。用户选择物理有线接口并确认后，启动本应用专属、单接口 DHCP Server；仅供直连 SSH，不下发默认网关和 DNS、不共享 Internet。可查看状态、停止并清理自身配置；自身 DHCPACK 日志仅提供待复验的缓存候选。 |
+| D · Link-local | IPv4 `169.254/16` 的报文/邻居候选与 IPv6 Link-local 发现。IPv6 地址携带 `%网卡名` scope，贯穿验证和 SSH 连接；不会穷举整个 `/16`。 |
 
-## Ubuntu 22.04 安装
+以被动、低干扰方式优先收集证据；B 类主动验证仅限候选地址，IPv6 Link-local 可选策略另有受限全节点探测。可以选择所有物理有线接口或指定接口，每个候选保留对应网卡。断开的接口会跳过，不让其他接口的扫描一起失败。物理链路统一读取内核 carrier 状态，不再错误依赖 sysfs `flags` 中并不可靠的链路位。
 
-请使用项目维护者提供的 `RoboLink_0.3.0_ubuntu22.04_amd64.deb` 测试候选包，不要从不明网站下载，也不要把它当作正式 GitHub Release。下载后可在 Ubuntu 文件管理器里双击 `.deb`，使用“应用中心/软件安装”打开并点击“安装”；也可以运行：
+ARP Probe、DHCP 请求地址、IPv6 DAD 和邻居缓存都是不同强度的候选证据。一般 ARP 请求中的目标 IP 不会被当作对端地址；缓存也不证明当前接入的是原设备。**任何策略都不能保证发现任意静默的未知静态 IP，IP/MAC/TCP 可达也不能替代 SSH 身份核验。**
 
-```bash
-sudo apt install ./RoboLink_0.3.0_ubuntu22.04_amd64.deb
-```
+## 主要功能与安全边界
 
-然后从系统应用列表启动 **RoboLink**。开发机和机器人之间的连接步骤、授权说明和故障排查见[第一次直连 Linux 机器人操作手册](docs/first-direct-connection.md)。
+- 多目标 SSH 管理、首连主机指纹核验和后续密钥变化阻断；支持自定义用户名和 SSH 端口。
+- 用户明确确认后，为选定物理有线网口附加一个临时 IPv4。添加前检查地址、路由重叠和重复地址；默认在 SSH 会话结束时清理，也可保持并手动移除。ARP 不携带掩码，普通地址的 `/24` 只是可编辑假设。
+- DHCP 由独立受限 helper 管理，只清理本应用记录的服务和地址，不终止系统原有 dnsmasq，不删除用户 NetworkManager 连接。应用异常退出后，可查询并清理 `/run` 中的自身记录。
+- 授权未完成/取消、授权代理或 helper 启动失败、授权后的网络操作失败分开显示；不把所有失败都说成“授权失败”。
+- 通过已验证 SSH 读取机器人概览、systemd、NetworkManager Wi-Fi、BlueZ、PipeWire/PulseAudio 和 ALSA 硬件 PCM 清单。
+- 交互终端、高风险命令确认、多行粘贴预览、本地诊断记录和浅色/深色切换。
 
-测试包以 Ubuntu 22.04 amd64 为构建目标，最高要求 GLIBC 2.34。其他发行版或 CPU 架构需要单独构建和验证。应用依赖 Ubuntu 桌面版的 WebKitGTK 4.1（至少 2.38）、GTK、OpenSSH、iproute2 和 polkit；机器人端不需要安装 RoboLink。若安装器提示 WebKitGTK 版本不足，请先用“软件更新器”安装 Ubuntu 22.04 更新，或运行 `sudo apt update` 后重试，不要从不明网站单独下载系统库。
+整个 GUI 不以 root 运行。应用不会主动修改机器人的地址、Wi-Fi 默认网关或 DNS，不会关闭防火墙。DHCP 仅适用于你确认的一根网线直连，不应在办公网络或共享 LAN 上启动。当前不实现电脑向机器人共享 Internet；机器人对 DHCP 的具体行为仍需实机验证。
 
-## 从源码运行与构建
+## Ubuntu 22.04 安装与试用
 
-需要 Node.js/npm、Rust/Cargo，以及 Tauri Linux 开发依赖（Ubuntu 22.04 可安装 `libwebkit2gtk-4.1-dev`、`build-essential`、`curl`、`wget`、`file`、`libxdo-dev`、`libssl-dev`、`librsvg2-dev`、`libayatana-appindicator3-dev`）。浏览器模式仅为界面演示，不会连接真实机器人。
+收到 `RoboLink_0.4.0_ubuntu22.04_amd64.deb` 后，在 Ubuntu 文件管理器里双击，用“应用中心/软件安装”打开并点击“安装”，然后从系统应用列表启动 **RoboLink**。无需在机器人端安装 RoboLink。详细图形界面操作见[第一次直连 Linux 机器人](docs/first-direct-connection.md)。
+
+测试包以 Ubuntu 22.04 amd64 用户空间构建，最高要求 GLIBC 2.34。需要 WebKitGTK 4.1 至少 2.38、GTK、OpenSSH、iproute2、polkit、iputils-ping 和 dnsmasq-base；dnsmasq-base 提供受限 DHCP 使用的二进制，不代表 RoboLink 会默认启动 DHCP 服务。若桌面安装器提示依赖不足，请先使用 Ubuntu“软件更新器”，不要从不明网站单独下载系统库。其他发行版/CPU 架构需要单独构建与验证。
+
+## 开发与构建
+
+以下仅供项目开发，不是用户发现设备的操作流程。需要 Node.js/npm、Rust/Cargo 和 Tauri Linux 开发依赖。浏览器入口是视觉演示，不会连接真实机器人。
 
 ```bash
 npm install
 npm run dev           # 浏览器 UI 演示
 npm run app:dev       # Tauri 桌面程序
-npm run app:build     # 构建 Debian 安装包（只构建 .deb）
-npm run test:rust     # 构建 helper，并运行主应用和 helper 的 Rust 测试
-npm run build         # TypeScript + Vite 前端生产构建
+npm run app:build     # 构建 Debian 候选安装包
+npm run test:rust     # 主应用和受限 helper 的单元测试
+npm run build         # TypeScript + Vite 生产构建
 ```
 
-建议在 Ubuntu 22.04 或等价的 Jammy 容器中构建；在较新的发行版构建可能抬高所需 GLIBC 版本。`app:build` 会先单独构建受限网络 helper，并将其随 Debian 包安装；helper 仅在用户确认网络操作时由系统授权窗口调用。不要手动把它改成宽泛的 root shell 或让整个 GUI 以 root 身份运行。
+应在 Ubuntu 22.04 或等价 Jammy 用户空间构建，避免抬高 GLIBC 要求。helper 必须由系统包管理器安装为 root 所有、普通用户不可改写；源码开发模式不会启用不安全的本机提权。不要把它改成通用 root shell，也不要以 root 启动整个 GUI。
 
 ## 项目目录
 
 ```text
-src/                              React + TypeScript 界面
-src-tauri/                        Tauri 2 桌面壳与 Rust SSH/设备后端
-net-helper/                       独立、参数受限的 Linux 网络授权 helper
-docs/product-spec.md              产品、安全与功能规格
-docs/first-direct-connection.md   Ubuntu 安装和直连网络新手手册
+src/                              React + TypeScript GUI
+src-tauri/                        Tauri 2、SSH 与发现策略编排
+net-helper/src/main.rs            受限抓包、ARP 验证和本机地址操作
+net-helper/src/dhcp.rs             单接口 DHCP 生命周期与所有权
+scripts/                          构建脚本
+docs/product-spec.md             产品、安全与功能规格
+docs/first-direct-connection.md  GUI 安装和直连试用指南
 ```
 
-浏览器界面预览只展示视觉设计，不表示真实设备状态：
+现有总览视觉预览不代表真实设备状态，也不作为本次策略验收证据：
 
 ![RoboLink 深色模式设计预览](./ui-preview.png)
 

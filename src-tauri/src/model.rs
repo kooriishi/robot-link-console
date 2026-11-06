@@ -41,7 +41,7 @@ pub struct HostInfo {
     pub interfaces: Vec<HostInterface>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredHost {
     pub address: String,
@@ -52,6 +52,80 @@ pub struct DiscoveredHost {
     pub route_ready: bool,
     pub source: String,
     pub confidence: String,
+    pub arp_reachable: Option<bool>,
+    pub icmp_reachable: Option<bool>,
+    pub port_checked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DiscoveryOptions {
+    pub passive_arp: bool,
+    pub passive_dhcp: bool,
+    pub passive_ipv6: bool,
+    pub mdns: bool,
+    pub active_arp: bool,
+    pub icmp: bool,
+    pub tcp: bool,
+    pub ipv4_link_local: bool,
+    pub ipv6_link_local: bool,
+}
+
+impl Default for DiscoveryOptions {
+    fn default() -> Self {
+        Self {
+            passive_arp: true,
+            passive_dhcp: true,
+            passive_ipv6: true,
+            mdns: true,
+            active_arp: true,
+            icmp: false,
+            tcp: true,
+            ipv4_link_local: true,
+            ipv6_link_local: true,
+        }
+    }
+}
+
+impl DiscoveryOptions {
+    pub fn validate(&self) -> Result<(), String> {
+        if ![
+            self.passive_arp,
+            self.passive_dhcp,
+            self.passive_ipv6,
+            self.mdns,
+            self.active_arp,
+            self.icmp,
+            self.tcp,
+            self.ipv4_link_local,
+            self.ipv6_link_local,
+        ]
+        .into_iter()
+        .any(|enabled| enabled)
+        {
+            return Err("至少启用一种设备发现或验证方式".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryReport {
+    pub hosts: Vec<DiscoveredHost>,
+    pub skipped_interfaces: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhcpStatus {
+    pub interface: String,
+    pub cidr: String,
+    pub running: bool,
+    pub owned: bool,
+    pub message: String,
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,6 +238,15 @@ pub fn validate_host(value: &str) -> Result<String, String> {
     if host.parse::<IpAddr>().is_ok() {
         return Ok(host.to_string());
     }
+    if let Some((address, scope)) = host.split_once('%') {
+        let ip = address
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| "IPv6 scope 仅可用于链路本地 IPv6 地址".to_string())?;
+        if !ip.is_unicast_link_local() || scope.is_empty() || validate_ifname(scope).is_err() {
+            return Err("IPv6 scope 仅允许链路本地地址并必须是有效网卡名称".into());
+        }
+        return Ok(format!("{ip}%{scope}"));
+    }
     let valid = host.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
@@ -252,6 +335,7 @@ mod tests {
         assert_eq!(validate_host("192.168.7.2").unwrap(), "192.168.7.2");
         assert_eq!(validate_host("robot-r2.local").unwrap(), "robot-r2.local");
         assert_eq!(validate_host("[2001:db8::1]").unwrap(), "2001:db8::1");
+        assert_eq!(validate_host("fe80::1%enx0").unwrap(), "fe80::1%enx0");
     }
 
     #[test]
@@ -260,6 +344,28 @@ mod tests {
         assert!(validate_host("robot;touch /tmp/x").is_err());
         assert!(validate_username("robot$(id)").is_err());
         assert!(validate_service_name("foo; reboot").is_err());
+        assert!(validate_host("2001:db8::1%enx0").is_err());
+        assert!(validate_host("fe80::1%enx0;id").is_err());
+        assert!(validate_host("fe80::1%-oProxyCommand").is_err());
+    }
+
+    #[test]
+    fn discovery_options_reject_empty_strategy_and_deserialize_defaults() {
+        let options = DiscoveryOptions {
+            passive_arp: false,
+            passive_dhcp: false,
+            passive_ipv6: false,
+            mdns: false,
+            active_arp: false,
+            icmp: false,
+            tcp: false,
+            ipv4_link_local: false,
+            ipv6_link_local: false,
+        };
+        assert!(options.validate().is_err());
+        assert!(DiscoveryOptions::default().validate().is_ok());
+        let partial: DiscoveryOptions = serde_json::from_str("{\"icmp\":true}").unwrap();
+        assert!(partial.icmp && partial.tcp && partial.passive_arp);
     }
 
     #[test]

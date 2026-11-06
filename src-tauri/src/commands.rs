@@ -6,7 +6,7 @@ use serde_json::Value;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -69,17 +69,9 @@ pub fn get_host_info() -> Result<HostInfo, String> {
                 ))
             })
             .collect();
-        let lower_up = row
-            .get("flags")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .any(|flag| flag == "LOWER_UP");
         let carrier = fs::read_to_string(sys.join("carrier"))
             .map(|v| v.trim() == "1")
-            .unwrap_or(false)
-            && lower_up;
+            .unwrap_or(false);
         let state = row
             .get("operstate")
             .and_then(Value::as_str)
@@ -368,6 +360,9 @@ pub fn scan_direct_interface(interface: String, port: u16) -> Result<Vec<Discove
             route_ready: true,
             source: source.into(),
             confidence: "路由/邻居候选".into(),
+            arp_reachable: None,
+            icmp_reachable: None,
+            port_checked: true,
         })
         .collect();
     result.sort_by(|a, b| a.address.cmp(&b.address));
@@ -382,6 +377,19 @@ struct PassiveArpCandidate {
     mac: String,
     source: String,
     confidence: String,
+    #[serde(default)]
+    arp_reachable: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HelperDiscoveryReport {
+    #[serde(default)]
+    candidates: Vec<PassiveArpCandidate>,
+    #[serde(default)]
+    skipped_interfaces: Vec<String>,
+    #[serde(default)]
+    warnings: Vec<String>,
 }
 
 fn trusted_network_helper() -> Result<std::path::PathBuf, String> {
@@ -426,97 +434,541 @@ fn run_network_helper(arguments: &[String]) -> Result<String, String> {
         .map_err(|e| format!("无法打开系统授权弹窗：{e}。请确认桌面环境安装并运行了 polkit。"))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if detail.is_empty() {
-            "系统授权未完成，网络操作没有执行。".into()
-        } else {
-            format!("系统授权未完成或网络操作失败：{detail}")
-        });
+        return Err(network_helper_failure(output.status.code(), &detail));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn route_uses_interface(address: Ipv4Addr, interface: &str) -> bool {
-    let output = Command::new("ip")
-        .args(["-4", "route", "get", &address.to_string()])
-        .output();
-    let Ok(output) = output else { return false };
-    output.status.success()
-        && String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .windows(2)
-            .any(|pair| pair[0] == "dev" && pair[1] == interface)
+fn network_helper_failure(exit_code: Option<i32>, detail: &str) -> String {
+    if let Some(operation) = detail.strip_prefix("ROBOLINK_NETWORK_OPERATION: ") {
+        return format!("网络操作失败（系统授权已通过）：{operation}");
+    }
+    let lower = detail.to_ascii_lowercase();
+    let authorization_denied = [
+        "not authorized",
+        "authentication failed",
+        "authorization failed",
+        "no authentication agent",
+        "authentication was dismissed",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if exit_code == Some(126) || authorization_denied {
+        return "系统授权未完成、未通过或已取消；网络操作没有执行。请在系统授权窗口完成认证后重试。".into();
+    }
+    if exit_code == Some(127) {
+        return if detail.is_empty() {
+            "系统授权代理或网络助手无法启动；网络操作没有执行。请检查桌面 PolicyKit 服务和 RoboLink 安装。".into()
+        } else {
+            format!("系统授权代理或网络助手无法启动；网络操作没有执行：{detail}")
+        };
+    }
+    if !detail.is_empty() {
+        return format!("网络操作失败（系统授权已通过）：{detail}");
+    }
+    format!(
+        "网络操作失败（助手退出码 {:?}，未提供错误详情）。",
+        exit_code
+    )
+}
+
+#[derive(Clone)]
+struct DiscoveryCandidate {
+    address: String,
+    interface: String,
+    mac: String,
+    source: String,
+    confidence: String,
+    arp_reachable: Option<bool>,
+}
+
+fn route_details(address: &str, interface: &str) -> Option<String> {
+    let ip = address
+        .split('%')
+        .next()
+        .unwrap_or(address)
+        .parse::<IpAddr>()
+        .ok()?;
+    let link_local_v6 = matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local());
+    let destination = ip.to_string();
+    let mut command = Command::new("ip");
+    command.args([
+        if ip.is_ipv4() { "-4" } else { "-6" },
+        "route",
+        "get",
+        &destination,
+    ]);
+    if link_local_v6 {
+        command.args(["oif", interface]);
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    if !words.windows(2).any(|w| w[0] == "dev" && w[1] == interface) {
+        return None;
+    }
+    let source = words
+        .windows(2)
+        .find(|w| w[0] == "src" || w[0] == "prefsrc")
+        .map(|w| w[1].to_string());
+    Some(source.unwrap_or_default())
+}
+
+fn addresses_for_interface(interface: &str) -> Vec<IpAddr> {
+    let Ok(output) = Command::new("ip")
+        .args(["-json", "address", "show", "dev", interface])
+        .output()
+    else {
+        return vec![];
+    };
+    let Ok(rows) = serde_json::from_slice::<Vec<Value>>(&output.stdout) else {
+        return vec![];
+    };
+    rows.iter()
+        .flat_map(|r| {
+            r.get("addr_info")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|a| {
+            a.get("scope").and_then(Value::as_str) != Some("host")
+                && a.get("tentative").and_then(Value::as_bool) != Some(true)
+                && a.get("dadfailed").and_then(Value::as_bool) != Some(true)
+        })
+        .filter_map(|a| a.get("local")?.as_str()?.parse::<IpAddr>().ok())
+        .collect()
+}
+fn is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => v.octets()[0] == 169 && v.octets()[1] == 254,
+        IpAddr::V6(v) => v.is_unicast_link_local(),
+    }
+}
+fn discover_neighbor_rows(interface: &str, family: &str) -> Vec<Value> {
+    let Ok(out) = Command::new("ip")
+        .args(["-json", family, "neigh", "show", "dev", interface])
+        .output()
+    else {
+        return vec![];
+    };
+    if !out.status.success() {
+        return vec![];
+    }
+    serde_json::from_slice(&out.stdout).unwrap_or_default()
+}
+fn probe_discovered(
+    candidate: &DiscoveryCandidate,
+    port: u16,
+    options: &DiscoveryOptions,
+) -> (bool, bool, Option<bool>, Option<bool>) {
+    let Ok(ip) = candidate
+        .address
+        .split('%')
+        .next()
+        .unwrap_or(&candidate.address)
+        .parse::<IpAddr>()
+    else {
+        return (false, false, None, None);
+    };
+    let Some(route_source) = route_details(&candidate.address, &candidate.interface) else {
+        return (false, false, None, None);
+    };
+    let addresses = addresses_for_interface(&candidate.interface);
+    let route_source_ip = route_source.parse::<IpAddr>().ok();
+    let source_is_local = route_source_ip
+        .map(|src| addresses.contains(&src))
+        .unwrap_or(false);
+    let source_for_family = route_source_ip.filter(|src| {
+        src.is_ipv4() == ip.is_ipv4() && is_link_local(*src) == is_link_local(ip) && source_is_local
+    });
+    let tcp_result = if options.tcp {
+        if let Some(local) = source_for_family {
+            let scope = if matches!(local, IpAddr::V6(v6) if v6.is_unicast_link_local()) {
+                fs::read_to_string(format!("/sys/class/net/{}/ifindex", candidate.interface))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let local_socket = match local {
+                IpAddr::V4(v) => SocketAddr::V4(SocketAddrV4::new(v, 0)),
+                IpAddr::V6(v) => SocketAddr::V6(SocketAddrV6::new(v, 0, 0, scope)),
+            };
+            let remote = match ip {
+                IpAddr::V4(v) => SocketAddr::V4(SocketAddrV4::new(v, port)),
+                IpAddr::V6(v) => SocketAddr::V6(SocketAddrV6::new(v, port, 0, scope)),
+            };
+            match Socket::new(
+                if ip.is_ipv4() {
+                    Domain::IPV4
+                } else {
+                    Domain::IPV6
+                },
+                Type::STREAM,
+                Some(Protocol::TCP),
+            ) {
+                Ok(socket) if socket.bind(&SockAddr::from(local_socket)).is_ok() => {
+                    let result = match socket
+                        .connect_timeout(&SockAddr::from(remote), Duration::from_millis(350))
+                    {
+                        Ok(()) => Some(true),
+                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Some(false),
+                        Err(_) => None,
+                    };
+                    (true, result)
+                }
+                _ => (false, None),
+            }
+        } else {
+            (false, None)
+        }
+    } else {
+        (false, None)
+    };
+    let icmp_result = if options.icmp {
+        let destination = if ip.is_ipv6() && is_link_local(ip) {
+            format!("{}%{}", ip, candidate.interface)
+        } else {
+            ip.to_string()
+        };
+        match Command::new("ping")
+            .args([
+                if ip.is_ipv4() { "-4" } else { "-6" },
+                "-I",
+                &candidate.interface,
+                "-c",
+                "1",
+                "-W",
+                "1",
+                &destination,
+            ])
+            .output()
+        {
+            Ok(out) => Some(out.status.success()),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    (true, tcp_result.0, tcp_result.1, icmp_result)
+}
+
+#[tauri::command]
+pub fn discover_direct_devices(
+    port: u16,
+    interfaces: Vec<String>,
+    options: DiscoveryOptions,
+) -> Result<DiscoveryReport, String> {
+    validate_scan_port(port)?;
+    options.validate()?;
+    let host = get_host_info()?;
+    let physical = host
+        .interfaces
+        .iter()
+        .filter(|i| i.kind == "有线以太网")
+        .collect::<Vec<_>>();
+    let selected = if interfaces.is_empty() {
+        physical.iter().map(|i| i.name.clone()).collect::<Vec<_>>()
+    } else {
+        let mut seen = HashSet::new();
+        for name in &interfaces {
+            validate_ifname(name)?;
+            if !seen.insert(name) {
+                return Err(format!("网卡 {name} 被重复选择"));
+            }
+            if !physical.iter().any(|i| i.name == *name) {
+                return Err(format!("{name} 不是本机物理有线网卡"));
+            }
+        }
+        interfaces
+    };
+    let mut report = DiscoveryReport {
+        hosts: vec![],
+        skipped_interfaces: vec![],
+        warnings: vec![],
+    };
+    let active = selected
+        .into_iter()
+        .filter(|name| {
+            let up = physical.iter().any(|i| i.name == *name && i.carrier);
+            if !up {
+                report.skipped_interfaces.push(name.clone());
+            }
+            up
+        })
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        if !report.skipped_interfaces.is_empty() {
+            report
+                .warnings
+                .push("所选有线接口当前均无 carrier；未启动扫描。".into());
+        }
+        return Ok(report);
+    }
+    let options_json =
+        serde_json::to_string(&options).map_err(|e| format!("序列化发现选项失败：{e}"))?;
+    let mut args = vec!["discover".into(), "8".into(), options_json];
+    args.extend(active.iter().cloned());
+    let helper_output = run_network_helper(&args)?;
+    let helper: HelperDiscoveryReport =
+        serde_json::from_str(&helper_output).map_err(|e| format!("解析设备发现结果失败：{e}"))?;
+    report.skipped_interfaces.extend(helper.skipped_interfaces);
+    report.warnings.extend(helper.warnings);
+    let allowed = active.iter().cloned().collect::<HashSet<_>>();
+    let mut candidates: HashMap<(String, String, String), DiscoveryCandidate> = HashMap::new();
+    for c in helper.candidates.into_iter().take(4096) {
+        if !allowed.contains(&c.interface) {
+            continue;
+        }
+        let Ok(ip) = c
+            .address
+            .split('%')
+            .next()
+            .unwrap_or(&c.address)
+            .parse::<IpAddr>()
+        else {
+            report
+                .warnings
+                .push(format!("忽略无效候选地址 {}", c.address));
+            continue;
+        };
+        if addresses_for_interface(&c.interface).contains(&ip) {
+            continue;
+        }
+        let address = match ip {
+            IpAddr::V6(v) if v.is_unicast_link_local() => format!("{v}%{}", c.interface),
+            _ => ip.to_string(),
+        };
+        let mac_key = c.mac.clone();
+        let candidate = DiscoveryCandidate {
+            address: address.clone(),
+            interface: c.interface.clone(),
+            mac: c.mac,
+            source: c.source,
+            confidence: c.confidence,
+            arp_reachable: c.arp_reachable,
+        };
+        candidates
+            .entry((c.interface, address, mac_key))
+            .and_modify(|old| {
+                if old.arp_reachable.is_none() {
+                    old.arp_reachable = candidate.arp_reachable;
+                }
+                if !old.source.contains(&candidate.source) {
+                    old.source.push('、');
+                    old.source.push_str(&candidate.source);
+                }
+            })
+            .or_insert(candidate);
+    }
+    for interface in &active {
+        if options.ipv6_link_local {
+            let group = format!("ff02::1%{interface}");
+            let _ = Command::new("ping")
+                .args(["-6", "-I", interface, "-c", "1", "-W", "1", &group])
+                .output();
+        }
+        let locals = addresses_for_interface(interface);
+        for family in ["-4", "-6"] {
+            if (family == "-4" && !options.passive_arp && !options.ipv4_link_local)
+                || (family == "-6" && !options.passive_ipv6 && !options.ipv6_link_local)
+            {
+                continue;
+            }
+            for row in discover_neighbor_rows(interface, family) {
+                if row.get("dev").and_then(Value::as_str) != Some(interface.as_str()) {
+                    continue;
+                }
+                let bad = |s: &str| matches!(s, "FAILED" | "INCOMPLETE" | "NONE");
+                let state_bad = match row.get("state") {
+                    Some(Value::String(s)) => bad(s),
+                    Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).any(bad),
+                    _ => false,
+                };
+                if state_bad {
+                    continue;
+                }
+                let Some(text) = row.get("dst").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Ok(ip) = text.split('%').next().unwrap_or(text).parse::<IpAddr>() else {
+                    continue;
+                };
+                if locals.contains(&ip) {
+                    continue;
+                }
+                if is_link_local(ip)
+                    && match ip {
+                        IpAddr::V4(_) => !options.ipv4_link_local,
+                        IpAddr::V6(_) => !options.ipv6_link_local,
+                    }
+                {
+                    continue;
+                }
+                let address = match ip {
+                    IpAddr::V6(v) if v.is_unicast_link_local() => format!("{v}%{interface}"),
+                    _ => ip.to_string(),
+                };
+                let mac = row
+                    .get("lladdr")
+                    .and_then(Value::as_str)
+                    .unwrap_or("未知")
+                    .to_string();
+                let candidate = DiscoveryCandidate {
+                    address: address.clone(),
+                    interface: interface.clone(),
+                    mac: mac.clone(),
+                    source: "Linux 邻居缓存（缓存证据，未确认）".into(),
+                    confidence: "缓存候选，未确认".into(),
+                    arp_reachable: None,
+                };
+                candidates
+                    .entry((interface.clone(), address, mac.clone()))
+                    .or_insert(candidate);
+            }
+        }
+    }
+    let mut list = candidates.into_values().collect::<Vec<_>>();
+    let mut evidence_keys = HashSet::new();
+    let mut conflicts = HashSet::new();
+    for candidate in &list {
+        let key = (candidate.interface.clone(), candidate.address.clone());
+        if !evidence_keys.insert(key.clone()) {
+            conflicts.insert(key);
+        }
+    }
+    for (interface, address) in conflicts {
+        report.warnings.push(format!("{interface} 上的候选 {address} 对应多个不同 MAC；结果仅保留为发现证据，不能据此判定设备身份。"));
+    }
+    list.sort_by(|a, b| {
+        a.interface
+            .cmp(&b.interface)
+            .then(a.address.cmp(&b.address))
+    });
+    if list.len() > 256 {
+        report.warnings.push(format!(
+            "共 {} 个候选；仅验证前 256 个，其余未验证。",
+            list.len()
+        ));
+    }
+    if options.ipv6_link_local {
+        report.warnings.push("IPv6 链路本地设备可能不响应多播探测；不响应不代表不可达，且不保证可发现。未修改网卡 IPv6 配置。".into());
+    }
+    let count = list.len().min(256);
+    let q = Arc::new(Mutex::new(VecDeque::from(
+        list.iter().take(count).cloned().collect::<Vec<_>>(),
+    )));
+    let (tx, rx) = mpsc::channel();
+    for _ in 0..16.min(count.max(1)) {
+        let q = Arc::clone(&q);
+        let tx = tx.clone();
+        let options = options.clone();
+        thread::spawn(move || {
+            while let Some(c) = q.lock().ok().and_then(|mut q| q.pop_front()) {
+                let v = probe_discovered(&c, port, &options);
+                let _ = tx.send(((c.interface, c.address), v));
+            }
+        });
+    }
+    drop(tx);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut checked = HashMap::new();
+    while checked.len() < count {
+        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        if wait.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(wait) {
+            Ok((k, v)) => {
+                checked.insert(k, v);
+            }
+            Err(_) => break,
+        }
+    }
+    if checked.len() < count {
+        report
+            .warnings
+            .push("部分验证在 20 秒总时限内未完成，相关字段保持未验证。".into());
+    }
+    report.hosts = list
+        .into_iter()
+        .map(|c| {
+            let (route, port_checked, open, icmp) = checked
+                .get(&(c.interface.clone(), c.address.clone()))
+                .copied()
+                .unwrap_or((false, false, None, None));
+            DiscoveredHost {
+                address: c.address,
+                interface: c.interface,
+                mac: c.mac,
+                port,
+                port_open: open.unwrap_or(false),
+                route_ready: route,
+                source: c.source,
+                confidence: c.confidence,
+                arp_reachable: c.arp_reachable,
+                icmp_reachable: icmp,
+                port_checked,
+            }
+        })
+        .collect();
+    report.skipped_interfaces.sort();
+    report.skipped_interfaces.dedup();
+    Ok(report)
+}
+
+#[tauri::command]
+pub fn get_dhcp_status() -> Result<Vec<DhcpStatus>, String> {
+    let s = run_network_helper(&["dhcp-status".into()])?;
+    serde_json::from_str(&s).map_err(|e| format!("解析 DHCP 状态失败：{e}"))
+}
+fn validate_dhcp_cidr(cidr: &str) -> Result<(), String> {
+    let (addr, prefix) = cidr
+        .split_once('/')
+        .ok_or("DHCP 地址请使用 IPv4/CIDR 格式")?;
+    let ip = addr
+        .parse::<Ipv4Addr>()
+        .map_err(|_| "DHCP 地址必须是 IPv4 地址")?;
+    let bits = prefix.parse::<u8>().map_err(|_| "IPv4 前缀长度无效")?;
+    if !(1..=30).contains(&bits)
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip == Ipv4Addr::BROADCAST
+    {
+        return Err("DHCP 服务仅支持普通 IPv4 地址和 /1–/30 前缀".into());
+    }
+    Ok(())
+}
+#[tauri::command]
+pub fn start_direct_dhcp(interface: String, cidr: String) -> Result<Vec<DhcpStatus>, String> {
+    validate_ifname(&interface)?;
+    validate_dhcp_cidr(&cidr)?;
+    let host = get_host_info()?;
+    if !host
+        .interfaces
+        .iter()
+        .any(|i| i.name == interface && i.kind == "有线以太网" && i.carrier)
+    {
+        return Err("请选择当前已连接的本机物理有线网卡；DHCP 服务未启动。".into());
+    }
+    let s = run_network_helper(&["dhcp-start".into(), interface, cidr])?;
+    serde_json::from_str(&s).map_err(|e| format!("解析 DHCP 启动结果失败：{e}"))
+}
+#[tauri::command]
+pub fn stop_direct_dhcp(interface: String) -> Result<Vec<DhcpStatus>, String> {
+    validate_ifname(&interface)?;
+    let s = run_network_helper(&["dhcp-stop".into(), interface])?;
+    serde_json::from_str(&s).map_err(|e| format!("解析 DHCP 停止结果失败：{e}"))
 }
 
 #[tauri::command]
 pub fn scan_direct_interfaces(port: u16) -> Result<Vec<DiscoveredHost>, String> {
-    validate_scan_port(port)?;
-    let host_info = get_host_info()?;
-    let interfaces = host_info
-        .interfaces
-        .iter()
-        .filter(|iface| iface.kind == "有线以太网" && iface.carrier)
-        .map(|iface| iface.name.clone())
-        .collect::<Vec<_>>();
-    if interfaces.is_empty() {
-        return Err(
-            "没有检测到 LOWER_UP 的物理有线网口。请插好网线、检查机器人电源，再刷新网卡列表。"
-                .into(),
-        );
-    }
-    let mut arguments = vec!["discover".to_string(), "8".to_string()];
-    arguments.extend(interfaces.iter().cloned());
-    let output = run_network_helper(&arguments)?;
-    let candidates: Vec<PassiveArpCandidate> =
-        serde_json::from_str(&output).map_err(|e| format!("解析 ARP 发现结果失败：{e}"))?;
-    let mut result = candidates
-        .into_iter()
-        .take(2048)
-        .map(|candidate| {
-            let address = candidate.address.parse::<Ipv4Addr>().ok();
-            let route_ready = address
-                .map(|ip| route_uses_interface(ip, &candidate.interface))
-                .unwrap_or(false);
-            let port_open = if route_ready {
-                let Some(ip) = address else {
-                    return DiscoveredHost {
-                        address: candidate.address,
-                        interface: candidate.interface,
-                        mac: candidate.mac,
-                        port,
-                        port_open: false,
-                        route_ready: false,
-                        source: candidate.source,
-                        confidence: candidate.confidence,
-                    };
-                };
-                TcpStream::connect_timeout(
-                    &SocketAddrV4::new(ip, port).into(),
-                    Duration::from_millis(400),
-                )
-                .is_ok()
-            } else {
-                false
-            };
-            DiscoveredHost {
-                address: candidate.address,
-                interface: candidate.interface,
-                mac: candidate.mac,
-                port,
-                port_open,
-                route_ready,
-                source: candidate.source,
-                confidence: candidate.confidence,
-            }
-        })
-        .collect::<Vec<_>>();
-    result.sort_by(|a, b| {
-        a.interface
-            .cmp(&b.interface)
-            .then_with(|| a.address.cmp(&b.address))
-            .then_with(|| a.mac.cmp(&b.mac))
-    });
-    Ok(result)
+    discover_direct_devices(port, vec![], DiscoveryOptions::default()).map(|r| r.hosts)
 }
 
 #[tauri::command]
@@ -1389,6 +1841,27 @@ mod tests {
         assert!(validate_scan_port(22).is_ok());
         assert!(validate_scan_port(2222).is_ok());
         assert!(validate_scan_port(u16::MAX).is_ok());
+    }
+
+    #[test]
+    fn system_authorization_and_network_operation_failures_are_distinguished() {
+        assert!(network_helper_failure(Some(126), "").contains("系统授权未完成"));
+        assert!(
+            network_helper_failure(Some(1), "enx00e04c3071f5 当前没有物理链路")
+                .contains("网络操作失败（系统授权已通过）")
+        );
+        assert!(
+            network_helper_failure(Some(1), "enx00e04c3071f5 当前没有物理链路")
+                .contains("当前没有物理链路")
+        );
+        assert!(network_helper_failure(Some(1), "Not authorized").contains("系统授权未完成"));
+        assert!(network_helper_failure(
+            Some(1),
+            "ROBOLINK_NETWORK_OPERATION: Not authorized in network setup"
+        )
+        .contains("系统授权已通过"));
+        assert!(network_helper_failure(Some(126), "").contains("系统授权未完成"));
+        assert!(network_helper_failure(Some(127), "").contains("网络助手无法启动"));
     }
 
     #[test]
