@@ -1539,12 +1539,21 @@ fn add_address(interface: &str, cidr: &str, peer_text: &str) -> Result<(), Strin
         return Err(format!("检测到其他设备正在使用本机候选地址 {local}。没有添加该地址；请在窗口里选择另一个地址。"));
     }
     let cidr_arg = format!("{local}/{prefix}");
-    let output = ip_command(&["address", "add", &cidr_arg, "dev", interface])?;
-    if !output.status.success() {
-        return Err(format!(
-            "添加临时 IPv4 地址失败：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    let via_nm = nm_manages(interface);
+    if via_nm {
+        let mut addresses = nm_profile_addresses(interface).unwrap_or_default();
+        if !addresses.contains(&cidr_arg) {
+            addresses.push(cidr_arg.clone());
+        }
+        nm_apply_profile(interface, &addresses)?;
+    } else {
+        let output = ip_command(&["address", "add", &cidr_arg, "dev", interface])?;
+        if !output.status.success() {
+            return Err(format!(
+                "添加临时 IPv4 地址失败：{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
     }
     let route = ip_command(&["-4", "route", "get", &peer.to_string()])?;
     let route_text = String::from_utf8_lossy(&route.stdout);
@@ -1555,18 +1564,182 @@ fn add_address(interface: &str, cidr: &str, peer_text: &str) -> Result<(), Strin
             .windows(2)
             .any(|pair| pair[0] == "dev" && pair[1] == interface)
     {
-        let _ = ip_command(&["address", "del", &cidr_arg, "dev", interface]);
+        let _ = remove_address(interface, &cidr_arg);
         return Err(
             "添加后路由检查没有指向选定网卡；已撤销刚添加的地址，其他网络未作更改。".into(),
         );
     }
-    println!("已在 {interface} 添加临时地址 {cidr_arg}；默认路由、DNS、Wi‑Fi 和机器人端配置未修改。目标前缀 /{prefix} 为用户选择的假设。{peer}");
+    if via_nm {
+        println!("已通过 NetworkManager 临时连接“{}”在 {interface} 配置 {cidr_arg}（不设默认路由、不改 DNS），切换 Wi‑Fi 或网络重连时不会被清掉；清理后恢复该网口原来的连接。目标前缀 /{prefix} 为用户选择的假设。{peer}", nm_profile_name(interface));
+    } else {
+        println!("已在 {interface} 添加临时地址 {cidr_arg}；默认路由、DNS、Wi‑Fi 和机器人端配置未修改。目标前缀 /{prefix} 为用户选择的假设。{peer}");
+    }
+    Ok(())
+}
+
+// NetworkManager integration. A bare `ip address add` on an interface that NetworkManager manages is
+// flushed whenever NM (re)activates that interface – e.g. its DHCP profile times out and retries, or
+// the network is reconfigured after switching Wi-Fi – and traffic to the board then leaves via Wi-Fi.
+// When NM manages the interface we instead activate an in-memory (not saved to disk) manual profile
+// that never becomes the default route; deleting it lets NM bring back the user's original profile.
+
+fn nmcli_path() -> Option<&'static str> {
+    ["/usr/bin/nmcli", "/bin/nmcli"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file())
+}
+
+fn nmcli(args: &[&str]) -> Result<std::process::Output, String> {
+    let path = nmcli_path().ok_or("找不到 nmcli")?;
+    Command::new(path)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("无法运行 nmcli：{e}"))
+}
+
+fn nm_profile_name(interface: &str) -> String {
+    format!("robolink-{interface}")
+}
+
+fn nm_manages(interface: &str) -> bool {
+    if nmcli_path().is_none() || !std::path::Path::new("/run/NetworkManager").exists() {
+        return false;
+    }
+    match nmcli(&["-g", "GENERAL.STATE", "device", "show", interface]) {
+        Ok(out) if out.status.success() => {
+            nm_state_is_managed(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => false,
+    }
+}
+
+fn nm_state_is_managed(state: &str) -> bool {
+    let state = state.trim();
+    !state.is_empty() && !state.contains("unmanaged") && !state.starts_with("10 ")
+}
+
+/// Addresses of our profile for this interface, or None when the profile does not exist.
+fn nm_profile_addresses(interface: &str) -> Option<Vec<String>> {
+    nmcli_path()?;
+    let out = nmcli(&[
+        "-g",
+        "ipv4.addresses",
+        "connection",
+        "show",
+        &nm_profile_name(interface),
+    ])
+    .ok()?;
+    out.status
+        .success()
+        .then(|| parse_nm_addresses(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_nm_addresses(text: &str) -> Vec<String> {
+    text.trim()
+        .split(',')
+        .map(|item| item.trim().replace("\\", ""))
+        .filter(|item| parse_cidr(item).is_ok())
+        .collect()
+}
+
+fn nm_profile_args(interface: &str, addresses: &[String], create: bool) -> Vec<String> {
+    let name = nm_profile_name(interface);
+    let mut args: Vec<String> = if create {
+        [
+            "connection",
+            "add",
+            "save",
+            "no",
+            "type",
+            "ethernet",
+            "con-name",
+            &name,
+            "ifname",
+            interface,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    } else {
+        vec!["connection".into(), "modify".into(), name]
+    };
+    for (key, value) in [
+        ("connection.autoconnect", "yes"),
+        ("connection.autoconnect-priority", "100"),
+        ("ipv4.method", "manual"),
+        ("ipv4.addresses", &addresses.join(",")),
+        ("ipv4.gateway", ""),
+        ("ipv4.never-default", "yes"),
+        ("ipv4.ignore-auto-dns", "yes"),
+        ("ipv4.may-fail", "no"),
+        ("ipv6.method", "link-local"),
+        ("ipv6.never-default", "yes"),
+    ] {
+        args.push(key.into());
+        args.push(value.into());
+    }
+    args
+}
+
+fn nm_apply_profile(interface: &str, addresses: &[String]) -> Result<(), String> {
+    let exists = nm_profile_addresses(interface).is_some();
+    let args = nm_profile_args(interface, addresses, !exists);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let out = nmcli(&refs)?;
+    if !out.status.success() {
+        return Err(format!(
+            "创建 NetworkManager 临时连接失败：{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let name = nm_profile_name(interface);
+    let up = nmcli(&[
+        "--wait",
+        "20",
+        "connection",
+        "up",
+        &name,
+        "ifname",
+        interface,
+    ])?;
+    if !up.status.success() {
+        let detail = String::from_utf8_lossy(&up.stderr).trim().to_string();
+        if !exists {
+            let _ = nmcli(&["connection", "delete", &name]);
+        }
+        return Err(format!("启用 NetworkManager 临时连接失败：{detail}"));
+    }
     Ok(())
 }
 
 fn remove_address(interface: &str, cidr: &str) -> Result<(), String> {
     validate_ifname(interface)?;
     let (address, prefix) = parse_cidr(cidr)?;
+    let cidr_text = format!("{address}/{prefix}");
+    if let Some(addresses) = nm_profile_addresses(interface) {
+        if addresses.contains(&cidr_text) {
+            let remaining = addresses
+                .into_iter()
+                .filter(|item| *item != cidr_text)
+                .collect::<Vec<_>>();
+            let name = nm_profile_name(interface);
+            if remaining.is_empty() {
+                let out = nmcli(&["connection", "delete", &name])?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "删除 NetworkManager 临时连接失败：{}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ));
+                }
+                println!("已删除 NetworkManager 临时连接“{name}”（{cidr_text}）；该网口将恢复原来的连接，其他网络未修改。\n");
+            } else {
+                nm_apply_profile(interface, &remaining)?;
+                println!("已从 NetworkManager 临时连接“{name}”移除 {cidr_text}；其他地址和默认路由未修改。\n");
+            }
+            return Ok(());
+        }
+    }
     let current = all_ipv4_addresses()?;
     let exact = current
         .iter()
@@ -1905,6 +2078,34 @@ mod tests {
         let lan = sweep_targets(&[(Ipv4Addr::new(10, 3, 4, 5), 16)], false, true, true);
         assert_eq!(lan.len(), 253);
         assert!(lan.iter().all(|(t, _)| t.octets()[..3] == [10, 3, 4]));
+    }
+
+    #[test]
+    fn nm_profile_is_manual_without_default_route() {
+        let args = nm_profile_args("enp3s0", &["192.168.127.1/24".into()], true);
+        let joined = args.join(" ");
+        assert!(joined.starts_with(
+            "connection add save no type ethernet con-name robolink-enp3s0 ifname enp3s0"
+        ));
+        assert!(joined.contains("ipv4.method manual"));
+        assert!(joined.contains("ipv4.addresses 192.168.127.1/24"));
+        assert!(joined.contains("ipv4.never-default yes"));
+        let modify = nm_profile_args(
+            "enp3s0",
+            &["192.168.127.1/24".into(), "192.168.1.2/24".into()],
+            false,
+        );
+        assert_eq!(&modify[..3], ["connection", "modify", "robolink-enp3s0"]);
+        assert!(modify.contains(&"192.168.127.1/24,192.168.1.2/24".to_string()));
+        assert_eq!(
+            parse_nm_addresses("192.168.127.1/24, 192.168.1.2/24\n"),
+            vec!["192.168.127.1/24", "192.168.1.2/24"]
+        );
+        assert!(parse_nm_addresses("\n").is_empty());
+        assert!(nm_state_is_managed("100 (connected)"));
+        assert!(nm_state_is_managed("30 (disconnected)"));
+        assert!(!nm_state_is_managed("10 (unmanaged)"));
+        assert!(!nm_state_is_managed(""));
     }
 
     #[test]

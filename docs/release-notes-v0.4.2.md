@@ -33,3 +33,13 @@ package.json、tauri.conf.json、桌面程序与网络助手 Cargo 版本统一�
 
 - 读取主机密钥失败时，按 `ip route get` 判断原因：没有路由、走网关、走无线网卡，还是直连但 SSH 无响应，并给出下一步操作。
 - 发现列表里路由未就绪的 IPv4 候选，按钮改为“配置本机 IP 后添加”：先配置临时地址，成功后直接弹出“添加 SSH 目标”。
+
+## 修复：切换 Wi-Fi 后直连网线的临时地址丢失、流量改走无线网卡
+
+**原因**：之前用 `ip address add` 给网口加临时地址，NetworkManager 并不知道这个地址。直连网口上通常还挂着 NetworkManager 的默认 DHCP 连接（如“有线连接 1”），开发板不提供 DHCP，它会超时、重试并重新激活设备；切换 Wi-Fi 等网络变化也会触发重新激活。每次重新激活，NetworkManager 都会清空它不认识的地址，去往开发板的流量于是改走 Wi-Fi 的默认路由。已在容器中用 NetworkManager 1.46 复现：手动地址在 DHCP 超时后约 15 秒被清掉。
+
+**修复**：网口由 NetworkManager 管理时，网络助手改为创建并启用一个只存在内存、不写入磁盘的连接 `robolink-<网卡名>`：手动 IPv4、`never-default`（永不成为默认路由）、不改 DNS、IPv6 仅 link-local，autoconnect 优先级 100。同一网口的多个 RoboLink 地址合并在这个连接里。清理时删除该连接，网口恢复原来的连接。NetworkManager 未运行或网口未被管理时仍使用 `ip address add`。
+
+已在容器中用 NetworkManager 验证：配置后设备断开再连接，地址仍在、路由仍走网线；清理后临时连接被删除。
+
+注意：可选的直连 DHCP Server 仍用 `ip address add` 配置本机地址，同样可能被 NetworkManager 清掉，后续版本再处理。
