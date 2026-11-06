@@ -1,68 +1,59 @@
 # RoboLink · 机器人调试台
 
-RoboLink 是运行在 Linux 开发机上的无头机器人调试桌面应用。它支持经 SSH 管理 Linux 机器人，并为直接有线连接提供受限的接口发现。**有线拓扑是开发机和机器人一根网线直连，不经过路由器、交换机或中间设备。** 机器人 Wi‑Fi 是独立的远端控制对象。
+RoboLink 是运行在 Linux 开发机上的桌面 GUI，用 SSH 管理 Linux 机器人。目标拓扑是开发机与机器人用一根以太网线直接相连，不经过路由器或交换机；机器人内部 Wi‑Fi 是独立的远端控制对象。
 
 ## 版本状态
 
-当前源码版本为 **0.2.2**，是待审的 Linux 候选版；它基于 v0.2.1，新增不依赖 PipeWire/PulseAudio 的 ALSA 硬件识别，并优化页面切换与终端排版。此任务没有接入实际机器人，因此真实硬件连接、无线配对和音频播放仍需你在自己的设备上验证。
+当前源码版本为 **v0.3.0 测试候选**。这一版新增多网口 ARP 被动发现、设备候选 IP/MAC/网卡标注，以及用户确认后给开发机物理有线接口添加和清理临时 IPv4 地址的流程。尚未完成真实硬件验收，**没有创建 GitHub Release**；收到测试包后请先在自己的 Ubuntu 22.04 机器人上验证，再决定是否发布。
 
-## 当前功能
+## 主要功能
 
-- 通过 SSH 管理多个 Linux 目标；首次连接显示主机密钥指纹，让用户选择并核对一把密钥后固定；变化时阻断连接。
-- 在开发机物理有线接口上查看链路，并列出所选接口 Linux 邻居表中的 IPv4 地址候选；在受限子网内探测用户指定的单个 TCP 端口（默认 22）。扫描绑定到选中的接口；不会修改开发机 IP、默认路由或 DNS。
-- 读取机器人概览、systemd 服务、NetworkManager Wi-Fi、BlueZ 蓝牙、PipeWire/PulseAudio 默认输入/输出设备与音量；另外读取 ALSA 硬件 PCM 播放/采集端点，即使机器人没有音频服务器也可显示识别结果。
-- 提供交互式 SSH PTY 终端、高风险命令确认、多行粘贴预览、本地操作事件记录；已访问页面保留实例，终端缩放更新合并处理。
-- 提供浅色/深色模式。
+- 通过 SSH 管理多个 Linux 机器人。首次连接需经可信渠道核对 SSH 主机指纹；后续指纹变化会阻断连接。
+- 同时监听所有已连接的物理有线网口 8 秒，展示 ARP 源 IP、MAC、来源网卡和证据类型；只探测用户选择的单个 TCP 端口（默认 22），且仅当系统路由指向该直连接口时报告端口状态。
+- 可在明确确认后给选定的开发机有线网口增加一条临时 IPv4。授权 helper 会检查地址格式、重复地址和重叠路由；默认在 SSH 会话结束时清理，也可以选择保持并手动移除。
+- 通过已验证的 SSH 连接读取机器人概览、systemd 服务、NetworkManager Wi‑Fi、BlueZ 蓝牙、PipeWire/PulseAudio 默认音频设备与音量，以及 ALSA 硬件 PCM 端点。
+- 提供 SSH 交互终端、高风险命令确认、多行粘贴预览、本地诊断记录和浅色/深色模式。
 
-服务启停、机器人 Wi‑Fi、蓝牙配对/连接和音频设置会改变机器人状态，界面会要求确认；应用不自动提权。直连扫描可帮助发现 Linux 已记录的邻居 IP，但不能凭一根网线推导任意静态地址；两端仍需先有同网段 IP。邻居缓存也可能包含过期地址。详见[第一次直连操作手册](docs/first-direct-connection.md)。
+RoboLink 不提供 DHCP server、不猜测任意静态 IP、不自动修改机器人端网络，也不会替开发机改 Wi‑Fi、DNS、默认网关或防火墙。ARP 只是一种发现证据：不发 ARP 的静默设备可能无法扫描到；MAC/IP/TCP 端口也不能替代 SSH 身份核验。
 
-## 下载与安装
+## Ubuntu 22.04 安装
 
-v0.2.2 的 Ubuntu 22.04 amd64 `.deb` 是本地待审候选，尚未上传或发布。审阅通过后可从 GitHub Release 下载并安装：
+请使用项目维护者提供的 `RoboLink_0.3.0_ubuntu22.04_amd64.deb` 测试候选包，不要从不明网站下载，也不要把它当作正式 GitHub Release。下载后可在 Ubuntu 文件管理器里双击 `.deb`，使用“应用中心/软件安装”打开并点击“安装”；也可以运行：
 
 ```bash
-sudo apt install ./RoboLink_0.2.2_ubuntu22.04_amd64.deb
+sudo apt install ./RoboLink_0.3.0_ubuntu22.04_amd64.deb
 ```
 
-系统会按 deb 包依赖检查桌面运行库。打开系统应用菜单中的 **RoboLink** 启动。应用运行在开发机上，机器人端不需要安装 RoboLink。
+然后从系统应用列表启动 **RoboLink**。开发机和机器人之间的连接步骤、授权说明和故障排查见[第一次直连 Linux 机器人操作手册](docs/first-direct-connection.md)。
 
-> 候选包按 Ubuntu 22.04 x86_64 用户空间构建。其他发行版/架构需自行验证 GTK/WebKitGTK 等桌面依赖兼容性；Windows、macOS 和 Linux ARM 构建不在此版本范围内。
+测试包以 Ubuntu 22.04 amd64 为构建目标，最高要求 GLIBC 2.34。其他发行版或 CPU 架构需要单独构建和验证。应用依赖 Ubuntu 桌面版的 WebKitGTK 4.1（至少 2.38）、GTK、OpenSSH、iproute2 和 polkit；机器人端不需要安装 RoboLink。若安装器提示 WebKitGTK 版本不足，请先用“软件更新器”安装 Ubuntu 22.04 更新，或运行 `sudo apt update` 后重试，不要从不明网站单独下载系统库。
 
-## 从源码运行
+## 从源码运行与构建
 
-需要 Node.js、npm、Rust/Cargo、Tauri Linux 开发库（GTK 3、WebKitGTK 4.1 等）。浏览器模式只用于界面演示，不会连接真实机器人：
+需要 Node.js/npm、Rust/Cargo，以及 Tauri Linux 开发依赖（Ubuntu 22.04 可安装 `libwebkit2gtk-4.1-dev`、`build-essential`、`curl`、`wget`、`file`、`libxdo-dev`、`libssl-dev`、`librsvg2-dev`、`libayatana-appindicator3-dev`）。浏览器模式仅为界面演示，不会连接真实机器人。
 
 ```bash
 npm install
-npm run dev
+npm run dev           # 浏览器 UI 演示
+npm run app:dev       # Tauri 桌面程序
+npm run app:build     # 构建 Debian 安装包（只构建 .deb）
+npm run test:rust     # 构建 helper，并运行主应用和 helper 的 Rust 测试
+npm run build         # TypeScript + Vite 前端生产构建
 ```
 
-运行真实桌面功能：
+建议在 Ubuntu 22.04 或等价的 Jammy 容器中构建；在较新的发行版构建可能抬高所需 GLIBC 版本。`app:build` 会先单独构建受限网络 helper，并将其随 Debian 包安装；helper 仅在用户确认网络操作时由系统授权窗口调用。不要手动把它改成宽泛的 root shell 或让整个 GUI 以 root 身份运行。
 
-```bash
-npm run app:dev
-```
-
-在兼容 Linux 环境构建 deb：
-
-```bash
-npm run app:build -- --bundles deb
-```
-
-## 主机工具
-
-开发机需要 OpenSSH 客户端（含 `ssh`、`ssh-keyscan`、`ssh-keygen`）、`iproute2`（`ip`）。可用系统工具控制器件：NetworkManager 的 `nmcli`、BlueZ 的 `bluetoothctl`、音频服务器的 `pactl`；播放测试音还需要 `speaker-test`。机器人端 ALSA 设备识别直接读取 `/proc/asound/pcm`；切换默认音频设备和调节音量仍需要 PulseAudio/PipeWire 的 `pactl` 接口及相应用户权限。应用不会自动安装软件或执行 `sudo`。
-
-## 目录
+## 项目目录
 
 ```text
-src/                         React + TypeScript 界面
-src-tauri/                   Tauri 2 Linux 外壳和 Rust SSH/设备后端
-docs/product-spec.md          产品与安全规格
-docs/first-direct-connection.md  无 Internet 直连操作手册
+src/                              React + TypeScript 界面
+src-tauri/                        Tauri 2 桌面壳与 Rust SSH/设备后端
+net-helper/                       独立、参数受限的 Linux 网络授权 helper
+docs/product-spec.md              产品、安全与功能规格
+docs/first-direct-connection.md   Ubuntu 安装和直连网络新手手册
 ```
 
-浏览器中的界面截图仅展示视觉设计，不表示真实设备状态：
+浏览器界面预览只展示视觉设计，不表示真实设备状态：
 
 ![RoboLink 深色模式设计预览](./ui-preview.png)
 

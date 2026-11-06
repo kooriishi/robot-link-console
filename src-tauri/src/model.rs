@@ -46,9 +46,12 @@ pub struct HostInfo {
 pub struct DiscoveredHost {
     pub address: String,
     pub interface: String,
+    pub mac: String,
     pub port: u16,
     pub port_open: bool,
+    pub route_ready: bool,
     pub source: String,
+    pub confidence: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -193,6 +196,7 @@ pub fn validate_username(value: &str) -> Result<String, String> {
 pub fn validate_ifname(value: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 15
+        || value.starts_with('-')
         || !value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.' || b == b':')

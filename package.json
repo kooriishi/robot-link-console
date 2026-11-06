@@ -1,7 +1,7 @@
 {
   "name": "robot-link-console",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
@@ -9,7 +9,9 @@
     "preview": "vite preview --host 0.0.0.0",
     "tauri": "tauri",
     "app:dev": "tauri dev",
-    "app:build": "tauri build"
+    "app:build": "tauri build",
+    "build:net-helper": "bash ./scripts/build-net-helper.sh",
+    "test:rust": "npm run build:net-helper && cargo test --manifest-path src-tauri/Cargo.toml --all-targets && cargo test --manifest-path net-helper/Cargo.toml"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",

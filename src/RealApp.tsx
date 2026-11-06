@@ -17,7 +17,8 @@ type Page = 'overview' | 'network' | 'services' | 'bluetooth' | 'audio' | 'termi
 type Target = { id: string; name: string; host: string; port: number; username: string }
 type HostInterface = { name: string; kind: string; mac?: string; ipv4: string[]; carrier: boolean; state: string; mtu?: number }
 type HostInfo = { hostname: string; os: string; interfaces: HostInterface[] }
-type DiscoveredHost = { address: string; interface: string; port: number; portOpen: boolean; source: string }
+type DiscoveredHost = { address: string; interface: string; mac: string; port: number; portOpen: boolean; routeReady: boolean; source: string; confidence: string }
+type OwnedNetworkAddress = { interface: string; cidr: string; peer: string; persistent: boolean }
 type HostKeyStatus = { fingerprints: string[]; pinnedFingerprints: string[]; trusted: boolean; changed: boolean }
 type RemoteOverview = { hostname: string; uptime: string; load: string; memoryTotalKb?: number; memoryAvailableKb?: number; temperatureC?: number }
 type Service = { name: string; description: string; active: string; subState: string; enabled: string }
@@ -77,6 +78,9 @@ export default function RealApp() {
   const [localInterface, setLocalInterface] = useState('')
   const [scanPort, setScanPort] = useState('22')
   const [discovered, setDiscovered] = useState<DiscoveredHost[]>([])
+  const [ownedNetworkAddresses, setOwnedNetworkAddresses] = useState<OwnedNetworkAddress[]>([])
+  const [addressDialog, setAddressDialog] = useState(false)
+  const [addressDraft, setAddressDraft] = useState({ interface: '', peer: '', cidr: '', persistent: false })
   const [remoteOverview, setRemoteOverview] = useState<RemoteOverview | null>(null)
   const [services, setServices] = useState<Service[]>([])
   const [remoteNetwork, setRemoteNetwork] = useState<RemoteNetwork | null>(null)
@@ -128,11 +132,12 @@ export default function RealApp() {
   useEffect(() => {
     void (async () => {
       try {
-        const [h, t] = await Promise.all([invoke<HostInfo>('get_host_info'), invoke<Target[]>('list_targets')])
+        const [h, t, owned] = await Promise.all([invoke<HostInfo>('get_host_info'), invoke<Target[]>('list_targets'), invoke<OwnedNetworkAddress[]>('list_owned_network_addresses')])
         setHostInfo(h); setTargets(t)
+        setOwnedNetworkAddresses(owned)
         const remembered = localStorage.getItem('robolink-selected-target') ?? ''
         const chosen = t.some(x => x.id === remembered) ? remembered : t[0]?.id ?? ''
-        setSelectedId(chosen); setLocalInterface(h.interfaces.find(i => i.kind === '有线以太网')?.name ?? '')
+        setSelectedId(chosen); setLocalInterface(h.interfaces.find(i => i.kind === '有线以太网' && i.carrier)?.name ?? h.interfaces.find(i => i.kind === '有线以太网')?.name ?? '')
       } catch (e) { setError(displayError(e)) }
     })()
   }, [])
@@ -189,7 +194,10 @@ export default function RealApp() {
     }).then(fn => { offOutput = fn })
     const exitReady = listen<TerminalEvent>('terminal-exit', event => {
       const id = event.payload.sessionId
-      if (id === activeTerminalRef.current) { setTerminalExited(true); setSshReady(false); terminalWriterRef.current?.write(event.payload.data) }
+      if (id === activeTerminalRef.current) {
+        setTerminalExited(true); setSshReady(false); terminalWriterRef.current?.write(event.payload.data)
+        void invoke<OwnedNetworkAddress[]>('cleanup_session_network_addresses').then(setOwnedNetworkAddresses).catch(e => setError(displayError(e)))
+      }
       else if (openingTerminalRef.current) terminalExitQueue.add(id)
     }).then(fn => { offExit = fn })
     terminalEventsReadyRef.current = Promise.all([outputReady, exitReady]).then(() => undefined)
@@ -217,13 +225,15 @@ export default function RealApp() {
 
   const selectTarget = async (id: string) => {
     if (sessionId) await invoke('close_ssh_terminal', { sessionId }).catch(() => {})
+    const remaining = await invoke<OwnedNetworkAddress[]>('cleanup_session_network_addresses').catch(() => null)
+    if (remaining) setOwnedNetworkAddresses(remaining)
     terminalOutputQueue.delete(sessionId); terminalExitQueue.delete(sessionId); activeTerminalRef.current = ''; terminalWriterRef.current = null; setSessionId(''); setTerminalExited(false); setSshReady(false)
     setRemoteOverview(null); setServices([]); setRemoteNetwork(null); setBluetooth(null); setAudio(null)
     setSelectedId(id); setKeyStatus(null); setError(''); setPage('overview')
   }
   const refreshNow = () => { setRefreshCount(n => n + 1); void invoke<HostInfo>('get_host_info').then(setHostInfo).catch(e => setError(displayError(e))) }
-  const openNewTarget = (prefill = '', port = 22) => {
-    setTargetDraft({ id: '', name: prefill ? `机器人 ${prefill}` : '', host: prefill, port: String(port), username: 'robot' })
+  const openNewTarget = (prefill = '', port = 22, username = 'robot') => {
+    setTargetDraft({ id: '', name: prefill ? `机器人 ${prefill}` : '', host: prefill, port: String(port), username })
     setTargetDialog(true)
   }
   const saveTarget = async (e: FormEvent) => {
@@ -277,21 +287,48 @@ export default function RealApp() {
   }
   const disconnectTerminal = async () => {
     if (sessionId) await invoke('close_ssh_terminal', { sessionId }).catch(() => {})
+    const remaining = await invoke<OwnedNetworkAddress[]>('cleanup_session_network_addresses').catch(e => { setError(displayError(e)); return null })
+    if (remaining) setOwnedNetworkAddresses(remaining)
     terminalWriterRef.current?.write('\r\n[已断开 SSH 会话]\r\n'); terminalOutputQueue.delete(sessionId); terminalExitQueue.delete(sessionId); activeTerminalRef.current = ''; terminalWriterRef.current = null; setSessionId(''); setTerminalExited(false); setSshReady(false); log('已断开 SSH 终端会话')
   }
   const scanInterface = async () => {
-    if (!localInterface) { setError('请先选择本机物理有线网卡'); return }
     const port = Number(scanPort)
     if (!Number.isInteger(port) || port < 1 || port > 65535) { setError('TCP 探测端口必须是 1–65535 的整数'); return }
     setDiscovered([])
-    const found = await withBusy(() => invoke<DiscoveredHost[]>('scan_direct_interface', { interface: localInterface, port }))
+    const found = await withBusy(() => invoke<DiscoveredHost[]>('scan_direct_interfaces', { port }))
     if (found) {
       setDiscovered(found)
       const portCount = found.filter(host => host.portOpen).length
-      log(`在 ${localInterface} 发现 ${found.length} 个邻居 IP 候选，其中 ${portCount} 个 TCP/${port} 可达`, found.length ? 'ok' : 'info')
-      if (!found.length) notify('未发现邻居 IP；请确认两端 IPv4 同网段、网线和机器人电源')
-      else if (!portCount) notify(`已发现邻居 IP，但 TCP/${port} 未确认；若 SSH 使用其他端口，请修改端口后重试`)
+      const links = [...new Set(found.map(host => host.interface))]
+      log(`在 ${links.length} 张网卡发现 ${found.length} 个 ARP 地址候选，其中 ${portCount} 个 TCP/${port} 可达`, found.length ? 'ok' : 'info')
+      if (!found.length) notify('监听期间未收到可识别的 ARP 候选；静默或尚未发 ARP 的设备无法仅凭网线自动发现')
+      else if (!portCount) notify(`找到 ARP 候选，但所选 TCP/${port} 尚未可达；若没有本机同网段地址，可为该网卡添加临时 IPv4`)
     }
+  }
+  const openAddressDialog = (host: DiscoveredHost) => {
+    const parts = host.address.split('.')
+    const last = parts[3] === '1' ? '2' : '1'
+    const defaultAddress = `${parts.slice(0, 3).join('.')}.${last}/24`
+    setAddressDraft({ interface: host.interface, peer: host.address, cidr: defaultAddress, persistent: false })
+    setAddressDialog(true)
+  }
+  const addTemporaryAddress = async (event: FormEvent) => {
+    event.preventDefault()
+    const updated = await withBusy(() => invoke<OwnedNetworkAddress[]>('add_temporary_network_address', addressDraft))
+    if (updated) {
+      setOwnedNetworkAddresses(updated); setAddressDialog(false)
+      log(`已为 ${addressDraft.interface} 配置临时地址 ${addressDraft.cidr}${addressDraft.persistent ? '（保持）' : '（SSH 会话结束时清理）'}`, 'ok')
+      notify('本机直连接口地址已配置；请重新扫描验证 SSH 端口')
+      refreshNow()
+    }
+  }
+  const removeOwnedAddress = async (entry: OwnedNetworkAddress) => {
+    const updated = await withBusy(() => invoke<OwnedNetworkAddress[]>('remove_owned_network_address', { interface: entry.interface, cidr: entry.cidr }))
+    if (updated) { setOwnedNetworkAddresses(updated); log(`已清理 RoboLink 地址 ${entry.cidr} · ${entry.interface}`, 'warn') }
+  }
+  const cleanupOwnedAddresses = async () => {
+    const updated = await withBusy(() => invoke<OwnedNetworkAddress[]>('cleanup_owned_network_addresses'))
+    if (updated) { setOwnedNetworkAddresses(updated); log('已清理所有 RoboLink 记录的本机临时地址', 'warn') }
   }
   const showConfirm = (title: string, description: string, run: () => Promise<void>, danger = false) => setConfirm({ title, description, run, danger })
 
@@ -392,16 +429,17 @@ export default function RealApp() {
         <div className="page-heading"><div><div className="eyebrow">LINUX HOST <span>·</span> DIRECT ETHERNET / SSH</div><h1>{pageInfo[page].title}</h1><p>{pageInfo[page].subtitle}</p></div><div className="heading-actions"><span className={`runtime-tag ${selected && keyStatus?.trusted ? 'live' : ''}`}><span/>{selected && keyStatus?.trusted ? '真实设备' : '尚未连接'}</span><button className="button button-subtle" onClick={refreshNow} disabled={busy}><RefreshCw size={15}/>刷新</button></div></div>
         {error && <div className="inline-error"><AlertTriangle size={16}/><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误"><X size={15}/></button></div>}
         <div className="page-view" hidden={page !== 'overview'}>{visitedPages.has('overview') && <OverviewPage hostInfo={hostInfo} target={selected} trusted={!!keyStatus?.trusted} connected={sshReady && !terminalExited} remote={remoteOverview} services={services} onAdd={() => openNewTarget()} onConnect={connectTarget} onPage={navPage}/>}</div>
-        <div className="page-view" hidden={page !== 'network'}>{visitedPages.has('network') && <NetworkPage hostInfo={hostInfo} interfaces={wiredInterfaces} selectedInterface={localInterface} setSelectedInterface={name => { setLocalInterface(name); setDiscovered([]) }} scanPort={scanPort} setScanPort={setScanPort} discovered={discovered} onScan={scanInterface} network={remoteNetwork} wifi={wifiNetworks} onScanWifi={scanWifi} onToggleWifi={toggleWifiRadio} onConnectWifi={connectWifi} onAddHost={openNewTarget} busy={busy}/>}</div>
+        <div className="page-view" hidden={page !== 'network'}>{visitedPages.has('network') && <NetworkPage hostInfo={hostInfo} interfaces={wiredInterfaces} selectedInterface={localInterface} setSelectedInterface={name => { setLocalInterface(name); setDiscovered([]) }} scanPort={scanPort} setScanPort={setScanPort} discovered={discovered} ownedAddresses={ownedNetworkAddresses} onScan={scanInterface} onAddAddress={openAddressDialog} onRemoveAddress={removeOwnedAddress} onCleanupAddresses={cleanupOwnedAddresses} network={remoteNetwork} wifi={wifiNetworks} onScanWifi={scanWifi} onToggleWifi={toggleWifiRadio} onConnectWifi={connectWifi} onAddHost={(host, port) => openNewTarget(host, port, 'sunrise')} busy={busy}/>}</div>
         <div className="page-view" hidden={page !== 'services'}>{visitedPages.has('services') && <ServicesPage services={visibleServices} query={serviceQuery} setQuery={setServiceQuery} onAction={doServiceAction} busy={busy}/>}</div>
         <div className="page-view" hidden={page !== 'bluetooth'}>{visitedPages.has('bluetooth') && <BluetoothPage snapshot={bluetooth} onScan={scanBluetooth} onTogglePower={toggleBluetoothPower} onAction={bluetoothAction} busy={busy}/>}</div>
         <div className="page-view" hidden={page !== 'audio'}>{visitedPages.has('audio') && <AudioPage snapshot={audio} sourceVolume={sourceVolume} sinkVolume={sinkVolume} setSourceVolume={setSourceVolume} setSinkVolume={setSinkVolume} onDefault={setDefaultAudio} onVolume={commitAudioVolume} onTest={playTestAudio} busy={busy}/>}</div>
         <div className="page-view" hidden={page !== 'terminal'}>{visitedPages.has('terminal') && <TerminalPage key={sessionId} sessionId={sessionId} exited={terminalExited} sshReady={sshReady} target={selected} theme={theme} onConnect={connectTarget} onDisconnect={disconnectTerminal} onRisk={setDangerLine} onPaste={setPastePreview} onError={setError}/>}</div>
         <div className="page-view" hidden={page !== 'logs'}>{visitedPages.has('logs') && <LogsPage logs={logs} onClear={() => setConfirm({ title: '清空本地诊断记录？', description: '只删除 RoboLink 本机界面中的操作记录，不会影响机器人。', run: async () => { setLogs([]); setConfirm(null) } })}/>}</div>
-        <footer className="footer-note"><ShieldCheck size={14}/>默认只读本机网卡 · SSH 使用独立 known_hosts · RoboLink v0.2.2 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
+        <footer className="footer-note"><ShieldCheck size={14}/>本机地址仅按需临时添加 · SSH 使用独立 known_hosts · RoboLink v0.3.0 测试候选 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
       </div>
     </main>
     {targetDialog && <TargetDialog value={targetDraft} setValue={setTargetDraft} onClose={() => setTargetDialog(false)} onSubmit={saveTarget} busy={busy}/>}
+    {addressDialog && <div className="modal-backdrop"><form className="modal-card" onSubmit={addTemporaryAddress}><div className="modal-title"><div><div className="section-kicker">LOCAL DIRECT LINK · SYSTEM AUTHORIZATION</div><h2>临时配置开发机网口 IPv4</h2></div><button type="button" className="icon-button" onClick={() => setAddressDialog(false)} aria-label="关闭"><X size={18}/></button></div><p className="modal-intro">网口 <strong>{addressDraft.interface}</strong> 的 ARP 候选设备是 <strong>{addressDraft.peer}</strong>。ARP 报文不包含真实子网掩码；下方默认使用 <code>/24</code> 假设，可按机器人说明修改。</p><label>开发机临时地址/CIDR<input required value={addressDraft.cidr} onChange={event => setAddressDraft({ ...addressDraft, cidr: event.target.value })} placeholder="例如 192.168.127.1/24" autoComplete="off"/></label><label className="confirm-check"><input type="checkbox" checked={!addressDraft.persistent} onChange={event => setAddressDraft({ ...addressDraft, persistent: !event.target.checked })}/><span>SSH 会话结束后清理该地址（默认）；取消勾选则保持，直到我手动清理。</span></label><div className="subtle-callout"><ShieldCheck size={15}/><span>继续后会显示系统授权窗口。RoboLink 会先检查地址冲突和重叠路由，再只给这张有线网卡增加一个 IPv4 地址；不会改默认路由、DNS、Wi-Fi 或机器人网络设置。</span></div><div className="modal-actions"><button type="button" className="button button-subtle" onClick={() => setAddressDialog(false)}>取消</button><button className="button button-primary" type="submit" disabled={busy}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : <Check size={15}/>}确认并临时添加</button></div></form></div>}
     {keyDialog && selected && keyStatus && <HostKeyDialog target={selected} status={keyStatus} fingerprint={selectedFingerprint} setFingerprint={setSelectedFingerprint} checked={trustChecked} setChecked={setTrustChecked} onTrust={trustAndConnect} onClear={clearChangedPin} onClose={() => setKeyDialog(false)} busy={busy}/>}
     {confirm && <ConfirmDialog confirm={confirm} onCancel={() => setConfirm(null)} onConfirm={async () => { setBusy(true); setError(''); try { await confirm.run() } catch (e) { setError(displayError(e)); setConfirm(null) } finally { setBusy(false) } }}/>}
     {dangerLine && <ConfirmDialog confirm={{ title: '高风险终端命令', description: `目标：${selected?.username}@${selected?.host}\n命令：${dangerLine}\n\n此命令可能改变网络、服务或磁盘。确认后才会将回车发送到远端 Shell。`, danger: true, run: async () => { await terminalWriterRef.current?.confirmDangerous(); setDangerLine('') } }} onCancel={async () => { await terminalWriterRef.current?.cancelDangerous(); setDangerLine('') }} onConfirm={async () => { await terminalWriterRef.current?.confirmDangerous(); setDangerLine('') }}/>}
@@ -434,17 +472,18 @@ function HealthRow({ icon: Icon, label, value, sub, percent, color }: { icon: ty
 function QuickAction({ icon: Icon, title, detail, onClick }: { icon: typeof Terminal; title: string; detail: string; onClick: () => void }) { return <button className="quick-action" onClick={onClick}><span className="quick-icon blue"><Icon size={17}/></span><span><strong>{title}</strong><small>{detail}</small></span><ChevronRight size={16}/></button> }
 function EmptyState({ text }: { text: string }) { return <div className="empty-state"><Activity size={17}/><span>{text}</span></div> }
 
-function NetworkPage({ hostInfo, interfaces, selectedInterface, setSelectedInterface, scanPort, setScanPort, discovered, onScan, network, wifi, onScanWifi, onToggleWifi, onConnectWifi, onAddHost, busy }: { hostInfo: HostInfo | null; interfaces: HostInterface[]; selectedInterface: string; setSelectedInterface: (v: string) => void; scanPort: string; setScanPort: (v: string) => void; discovered: DiscoveredHost[]; onScan: () => void; network: RemoteNetwork | null; wifi: WifiNetwork[]; onScanWifi: () => void; onToggleWifi: (v: boolean) => void; onConnectWifi: (n: WifiNetwork) => void; onAddHost: (host?: string, port?: number) => void; busy: boolean }) {
+function NetworkPage({ hostInfo, interfaces, selectedInterface, setSelectedInterface, scanPort, setScanPort, discovered, ownedAddresses, onScan, onAddAddress, onRemoveAddress, onCleanupAddresses, network, wifi, onScanWifi, onToggleWifi, onConnectWifi, onAddHost, busy }: { hostInfo: HostInfo | null; interfaces: HostInterface[]; selectedInterface: string; setSelectedInterface: (v: string) => void; scanPort: string; setScanPort: (v: string) => void; discovered: DiscoveredHost[]; ownedAddresses: OwnedNetworkAddress[]; onScan: () => void; onAddAddress: (host: DiscoveredHost) => void; onRemoveAddress: (entry: OwnedNetworkAddress) => void; onCleanupAddresses: () => void; network: RemoteNetwork | null; wifi: WifiNetwork[]; onScanWifi: () => void; onToggleWifi: (v: boolean) => void; onConnectWifi: (n: WifiNetwork) => void; onAddHost: (host?: string, port?: number) => void; busy: boolean }) {
   const selectedLink = interfaces.find(i => i.name === selectedInterface)
-  const linkLocalOnly = !!selectedLink?.ipv4.length && selectedLink.ipv4.every(address => address.startsWith('169.254.'))
-  return <div className="page-stack"><div className="network-warning"><div className="warning-icon"><AlertTriangle size={18}/></div><div><strong>有线网络按点对点连接处理</strong><p>网线直接连接 Linux 开发机和机器人，不依赖交换机或路由器。这里不会自动改开发机地址、默认路由、DNS 或防火墙。</p></div></div>
-    <section className="panel detail-panel"><div className="panel-heading"><div className="heading-icon cable-bg"><Cable size={18}/></div><div><div className="section-kicker">LOCAL LINUX HOST</div><h2>开发机有线网卡</h2></div><span className="small-muted push-right">{hostInfo?.hostname ?? '读取中'}</span></div>
+  const connectedLinks = interfaces.filter(i => i.carrier)
+  return <div className="page-stack"><div className="network-warning"><div className="warning-icon"><AlertTriangle size={18}/></div><div><strong>直连发现只监听已连接的物理有线网口</strong><p>RoboLink 会分别监听每张 LOWER_UP 网卡上的 ARP；不抓 Wi‑Fi、不更改机器人网络。未知静态 IP 只有在设备发出 ARP 报文时才可能被发现。</p></div></div>
+    <section className="panel detail-panel"><div className="panel-heading"><div className="heading-icon cable-bg"><Cable size={18}/></div><div><div className="section-kicker">LOCAL LINUX HOST · MULTI-NIC</div><h2>开发机有线网卡</h2></div><span className="small-muted push-right">{hostInfo?.hostname ?? '读取中'}</span></div>
       {!interfaces.length ? <EmptyState text="未检测到物理有线网卡。请插入网线或检查 iproute2。"/> : <div className="interface-cards">{interfaces.map(i => <button className={`interface-card ${selectedInterface === i.name ? 'selected' : ''}`} key={i.name} onClick={() => setSelectedInterface(i.name)}><span className="interface-card-top"><Cable size={15}/><strong>{i.name}</strong><i className={i.carrier ? 'carrier-up' : 'carrier-down'}/></span><span>{i.carrier ? '物理链路已连接' : '无物理链路'}</span><small>{i.ipv4.join(' · ') || '未配置 IPv4'}{i.mac ? ` · ${i.mac}` : ''}</small></button>)}</div>}
-      <div className={`direct-link-state ${selectedLink?.carrier && selectedLink.ipv4.length ? 'ready' : 'needs-setup'}`}><Cable size={16}/><div><strong>{!selectedLink ? '先选择直连接口' : !selectedLink.carrier ? '尚未检测到网线链路' : !selectedLink.ipv4.length ? '网线已连通，但开发机接口尚无 IPv4 地址' : linkLocalOnly ? '检测到 IPv4 链路本地地址' : '直连接口已配置 IPv4'}</strong><p>{!selectedLink ? '插入直连网线后，选择连接机器人的本机物理以太网口。' : !selectedLink.carrier ? '检查机器人电源、网线两端和所选网卡。直连不需要 Internet，但必须先建立物理链路。' : !selectedLink.ipv4.length ? '本机接口没有 IPv4 时，单靠网线不能推导机器人任意静态 IP。请按机器人说明为两端设置同一网段地址，例如开发机 192.168.77.1/24、机器人 192.168.77.2/24；应用不会自动改本机网络。' : linkLocalOnly ? '169.254/16 可用于无路由器直连；扫描只检查此接口已知的链路本地邻居，不遍历整个 /16。若没有邻居，请按机器人说明配置同网段地址或使用已知 IP。' : `本机直连接口地址：${selectedLink.ipv4.join(' · ')}。无需预先知道机器人 IP；扫描会列出同网段邻居 IP 候选。`}</p>{selectedLink?.carrier && <button className="text-button" onClick={() => onAddHost()}>我已知道机器人 IP / 主机名，手动添加 <ChevronRight size={14}/></button>}</div></div>
-      <div className="connection-steps"><strong>直连操作步骤</strong><ol><li>用网线把本机和已开机的机器人直接相连。</li><li>选择显示“物理链路已连接”、且本机 IPv4 与机器人同网段的有线网卡。</li><li>设置机器人 SSH 的 TCP 端口（默认 22；若使用其他端口，请在下方修改），再点击扫描。</li><li>将 IP 添加为机器人目标；端口可达仍不代表 SSH 身份已验证，首次连接要核对主机指纹。</li></ol></div>
-      <div className="subtle-callout"><ShieldCheck size={16}/><span>扫描只使用所选物理网卡：普通地址仅限其 /24–/30 子网（最多 254 个候选）；169.254/16 只看已知邻居，不扫完整 /16。邻居缓存可能含过期地址；结果标注的是你选定 TCP 端口的可达性，不验证 SSH 握手。不会扫描 Wi‑Fi/其他接口，也不会改本机 IP、路由或防火墙。</span></div>
-      <div className="scan-controls"><label className="scan-port-field"><span>SSH TCP 端口</span><input aria-label="SSH TCP 端口" type="number" min="1" max="65535" step="1" value={scanPort} onChange={event => setScanPort(event.target.value)} disabled={busy}/></label><button className="button button-primary" onClick={onScan} disabled={busy || !selectedInterface || !Number.isInteger(Number(scanPort)) || Number(scanPort) < 1 || Number(scanPort) > 65535}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : <Search size={15}/>}扫描直连设备 IP</button></div>
-      {discovered.length > 0 && <div className="discovery-list"><div className="section-kicker">发现结果 · {discovered.length}</div>{discovered.map(host => <div className="discovered-row" key={host.address}><span className="wifi-small-icon"><Signal size={16}/></span><span><strong>{host.address}</strong><small>{host.interface} · {host.source} · TCP/{host.port} {host.portOpen ? '可达' : '未确认'}</small></span><button className="button button-subtle" onClick={() => onAddHost(host.address, host.port)}>添加为机器人</button></div>)}</div>}
+      <div className={`direct-link-state ${selectedLink?.carrier ? 'ready' : 'needs-setup'}`}><Cable size={16}/><div><strong>{!selectedLink ? '先选择直连接口' : !selectedLink.carrier ? '尚未检测到所选网口链路' : !selectedLink.ipv4.length ? '网线已连通；开发机网口暂时没有 IPv4 地址' : '直连接口已配置 IPv4'}</strong><p>{!selectedLink ? '插入直连网线后，选择连接机器人的本机物理以太网口。扫描会覆盖所有已连接的物理网口。' : !selectedLink.carrier ? '所选网口目前不参与扫描；检查机器人电源、网线两端。' : !selectedLink.ipv4.length ? '现在仍可被动发现 ARP 候选；若要连接，可在发现后按界面指引为对应网口添加一个临时 IPv4。' : `当前网口地址：${selectedLink.ipv4.join(' · ')}。扫描仍会逐张网卡监听并单独标注来源。`}</p>{selectedLink?.carrier && <button className="text-button" onClick={() => onAddHost()}>我已知道机器人 IP / 主机名，手动添加 <ChevronRight size={14}/></button>}</div></div>
+      <div className="connection-steps"><strong>直连操作步骤</strong><ol><li>用网线把本机和已开机、已启用 SSH 的机器人直接相连。</li><li>设置 SSH TCP 端口（默认 22），点击扫描；系统授权弹窗会说明这是 ARP 监听。</li><li>在结果中核对本机网卡、机器人候选 IP 和 MAC。ARP 只显示对端报文，不证明设备身份。</li><li>若没有同网段路由，选择“临时配置本机 IP”。默认 /24 只是可编辑假设；冲突/路由检查通过后才添加。</li><li>端口可达后添加为目标。首次 SSH 仍需经可信渠道核对主机指纹。</li></ol></div>
+      <div className="subtle-callout"><ShieldCheck size={16}/><span>扫描持续 8 秒，独立监听每张 LOWER_UP 物理网口。只把 ARP 源 IP 以及源 IP 为 0.0.0.0 时的 ARP 探测目标列为候选，不把所有 ARP 目标地址当设备；结果显示 MAC、网卡和证据类型。TCP/{scanPort} 仅在系统路由已指向对应网卡时探测。未知子网掩码不会从 ARP 推断；手动配置地址时默认 /24 并需先做重复地址及重叠路由检查。</span></div>
+      <div className="scan-controls"><label className="scan-port-field"><span>SSH TCP 端口</span><input aria-label="SSH TCP 端口" type="number" min="1" max="65535" step="1" value={scanPort} onChange={event => setScanPort(event.target.value)} disabled={busy}/></label><button className="button button-primary" onClick={onScan} disabled={busy || !connectedLinks.length || !Number.isInteger(Number(scanPort)) || Number(scanPort) < 1 || Number(scanPort) > 65535}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : <Search size={15}/>}扫描所有已连接网口（8 秒）</button><span className="small-muted">{connectedLinks.length} 张链路已连接</span></div>
+      {discovered.length > 0 && <div className="discovery-list"><div className="section-kicker">ARP 发现结果 · {discovered.length}</div>{discovered.map((host, index) => <div className="discovered-row" key={`${host.interface}-${host.address}-${host.mac}-${index}`}><span className="wifi-small-icon"><Signal size={16}/></span><span className="discovered-copy"><strong>{host.address}</strong><small>{host.interface} · MAC {host.mac} · {host.source}（{host.confidence}）</small><small>TCP/{host.port} {host.portOpen ? '可达' : host.routeReady ? '路由已到此网口，端口未确认' : '当前路由未到此网口'}</small></span><div className="discovery-actions">{!host.routeReady && <button className="button button-subtle" onClick={() => onAddAddress(host)} disabled={busy}>临时配置本机 IP</button>}<button className="button button-subtle" onClick={() => onAddHost(host.address, host.port)}>添加为机器人</button></div></div>)}</div>}
+      {ownedAddresses.length > 0 && <div className="owned-addresses"><div className="owned-addresses-heading"><div><div className="section-kicker">ROBOlink OWNED · LOCAL IPv4</div><strong>RoboLink 添加的地址</strong></div><button className="button button-subtle" onClick={onCleanupAddresses} disabled={busy}><Trash2 size={14}/>全部清理</button></div>{ownedAddresses.map(entry => <div className="owned-address-row" key={`${entry.interface}-${entry.cidr}`}><span><strong>{entry.cidr}</strong><small>{entry.interface} · 对端 {entry.peer} · {entry.persistent ? '保持模式' : 'SSH 会话模式'}</small></span><button className="icon-button" title="清理此地址" aria-label={`清理 ${entry.cidr}`} onClick={() => onRemoveAddress(entry)} disabled={busy}><Trash2 size={15}/></button></div>)}</div>}
     </section>
     <section className="panel detail-panel"><div className="panel-heading"><div className="heading-icon wifi-bg"><Wifi size={18}/></div><div><div className="section-kicker">ROBOT ONLY · NETWORKMANAGER</div><h2>机器人 Wi-Fi</h2></div>{network?.supported && <span className={`connected-pill ${network.wifiEnabled ? '' : 'not-connected'} push-right`}><span/>{network.wifiEnabled ? '无线已开启' : '无线已关闭'}</span>}</div>
       {!network ? <EmptyState text="连接机器人并固定 SSH 指纹后读取 NetworkManager 状态。"/> : !network.supported ? <EmptyState text={network.note ?? '机器人没有可用的 NetworkManager/nmcli。'}/> : <><div className="remote-device-list">{network.devices.filter(d => d.kind.toLowerCase().includes('wifi') || d.kind.toLowerCase().includes('wireless')).map(d => <InfoRow key={d.device} label={`${d.device} · ${d.kind}`} value={`${d.state}${d.connection ? ` · ${d.connection}` : ''}`}/>)}</div><div className="wifi-actions"><div className="section-kicker">AVAILABLE NETWORKS</div><div className="inline-actions"><button className="button button-subtle" onClick={onScanWifi} disabled={busy}><RefreshCw size={14}/>扫描机器人 Wi-Fi</button><button className="button button-subtle" onClick={() => onToggleWifi(!network.wifiEnabled)} disabled={busy}><Power size={14}/>{network.wifiEnabled ? '关闭无线…' : '开启无线…'}</button></div></div><div className="wifi-list">{wifi.map((w, i) => <div className="wifi-row real-wifi-row" key={`${w.ssid}-${i}`}><span className="wifi-small-icon"><Wifi size={16}/></span><span className="wifi-row-copy"><strong>{w.ssid || '(隐藏网络)'} {w.inUse && <span className="current-badge">当前网络</span>}</strong><small>{w.security || '开放网络'} · 信号 {w.signal}%</small></span><button className="button button-subtle" onClick={() => onConnectWifi(w)} disabled={busy}>{w.inUse ? '重新连接…' : '连接…'}</button></div>)}</div></>}

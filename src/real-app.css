@@ -238,3 +238,24 @@ html[data-theme="light"] .direct-link-state.ready p{color:#668271}
 html[data-theme="light"] .fingerprint-choice{border-color:#d4dfe4;background:#f7fafb}
 html[data-theme="light"] .fingerprint-choice code{color:#3b5361}
 html[data-theme="light"] .fingerprint-choice.selected{border-color:#6aa886;background:#edf8f1}
+
+.discovered-row{display:flex;align-items:center;gap:10px;min-height:72px;border-bottom:1px solid #202b37;padding:10px 3px}
+.discovered-row:last-child{border-bottom:0}
+.discovered-copy{display:flex;flex:1;min-width:150px;flex-direction:column;gap:4px}
+.discovered-copy strong{color:#dbe5ec;font:11px 'DM Mono',ui-monospace,monospace}
+.discovered-copy small{color:#81919e;font-size:8px;line-height:1.45;overflow-wrap:anywhere}
+.discovery-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.owned-addresses{margin-top:15px;padding:12px 13px;border:1px solid #293944;border-radius:8px;background:#111a23}
+.owned-addresses-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:8px}
+.owned-addresses-heading>div{display:flex;flex-direction:column;gap:4px}
+.owned-addresses-heading strong{font-size:10px;color:#d7e1e8;font-weight:500}
+.owned-address-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:45px;border-top:1px solid #24313d}
+.owned-address-row>span{display:flex;flex-direction:column;gap:4px;min-width:0}
+.owned-address-row strong{color:#b9dfc9;font:10px 'DM Mono',ui-monospace,monospace}
+.owned-address-row small{color:#7e909c;font-size:8px;overflow-wrap:anywhere}
+html[data-theme="light"] .discovered-copy strong{color:#354b57}
+html[data-theme="light"] .discovered-copy small,html[data-theme="light"] .owned-address-row small{color:#647d89}
+html[data-theme="light"] .owned-addresses{background:#f6f9fa;border-color:#d8e3e7}
+html[data-theme="light"] .owned-addresses-heading strong{color:#354b57}
+html[data-theme="light"] .owned-address-row{border-top-color:#dce5e9}
+@media(max-width:700px){.discovered-row{align-items:flex-start;flex-wrap:wrap}.discovered-copy{flex:1 1 calc(100% - 44px)}.discovery-actions{width:100%;padding-left:40px;justify-content:flex-start}.owned-addresses-heading{align-items:flex-start;flex-direction:column}.scan-controls .small-muted{width:100%}}

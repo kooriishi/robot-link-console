@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "RoboLink",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "identifier": "dev.robolink.console",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build && npm run build:net-helper",
     "frontendDist": "../dist"
   },
   "app": {
@@ -28,7 +28,13 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "appimage"],
+    "targets": ["deb"],
+    "externalBin": ["binaries/robolink-net-helper"],
+    "linux": {
+      "deb": {
+        "depends": ["iproute2", "openssh-client", "policykit-1", "libwebkit2gtk-4.1-0 (>= 2.38)"]
+      }
+    },
     "category": "Utility",
     "shortDescription": "Linux 调试台，用于无头机器人 SSH 与外设调试",
     "longDescription": "运行在 Linux 开发机上的机器人调试控制台，支持直连以太网与 OpenSSH。",

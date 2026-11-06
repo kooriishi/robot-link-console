@@ -1,6 +1,9 @@
 node_modules/
 dist/
 /src-tauri/target/
+/src-tauri/binaries/
+/net-helper/target/
+/artifacts/
 /src-tauri/gen/schemas/
 *.local
 .DS_Store

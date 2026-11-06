@@ -1,11 +1,12 @@
 use crate::model::*;
 use crate::ssh;
-use crate::state::AppState;
+use crate::state::{AppState, OwnedNetworkAddress};
+use serde::Deserialize;
 use serde_json::Value;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -24,7 +25,7 @@ pub fn get_host_info() -> Result<HostInfo, String> {
         .trim_matches('"')
         .to_string();
     let output = Command::new("ip")
-        .args(["-json", "-4", "address", "show"])
+        .args(["-json", "address", "show"])
         .output()
         .map_err(|e| format!("无法读取本机网卡：{e}；请安装 iproute2"))?;
     if !output.status.success() {
@@ -68,9 +69,17 @@ pub fn get_host_info() -> Result<HostInfo, String> {
                 ))
             })
             .collect();
+        let lower_up = row
+            .get("flags")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .any(|flag| flag == "LOWER_UP");
         let carrier = fs::read_to_string(sys.join("carrier"))
             .map(|v| v.trim() == "1")
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && lower_up;
         let state = row
             .get("operstate")
             .and_then(Value::as_str)
@@ -353,13 +362,356 @@ pub fn scan_direct_interface(interface: String, port: u16) -> Result<Vec<Discove
         .map(|ip| DiscoveredHost {
             address: ip.to_string(),
             interface: interface.clone(),
+            mac: neighbor_mac(&rows, &interface, ip).unwrap_or_else(|| "未知".into()),
             port,
             port_open: open_ips.contains(&ip),
+            route_ready: true,
             source: source.into(),
+            confidence: "路由/邻居候选".into(),
         })
         .collect();
     result.sort_by(|a, b| a.address.cmp(&b.address));
     Ok(result)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PassiveArpCandidate {
+    interface: String,
+    address: String,
+    mac: String,
+    source: String,
+    confidence: String,
+}
+
+fn trusted_network_helper() -> Result<std::path::PathBuf, String> {
+    let executable = std::env::current_exe().map_err(|e| format!("无法定位 RoboLink 程序：{e}"))?;
+    let helper = executable
+        .parent()
+        .ok_or("无法定位 RoboLink 安装目录")?
+        .join("robolink-net-helper");
+    let metadata = fs::symlink_metadata(&helper)
+        .map_err(|_| "没有找到系统安装的网络助手。请使用 RoboLink .deb 安装包；源码开发模式不会启用本机网络修改。".to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(
+            "网络助手安装路径不安全，已拒绝运行。请重新安装正式的 RoboLink .deb 候选包。".into(),
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Err("网络助手必须由系统包管理器安装为 root 所有且不可被普通用户改写。请重新安装 RoboLink .deb 候选包。".into());
+        }
+        let directory = helper.parent().ok_or("无法定位网络助手安装目录")?;
+        let directory_metadata = fs::symlink_metadata(directory)
+            .map_err(|e| format!("读取网络助手安装目录失败：{e}"))?;
+        if directory_metadata.file_type().is_symlink()
+            || !directory_metadata.is_dir()
+            || directory_metadata.uid() != 0
+            || directory_metadata.mode() & 0o022 != 0
+        {
+            return Err("网络助手所在目录不是 root 所有的受保护系统目录，已拒绝提权。".into());
+        }
+    }
+    Ok(helper)
+}
+
+fn run_network_helper(arguments: &[String]) -> Result<String, String> {
+    let helper = trusted_network_helper()?;
+    let output = Command::new("/usr/bin/pkexec")
+        .arg(helper)
+        .args(arguments)
+        .output()
+        .map_err(|e| format!("无法打开系统授权弹窗：{e}。请确认桌面环境安装并运行了 polkit。"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "系统授权未完成，网络操作没有执行。".into()
+        } else {
+            format!("系统授权未完成或网络操作失败：{detail}")
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn route_uses_interface(address: Ipv4Addr, interface: &str) -> bool {
+    let output = Command::new("ip")
+        .args(["-4", "route", "get", &address.to_string()])
+        .output();
+    let Ok(output) = output else { return false };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| pair[0] == "dev" && pair[1] == interface)
+}
+
+#[tauri::command]
+pub fn scan_direct_interfaces(port: u16) -> Result<Vec<DiscoveredHost>, String> {
+    validate_scan_port(port)?;
+    let host_info = get_host_info()?;
+    let interfaces = host_info
+        .interfaces
+        .iter()
+        .filter(|iface| iface.kind == "有线以太网" && iface.carrier)
+        .map(|iface| iface.name.clone())
+        .collect::<Vec<_>>();
+    if interfaces.is_empty() {
+        return Err(
+            "没有检测到 LOWER_UP 的物理有线网口。请插好网线、检查机器人电源，再刷新网卡列表。"
+                .into(),
+        );
+    }
+    let mut arguments = vec!["discover".to_string(), "8".to_string()];
+    arguments.extend(interfaces.iter().cloned());
+    let output = run_network_helper(&arguments)?;
+    let candidates: Vec<PassiveArpCandidate> =
+        serde_json::from_str(&output).map_err(|e| format!("解析 ARP 发现结果失败：{e}"))?;
+    let mut result = candidates
+        .into_iter()
+        .take(2048)
+        .map(|candidate| {
+            let address = candidate.address.parse::<Ipv4Addr>().ok();
+            let route_ready = address
+                .map(|ip| route_uses_interface(ip, &candidate.interface))
+                .unwrap_or(false);
+            let port_open = if route_ready {
+                let Some(ip) = address else {
+                    return DiscoveredHost {
+                        address: candidate.address,
+                        interface: candidate.interface,
+                        mac: candidate.mac,
+                        port,
+                        port_open: false,
+                        route_ready: false,
+                        source: candidate.source,
+                        confidence: candidate.confidence,
+                    };
+                };
+                TcpStream::connect_timeout(
+                    &SocketAddrV4::new(ip, port).into(),
+                    Duration::from_millis(400),
+                )
+                .is_ok()
+            } else {
+                false
+            };
+            DiscoveredHost {
+                address: candidate.address,
+                interface: candidate.interface,
+                mac: candidate.mac,
+                port,
+                port_open,
+                route_ready,
+                source: candidate.source,
+                confidence: candidate.confidence,
+            }
+        })
+        .collect::<Vec<_>>();
+    result.sort_by(|a, b| {
+        a.interface
+            .cmp(&b.interface)
+            .then_with(|| a.address.cmp(&b.address))
+            .then_with(|| a.mac.cmp(&b.mac))
+    });
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn list_owned_network_addresses(
+    state: State<'_, AppState>,
+) -> Result<Vec<OwnedNetworkAddress>, String> {
+    state.load_network_addresses()
+}
+
+#[tauri::command]
+pub fn add_temporary_network_address(
+    state: State<'_, AppState>,
+    interface: String,
+    peer: String,
+    cidr: String,
+    persistent: bool,
+) -> Result<Vec<OwnedNetworkAddress>, String> {
+    validate_ifname(&interface)?;
+    let peer_ip = peer
+        .parse::<Ipv4Addr>()
+        .map_err(|_| "候选设备必须是 IPv4 地址".to_string())?;
+    validate_temporary_cidr(&cidr, peer_ip)?;
+    let host = get_host_info()?;
+    if !host
+        .interfaces
+        .iter()
+        .any(|item| item.name == interface && item.kind == "有线以太网" && item.carrier)
+    {
+        return Err("所选接口已断开或不再是物理有线网卡。请重新扫描。".into());
+    }
+    let mut owned = state.load_network_addresses()?;
+    if let Some(existing) = owned
+        .iter_mut()
+        .find(|item| item.interface == interface && item.cidr == cidr)
+    {
+        existing.peer = peer_ip.to_string();
+        existing.persistent = persistent;
+        state.save_network_addresses(&owned)?;
+        return Ok(owned);
+    }
+    let arguments = vec![
+        "add-address".to_string(),
+        interface.clone(),
+        cidr.clone(),
+        peer_ip.to_string(),
+    ];
+    run_network_helper(&arguments)?;
+    owned.push(OwnedNetworkAddress {
+        interface,
+        cidr,
+        peer: peer_ip.to_string(),
+        persistent,
+    });
+    if let Err(error) = state.save_network_addresses(&owned) {
+        let _ = run_network_helper(&[
+            "remove-address".into(),
+            owned
+                .last()
+                .map(|v| v.interface.clone())
+                .unwrap_or_default(),
+            owned.last().map(|v| v.cidr.clone()).unwrap_or_default(),
+        ]);
+        return Err(format!(
+            "网络地址已添加，但无法记录归属；已尝试立即撤销：{error}"
+        ));
+    }
+    Ok(owned)
+}
+
+#[tauri::command]
+pub fn remove_owned_network_address(
+    state: State<'_, AppState>,
+    interface: String,
+    cidr: String,
+) -> Result<Vec<OwnedNetworkAddress>, String> {
+    let mut owned = state.load_network_addresses()?;
+    if !owned
+        .iter()
+        .any(|item| item.interface == interface && item.cidr == cidr)
+    {
+        return Err("RoboLink 没有记录这条网络地址的所有权，因此拒绝删除。".into());
+    }
+    run_network_helper(&["remove-address".into(), interface.clone(), cidr.clone()])?;
+    owned.retain(|item| item.interface != interface || item.cidr != cidr);
+    state.save_network_addresses(&owned)?;
+    Ok(owned)
+}
+
+#[tauri::command]
+pub fn cleanup_session_network_addresses(
+    state: State<'_, AppState>,
+) -> Result<Vec<OwnedNetworkAddress>, String> {
+    let mut owned = state.load_network_addresses()?;
+    let session_items = owned
+        .iter()
+        .filter(|item| !item.persistent)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut failures = Vec::new();
+    for item in session_items {
+        match run_network_helper(&[
+            "remove-address".into(),
+            item.interface.clone(),
+            item.cidr.clone(),
+        ]) {
+            Ok(_) => owned
+                .retain(|current| current.interface != item.interface || current.cidr != item.cidr),
+            Err(error) => failures.push(format!("{} {}：{error}", item.interface, item.cidr)),
+        }
+    }
+    state.save_network_addresses(&owned)?;
+    if failures.is_empty() {
+        Ok(owned)
+    } else {
+        Err(format!(
+            "部分会话地址未能清理；可在“网络与 Wi‑Fi”页查看并重试：{}",
+            failures.join("；")
+        ))
+    }
+}
+
+#[tauri::command]
+pub fn cleanup_owned_network_addresses(
+    state: State<'_, AppState>,
+) -> Result<Vec<OwnedNetworkAddress>, String> {
+    let mut owned = state.load_network_addresses()?;
+    let initial = owned.clone();
+    let mut failures = Vec::new();
+    for item in initial {
+        match run_network_helper(&[
+            "remove-address".into(),
+            item.interface.clone(),
+            item.cidr.clone(),
+        ]) {
+            Ok(_) => owned
+                .retain(|current| current.interface != item.interface || current.cidr != item.cidr),
+            Err(error) => failures.push(format!("{} {}：{error}", item.interface, item.cidr)),
+        }
+    }
+    state.save_network_addresses(&owned)?;
+    if failures.is_empty() {
+        Ok(owned)
+    } else {
+        Err(format!(
+            "部分 RoboLink 地址未能清理；仍保留在列表中：{}",
+            failures.join("；")
+        ))
+    }
+}
+
+fn neighbor_mac(rows: &[Value], interface: &str, ip: Ipv4Addr) -> Option<String> {
+    let ip_text = ip.to_string();
+    rows.iter().find_map(|row| {
+        (row.get("dev").and_then(Value::as_str) == Some(interface)
+            && row.get("dst").and_then(Value::as_str) == Some(ip_text.as_str()))
+        .then(|| {
+            row.get("lladdr")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten()
+    })
+}
+
+fn validate_temporary_cidr(cidr: &str, peer: Ipv4Addr) -> Result<(), String> {
+    let (address, prefix) = cidr
+        .split_once('/')
+        .ok_or("本机地址请使用 IPv4/CIDR 格式，例如 192.168.127.1/24")?;
+    let address = address
+        .parse::<Ipv4Addr>()
+        .map_err(|_| "本机 IPv4 地址格式无效".to_string())?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| "IPv4 前缀长度无效".to_string())?;
+    if !(1..=30).contains(&prefix)
+        || address.is_unspecified()
+        || address.is_multicast()
+        || address == Ipv4Addr::BROADCAST
+    {
+        return Err("仅支持普通 IPv4 地址和 /1–/30 前缀".into());
+    }
+    let mask = u32::MAX << (32 - prefix);
+    let network = u32::from(address) & mask;
+    let host_mask = !mask;
+    let local_host = u32::from(address) & host_mask;
+    let peer_host = u32::from(peer) & host_mask;
+    if local_host == 0 || local_host == host_mask || peer_host == 0 || peer_host == host_mask {
+        return Err("本机地址和设备地址不能是所选子网的网络地址或广播地址".into());
+    }
+    if network != (u32::from(peer) & mask) {
+        return Err(format!(
+            "本机地址 {cidr} 与设备 {peer} 不在同一网段；请调整地址或前缀。"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_scan_port(port: u16) -> Result<(), String> {
@@ -1037,6 +1389,22 @@ mod tests {
         assert!(validate_scan_port(22).is_ok());
         assert!(validate_scan_port(2222).is_ok());
         assert!(validate_scan_port(u16::MAX).is_ok());
+    }
+
+    #[test]
+    fn temporary_address_requires_same_subnet_and_host_addresses() {
+        assert!(
+            validate_temporary_cidr("192.168.127.1/24", Ipv4Addr::new(192, 168, 127, 2)).is_ok()
+        );
+        assert!(
+            validate_temporary_cidr("192.168.127.1/24", Ipv4Addr::new(192, 168, 128, 2)).is_err()
+        );
+        assert!(
+            validate_temporary_cidr("192.168.127.1/24", Ipv4Addr::new(192, 168, 127, 255)).is_err()
+        );
+        assert!(
+            validate_temporary_cidr("192.168.127.0/24", Ipv4Addr::new(192, 168, 127, 2)).is_err()
+        );
     }
 
     #[test]

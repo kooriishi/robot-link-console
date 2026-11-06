@@ -16,11 +16,21 @@ pub struct HostPin {
     pub known_hosts_lines: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedNetworkAddress {
+    pub interface: String,
+    pub cidr: String,
+    pub peer: String,
+    pub persistent: bool,
+}
+
 pub struct AppState {
     pub config_dir: PathBuf,
     pub targets_file: PathBuf,
     pub pins_file: PathBuf,
     pub known_hosts_file: PathBuf,
+    pub network_addresses_file: PathBuf,
     pub sessions: Mutex<HashMap<String, TerminalSession>>,
     persistence_lock: Mutex<()>,
 }
@@ -37,6 +47,7 @@ impl AppState {
             targets_file: config_dir.join("targets.json"),
             pins_file: config_dir.join("host-pins.json"),
             known_hosts_file: config_dir.join("known_hosts"),
+            network_addresses_file: config_dir.join("owned-network-addresses.json"),
             config_dir,
             sessions: Mutex::new(HashMap::new()),
             persistence_lock: Mutex::new(()),
@@ -80,6 +91,18 @@ impl AppState {
             }
             .as_bytes(),
         )
+    }
+
+    pub fn load_network_addresses(&self) -> Result<Vec<OwnedNetworkAddress>, String> {
+        read_json(&self.network_addresses_file)
+    }
+
+    pub fn save_network_addresses(&self, addresses: &[OwnedNetworkAddress]) -> Result<(), String> {
+        let _guard = self
+            .persistence_lock
+            .lock()
+            .map_err(|_| "网络地址配置写入锁不可用".to_string())?;
+        write_json_atomic(&self.network_addresses_file, addresses)
     }
 }
 
