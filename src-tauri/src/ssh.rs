@@ -78,10 +78,13 @@ fn scan_keys(target: &Target) -> Result<Vec<ScannedKey>, String> {
         .output()
         .map_err(|e| format!("无法运行 ssh-keyscan：{e}；请安装 OpenSSH 客户端"))?;
     if !output.status.success() && output.stdout.is_empty() {
-        return Err(format!(
-            "读取机器人 SSH 主机密钥失败：{}",
-            safe_stderr(&output.stderr)
-        ));
+        let detail = safe_stderr(&output.stderr);
+        let hint = unreachable_hint(&target.host, target.port);
+        return Err(if detail.is_empty() {
+            format!("读取机器人 SSH 主机密钥失败：{hint}")
+        } else {
+            format!("读取机器人 SSH 主机密钥失败：{detail}。{hint}")
+        });
     }
     let lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -529,6 +532,53 @@ pub fn close_terminal(state: &AppState, session_id: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// ssh-keyscan prints nothing on timeout; explain the most likely reason instead of an empty error.
+fn unreachable_hint(host: &str, port: u16) -> String {
+    let Ok(ip) = host.parse::<std::net::Ipv4Addr>() else {
+        return format!("{host}:{port} 在 5 秒内没有响应。请检查网线、目标 IP、SSH 服务及端口。");
+    };
+    let route = Command::new("ip")
+        .args(["-4", "route", "get", &ip.to_string()])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    unreachable_hint_from_route(ip, port, &route, |dev| {
+        std::path::Path::new("/sys/class/net")
+            .join(dev)
+            .join("wireless")
+            .exists()
+    })
+}
+
+fn unreachable_hint_from_route(
+    ip: std::net::Ipv4Addr,
+    port: u16,
+    route: &str,
+    is_wireless: impl Fn(&str) -> bool,
+) -> String {
+    let words = route.split_whitespace().collect::<Vec<_>>();
+    let value = |key: &str| {
+        words
+            .windows(2)
+            .find(|w| w[0] == key)
+            .map(|w| w[1].to_string())
+    };
+    let dev = value("dev").unwrap_or_default();
+    let fix = "请到“网络与 Wi-Fi”页重新扫描，在该候选上点“临时配置本机 IPv4”（例如 192.168.127.10 对应本机 192.168.127.1/24），再核验连接。";
+    if words.is_empty() {
+        return format!("本机没有去往 {ip} 的路由，开发机网口与开发板不在同一网段。{fix}");
+    }
+    if let Some(gateway) = value("via") {
+        return format!("去往 {ip} 的流量会经网关 {gateway}（{dev}）发出，而不是走直连网线：开发机网口与开发板不在同一网段。{fix}");
+    }
+    if !dev.is_empty() && is_wireless(&dev) {
+        return format!("去往 {ip} 的流量会走无线网卡 {dev}，而不是直连网线。{fix}");
+    }
+    format!("{ip}:{port} 经 {dev} 在 5 秒内没有响应。请确认开发板 SSH 服务已启动、端口 {port} 正确，且防火墙未拦截。")
+}
+
 fn safe_stderr(input: &[u8]) -> String {
     let mut s = String::from_utf8_lossy(input).trim().to_string();
     s = s
@@ -546,6 +596,33 @@ mod tests {
     fn shell_quotes_arbitrary_network_names() {
         assert_eq!(shell_quote("Lab's WiFi"), "'Lab'\\''s WiFi'");
         assert_eq!(shell_quote("$(touch /tmp/x)"), "'$(touch /tmp/x)'");
+    }
+
+    #[test]
+    fn unreachable_hint_explains_missing_direct_route() {
+        let ip = "192.168.127.10".parse().unwrap();
+        let via = unreachable_hint_from_route(
+            ip,
+            22,
+            "192.168.127.10 via 10.0.0.1 dev wlp2s0 src 10.0.0.5 uid 1000",
+            |_| true,
+        );
+        assert!(via.contains("网关 10.0.0.1") && via.contains("临时配置本机 IPv4"));
+        let wifi = unreachable_hint_from_route(
+            ip,
+            22,
+            "192.168.127.10 dev wlp2s0 src 192.168.127.5",
+            |d| d == "wlp2s0",
+        );
+        assert!(wifi.contains("无线网卡 wlp2s0"));
+        let wired = unreachable_hint_from_route(
+            ip,
+            2222,
+            "192.168.127.10 dev enp3s0 src 192.168.127.1",
+            |_| false,
+        );
+        assert!(wired.contains("端口 2222") && wired.contains("enp3s0"));
+        assert!(unreachable_hint_from_route(ip, 22, "", |_| false).contains("没有去往"));
     }
 
     #[test]
