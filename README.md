@@ -4,9 +4,9 @@ RoboLink 是运行在 Linux 开发机上的桌面 GUI，用 SSH 管理 Linux 机
 
 ## 版本状态
 
-当前源码为 **v0.4.2 测试候选**。v0.4.2 新增“主动 ARP 扫描”：一根网线直连时，即使开发板处于静默状态（不重启、不主动发包）、开发机网口也没有 IPv4，点击“开始发现”也能找到开发板 IP；同时把所有后端命令移出 GUI 主线程并缓存远端页面数据，解决页面切换卡顿。详见 [v0.4.2 发布说明](docs/release-notes-v0.4.2.md)。**没有创建 GitHub Release**，也没有真实机器人硬件验收；请先在自己的 Ubuntu 22.04.5 开发机和机器人上试用，再决定是否发布。
+当前版本为 **v0.4.3**。本版为机器人端服务、Wi-Fi 开关和蓝牙变更加了一次性 sudo 授权：非交互操作在确认后短暂输入密码，密码只经 SSH 加密连接的标准输入发送，不写入命令参数、配置文件或诊断记录。Wi-Fi 连接和蓝牙配对等需要交互的操作仍在 SSH 终端提示 sudo 密码及系统要求的 Wi-Fi 密码/配对确认。切换 Wi-Fi 前只为当前 SSH 客户端添加运行期 /32 或 /128 有线回程路由，不改默认路由和 DNS，机器人互联网流量仍按 Wi-Fi 默认路由。
 
-已完成桌面后端 13 项、网络 helper 21 项单元测试，两部分零警告 Clippy 检查，以及 TypeScript/Vite 生产构建。最终 Debian 包已在隔离 Ubuntu 22.04 用户空间安装，并以普通用户启动出 1440×960 原生窗口；应用与 helper 的 GLIBC 最高要求均为 2.34。这些仅是自动化、模拟界面与启动冒烟检查，不表示已验证真机发现、DHCP 分配或 SSH 登录。
+当前自动化覆盖主应用 18 项、网络 helper 25 项 Rust 单元测试，TypeScript/Vite 生产构建通过。Debian 包在 Ubuntu 22.04 (Jammy) 用户空间构建，已检查控制信息、归档文件、可执行文件及动态库（无缺失依赖，最高 GLIBC 2.34）；尚未进行真实机器人硬件验收。
 
 ## 可选设备发现策略
 
@@ -31,11 +31,11 @@ ARP Probe、DHCP 请求地址、IPv6 DAD 和邻居缓存都是不同强度的候
 - 通过已验证 SSH 读取机器人概览、systemd、NetworkManager Wi-Fi、BlueZ、PipeWire/PulseAudio 和 ALSA 硬件 PCM 清单。
 - 交互终端、高风险命令确认、多行粘贴预览、本地诊断记录和浅色/深色切换。
 
-整个 GUI 不以 root 运行。应用不会主动修改机器人的地址、Wi-Fi 默认网关或 DNS，不会关闭防火墙。DHCP 仅适用于你确认的一根网线直连，不应在办公网络或共享 LAN 上启动。当前不实现电脑向机器人共享 Internet；机器人对 DHCP 的具体行为仍需实机验证。
+整个 GUI 不以 root 运行。机器人端需要提权的服务、Wi-Fi 和蓝牙变更在用户确认后使用一次性 sudo 密码；密码不会保存或写入应用日志。切 Wi-Fi 时，RoboLink 只在机器人内存路由表里为当前 SSH 客户端加一条精确主机路由，经原有有线接口回包；不覆盖已存在的不同静态路由，也不改默认路由、DNS、机器人 IP 或防火墙。Wi-Fi 开启并联网时，其他流量仍可走 Wi-Fi。DHCP 仅适用于你确认的一根网线直连，不应在办公网络或共享 LAN 上启动。当前不实现电脑向机器人共享 Internet；机器人 DHCP 和路由行为仍需实机验证。
 
 ## Ubuntu 22.04 安装与试用
 
-收到 `RoboLink_0.4.2_ubuntu22.04_amd64.deb` 后，在 Ubuntu 文件管理器里双击，用“应用中心/软件安装”打开并点击“安装”，然后从系统应用列表启动 **RoboLink**。无需在机器人端安装 RoboLink。详细图形界面操作见[第一次直连 Linux 机器人](docs/first-direct-connection.md)。
+收到 `RoboLink_0.4.3_ubuntu22.04_amd64.deb` 后，在 Ubuntu 文件管理器里双击，用“应用中心/软件安装”打开并点击“安装”，然后从系统应用列表启动 **RoboLink**。无需在机器人端安装 RoboLink。详细图形界面操作见[第一次直连 Linux 机器人](docs/first-direct-connection.md)。
 
 测试包以 Ubuntu 22.04 amd64 用户空间构建，最高要求 GLIBC 2.34。需要 WebKitGTK 4.1 至少 2.38、GTK、OpenSSH、iproute2、polkit、iputils-ping 和 dnsmasq-base；dnsmasq-base 提供受限 DHCP 使用的二进制，不代表 RoboLink 会默认启动 DHCP 服务。若桌面安装器提示依赖不足，请先使用 Ubuntu“软件更新器”，不要从不明网站单独下载系统库。其他发行版/CPU 架构需要单独构建与验证。
 

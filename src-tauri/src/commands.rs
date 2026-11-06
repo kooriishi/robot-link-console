@@ -1291,6 +1291,7 @@ pub fn service_action(
     target_id: String,
     service: String,
     action: String,
+    sudo_password: String,
 ) -> Result<String, String> {
     validate_service_name(&service)?;
     if !["start", "stop", "restart"].contains(&action.as_str()) {
@@ -1298,7 +1299,7 @@ pub fn service_action(
     }
     let target = ssh::lookup_target(&state, &target_id)?;
     let script = format!("systemctl --no-ask-password {} {}", action, service);
-    ssh::remote_command(&state, &target, &script)?;
+    ssh::remote_command_sudo(&state, &target, &script, &sudo_password)?;
     Ok(format!("{service} 已执行 {action}；请刷新状态确认结果"))
 }
 
@@ -1405,10 +1406,16 @@ pub fn set_remote_wifi_radio(
     state: State<'_, AppState>,
     target_id: String,
     enabled: bool,
+    sudo_password: String,
 ) -> Result<(), String> {
     let target = ssh::lookup_target(&state, &target_id)?;
     let on_off = if enabled { "on" } else { "off" };
-    ssh::remote_command(&state, &target, &format!("nmcli radio wifi {on_off}"))?;
+    ssh::remote_wifi_command_sudo(
+        &state,
+        &target,
+        &format!("nmcli radio wifi {on_off}"),
+        &sudo_password,
+    )?;
     Ok(())
 }
 
@@ -1421,10 +1428,11 @@ pub fn start_wifi_connect(
 ) -> Result<String, String> {
     validate_wifi_ssid(&ssid)?;
     let target = ssh::lookup_target(&state, &target_id)?;
-    let command = format!(
+    let payload = format!(
         "nmcli --ask device wifi connect {}",
         ssh::shell_quote(&ssid)
     );
+    let command = ssh::wifi_route_guarded_command(&payload, true);
     ssh::start_terminal(&app, &state, &target, Some(&command))
 }
 
@@ -1543,10 +1551,16 @@ pub fn set_bluetooth_power(
     state: State<'_, AppState>,
     target_id: String,
     enabled: bool,
+    sudo_password: String,
 ) -> Result<(), String> {
     let target = ssh::lookup_target(&state, &target_id)?;
     let power = if enabled { "on" } else { "off" };
-    ssh::remote_command(&state, &target, &format!("bluetoothctl power {power}"))?;
+    ssh::remote_command_sudo(
+        &state,
+        &target,
+        &format!("bluetoothctl power {power}"),
+        &sudo_password,
+    )?;
     Ok(())
 }
 
@@ -1557,6 +1571,7 @@ pub fn bluetooth_action(
     target_id: String,
     address: String,
     action: String,
+    sudo_password: String,
 ) -> Result<Option<String>, String> {
     validate_mac(&address)?;
     let target = ssh::lookup_target(&state, &target_id)?;
@@ -1566,13 +1581,17 @@ pub fn bluetooth_action(
             &app,
             &state,
             &target,
-            Some(&format!("bluetoothctl pair {}", ssh::shell_quote(&mac))),
+            Some(&format!(
+                "sudo -p '[sudo] password for %u: ' -- bluetoothctl pair {}",
+                ssh::shell_quote(&mac)
+            )),
         )?)),
         "connect" | "disconnect" | "remove" | "trust" => {
-            ssh::remote_command(
+            ssh::remote_command_sudo(
                 &state,
                 &target,
                 &format!("bluetoothctl {} {}", action, ssh::shell_quote(&mac)),
+                &sudo_password,
             )?;
             Ok(None)
         }

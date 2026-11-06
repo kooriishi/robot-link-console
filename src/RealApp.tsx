@@ -34,6 +34,7 @@ type AudioDevice = { name: string; description: string; isDefault: boolean }
 type AudioSnapshot = { available: boolean; sinks: AudioDevice[]; sources: AudioDevice[]; alsaPlayback: AudioDevice[]; alsaCapture: AudioDevice[]; defaultSinkVolume?: number; defaultSourceVolume?: number; note?: string }
 type AppLog = { at: string; text: string; tone: 'ok' | 'warn' | 'info' }
 type Confirm = { title: string; description: string; danger?: boolean; run: () => Promise<void> }
+type SudoRequest = { title: string; description: string; run: (password: string) => Promise<void> }
 type TerminalEvent = { sessionId: string; data: string }
 
 const nav: { id: Page; label: string; icon: typeof LayoutDashboard }[] = [
@@ -58,6 +59,8 @@ const DANGEROUS = /(^|[^A-Za-z0-9_])(sudo|su|reboot|shutdown|poweroff|halt|rm|mk
 const now = () => new Date().toLocaleTimeString('zh-CN', { hour12: false })
 const displayError = (e: unknown) => typeof e === 'string' ? e : e instanceof Error ? e.message : String(e)
 const errorHeading = (message: string) => {
+  if (message.includes('机器人 sudo 认证失败')) return '机器人 sudo 授权失败'
+  if (message.includes('当前 SSH 回程') || message.includes('目标主机已有不同的静态路由')) return 'Wi-Fi 操作已安全取消'
   if (message.includes('网络操作失败（系统授权已通过）')) return '网络操作失败 · 授权已通过'
   if (message.includes('系统授权未完成')) return '系统授权未完成或已取消'
   if (message.includes('无法启动') || message.includes('无法打开系统授权') || message.includes('没有找到系统安装的网络助手') || message.includes('网络助手安装')) return '授权组件或网络助手未就绪'
@@ -115,6 +118,8 @@ export default function RealApp() {
   const [trustChecked, setTrustChecked] = useState(false)
   const [selectedFingerprint, setSelectedFingerprint] = useState('')
   const [confirm, setConfirm] = useState<Confirm | null>(null)
+  const [sudoRequest, setSudoRequest] = useState<SudoRequest | null>(null)
+  const [sudoPassword, setSudoPassword] = useState('')
   const [dangerLine, setDangerLine] = useState('')
   const [pastePreview, setPastePreview] = useState('')
   const [busy, setBusy] = useState(false)
@@ -152,6 +157,24 @@ export default function RealApp() {
     catch (e) { setError(displayError(e)); return undefined }
     finally { setBusy(false) }
   }
+  const requestRobotSudo = (title: string, description: string, run: (password: string) => Promise<void>) => {
+    setSudoPassword('')
+    setSudoRequest({ title, description, run })
+  }
+  const submitRobotSudo = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!sudoRequest || busy) return
+    const request = sudoRequest
+    const password = sudoPassword
+    setSudoPassword('')
+    setSudoRequest(null)
+    setBusy(true)
+    setError('')
+    try { await request.run(password) }
+    catch (e) { setError(displayError(e)) }
+    finally { setBusy(false) }
+  }
+  const cancelRobotSudo = () => { setSudoPassword(''); setSudoRequest(null) }
 
   useEffect(() => {
     void (async () => {
@@ -397,16 +420,22 @@ export default function RealApp() {
   const doServiceAction = (service: Service, action: 'start' | 'stop' | 'restart') => {
     if (!selected) return
     const labels = { start: '启动', stop: '停止', restart: '重启' }
-    showConfirm(`${labels[action]} ${service.name}？`, `将在机器人 ${selected.name} 上对 systemd 服务执行 ${labels[action]}。该操作可能影响机器人功能；应用不会自动提权。`, async () => {
-      await invoke('service_action', { targetId: selected.id, service: service.name, action })
-      setConfirm(null); log(`${labels[action]} ${service.name}`, action === 'stop' ? 'warn' : 'ok'); setRefreshCount(n => n + 1)
+    showConfirm(`${labels[action]} ${service.name}？`, `将在机器人 ${selected.name} 上对 systemd 服务执行${labels[action]}。确认后输入机器人 SSH 用户的 sudo 密码；密码只用于本次 SSH 操作，不会保存或写入诊断记录。`, async () => {
+      setConfirm(null)
+      requestRobotSudo(`授权${labels[action]} ${service.name}`, `目标：${selected.username}@${selected.host}\n仅本次通过 SSH 加密传输 sudo 密码，以执行已确认的 systemd 操作。`, async sudoPassword => {
+        await invoke('service_action', { targetId: selected.id, service: service.name, action, sudoPassword })
+        log(`${labels[action]} ${service.name}`, action === 'stop' ? 'warn' : 'ok'); setRefreshCount(n => n + 1)
+      })
     }, action !== 'start')
   }
   const toggleWifiRadio = (enabled: boolean) => {
     if (!selected) return
-    showConfirm(`${enabled ? '开启' : '关闭'}机器人 Wi-Fi？`, `将在 ${selected.name} 上执行 NetworkManager Wi-Fi ${enabled ? '开启' : '关闭'}。这可能会中断 SSH；有线直连是否仍然可达取决于机器人网线和地址配置。`, async () => {
-      await invoke('set_remote_wifi_radio', { targetId: selected.id, enabled })
-      setConfirm(null); log(`机器人 Wi-Fi 已请求${enabled ? '开启' : '关闭'}`, enabled ? 'info' : 'warn'); setRefreshCount(n => n + 1)
+    showConfirm(`${enabled ? '开启' : '关闭'}机器人 Wi-Fi？`, `将在 ${selected.name} 上${enabled ? '开启' : '关闭'} NetworkManager Wi-Fi。切换前会只为当前 SSH 客户端添加一条临时有线主机路由，不改默认路由或 DNS；Wi-Fi 开启并连接时，互联网流量仍可走 Wi-Fi。若当前 SSH 不是经有线网卡，操作会安全取消。`, async () => {
+      setConfirm(null)
+      requestRobotSudo(`${enabled ? '开启' : '关闭'}机器人 Wi-Fi`, `目标：${selected.username}@${selected.host}\n仅本次通过 SSH 加密传输 sudo 密码。密码不会保存或写入诊断记录。`, async sudoPassword => {
+        await invoke('set_remote_wifi_radio', { targetId: selected.id, enabled, sudoPassword })
+        log(`机器人 Wi-Fi 已请求${enabled ? '开启' : '关闭'}`, enabled ? 'info' : 'warn'); setRefreshCount(n => n + 1)
+      })
     }, !enabled)
   }
   const scanWifi = async () => {
@@ -416,7 +445,7 @@ export default function RealApp() {
   }
   const connectWifi = (wifi: WifiNetwork) => {
     if (!selected) return
-    showConfirm(`连接 ${wifi.ssid}？`, '应用会在机器人上启动 nmcli 交互连接，并切换到 SSH 终端。若需要密码，请在终端提示中输入；密码不会保存在 RoboLink。此操作可能导致当前 SSH 会话中断。', async () => {
+    showConfirm(`连接 ${wifi.ssid}？`, '应用会先用机器人 SSH 用户执行 sudo，在机器人上为当前 SSH 客户端加一条只作用于该主机的临时有线路由，再运行 nmcli。终端会先提示输入机器人 sudo 密码，再提示 Wi-Fi 密码；两者都不会保存或写入诊断记录。默认互联网路由和 DNS 不会被 RoboLink 改动，其他流量仍按机器人 Wi-Fi 路由策略发送。', async () => {
       if (sessionId) await invoke('close_ssh_terminal', { sessionId }).catch(() => {})
       await terminalEventsReadyRef.current; openingTerminalRef.current = true
       let result: string
@@ -431,10 +460,13 @@ export default function RealApp() {
   }
   const toggleBluetoothPower = (enabled: boolean) => {
     if (!selected) return
-    showConfirm(`${enabled ? '开启' : '关闭'}机器人蓝牙？`, `将在 ${selected.name} 上切换 BlueZ 适配器电源。${enabled ? '开启后可扫描设备。' : '关闭会断开所有已连接的蓝牙设备。'}`, async () => {
-      await invoke('set_bluetooth_power', { targetId: selected.id, enabled })
-      const snap = await invoke<BluetoothSnapshot>('get_bluetooth_snapshot', { targetId: selected.id })
-      setBluetooth(snap); setConfirm(null); log(`机器人蓝牙适配器已请求${enabled ? '开启' : '关闭'}`, enabled ? 'ok' : 'warn')
+    showConfirm(`${enabled ? '开启' : '关闭'}机器人蓝牙？`, `将在 ${selected.name} 上切换 BlueZ 适配器电源。${enabled ? '开启后可扫描设备。' : '关闭会断开所有已连接的蓝牙设备。'}确认后输入机器人 SSH 用户的 sudo 密码；密码只用于本次 SSH 操作。`, async () => {
+      setConfirm(null)
+      requestRobotSudo(`${enabled ? '开启' : '关闭'}机器人蓝牙`, `目标：${selected.username}@${selected.host}\n仅本次通过 SSH 加密传输 sudo 密码，不保存或写入诊断记录。`, async sudoPassword => {
+        await invoke('set_bluetooth_power', { targetId: selected.id, enabled, sudoPassword })
+        const snap = await invoke<BluetoothSnapshot>('get_bluetooth_snapshot', { targetId: selected.id })
+        setBluetooth(snap); log(`机器人蓝牙已请求${enabled ? '开启' : '关闭'}`, enabled ? 'ok' : 'warn')
+      })
     }, !enabled)
   }
   const bluetoothAction = async (device: BluetoothDevice, action: string) => {
@@ -444,12 +476,12 @@ export default function RealApp() {
         if (sessionId) await invoke('close_ssh_terminal', { sessionId }).catch(() => {})
         await terminalEventsReadyRef.current; openingTerminalRef.current = true
         let result: string | null
-        try { result = await invoke<string | null>('bluetooth_action', { targetId: selected.id, address: device.address, action }) } finally { openingTerminalRef.current = false }
+        try { result = await invoke<string | null>('bluetooth_action', { targetId: selected.id, address: device.address, action, sudoPassword: '' }) } finally { openingTerminalRef.current = false }
         setConfirm(null); if (result) { activeTerminalRef.current = result; terminalWriterRef.current = null; setSessionId(result); setTerminalExited(terminalExitQueue.delete(result)); setSshReady(false); setPage('terminal') } log(`请求蓝牙配对 ${device.name}`, 'warn')
       }, true); return
     }
-    await withBusy(async () => {
-      await invoke('bluetooth_action', { targetId: selected.id, address: device.address, action })
+    requestRobotSudo(`执行蓝牙操作：${device.name}`, `目标：${selected.username}@${selected.host}\n操作：${action}。仅本次通过 SSH 加密传输机器人 sudo 密码，不保存或写入诊断记录。`, async sudoPassword => {
+      await invoke('bluetooth_action', { targetId: selected.id, address: device.address, action, sudoPassword })
       log(`蓝牙设备 ${device.name}：${action}`); setRefreshCount(n => n + 1)
     })
   }
@@ -497,13 +529,14 @@ export default function RealApp() {
         <div className="page-view" hidden={page !== 'audio'}>{visitedPages.has('audio') && <AudioPage snapshot={audio} sourceVolume={sourceVolume} sinkVolume={sinkVolume} setSourceVolume={setSourceVolume} setSinkVolume={setSinkVolume} onDefault={setDefaultAudio} onVolume={commitAudioVolume} onTest={playTestAudio} busy={busy}/>}</div>
         <div className="page-view" hidden={page !== 'terminal'}>{visitedPages.has('terminal') && <TerminalPage key={sessionId} sessionId={sessionId} exited={terminalExited} sshReady={sshReady} target={selected} theme={theme} onConnect={connectTarget} onDisconnect={disconnectTerminal} onRisk={setDangerLine} onPaste={setPastePreview} onError={setError}/>}</div>
         <div className="page-view" hidden={page !== 'logs'}>{visitedPages.has('logs') && <LogsPage logs={logs} onClear={() => setConfirm({ title: '清空本地诊断记录？', description: '只删除 RoboLink 本机界面中的操作记录，不会影响机器人。', run: async () => { setLogs([]); setConfirm(null) } })}/>}</div>
-        <footer className="footer-note"><ShieldCheck size={14}/>本机地址仅按需临时添加 · SSH 使用独立 known_hosts · RoboLink v0.4.0 测试候选 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
+        <footer className="footer-note"><ShieldCheck size={14}/>本机地址仅按需临时添加 · SSH 使用独立 known_hosts · RoboLink v0.4.3 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
       </div>
     </main>
     {targetDialog && <TargetDialog value={targetDraft} setValue={setTargetDraft} onClose={() => setTargetDialog(false)} onSubmit={saveTarget} busy={busy}/>}
     {addressDialog && <div className="modal-backdrop"><form className="modal-card" onSubmit={addTemporaryAddress}><div className="modal-title"><div><div className="section-kicker">LOCAL DIRECT LINK · SYSTEM AUTHORIZATION</div><h2>临时配置开发机网口 IPv4</h2></div><button type="button" className="icon-button" onClick={() => setAddressDialog(false)} aria-label="关闭"><X size={18}/></button></div><p className="modal-intro">网口 <strong>{addressDraft.interface}</strong> 对应的候选设备是 <strong>{addressDraft.peer}</strong>。网络报文通常无法给出真实子网掩码；普通地址默认 <code>/24</code>，IPv4 Link-local 默认 <code>/16</code>，请按机器人说明核对。</p><label>开发机临时地址/CIDR<input required value={addressDraft.cidr} onChange={event => setAddressDraft({ ...addressDraft, cidr: event.target.value })} placeholder="例如 192.168.127.1/24" autoComplete="off"/></label><label className="confirm-check"><input type="checkbox" checked={!addressDraft.persistent} onChange={event => setAddressDraft({ ...addressDraft, persistent: !event.target.checked })}/><span>SSH 会话结束后清理该地址（默认）；取消勾选则保持，直到我手动清理。</span></label><div className="subtle-callout"><ShieldCheck size={15}/><span>继续后会显示系统授权窗口。RoboLink 会先检查地址冲突和重叠路由，再只给这张有线网卡增加一个 IPv4 地址；不会改默认路由、DNS、Wi-Fi 或机器人网络设置。</span></div><div className="modal-actions"><button type="button" className="button button-subtle" onClick={() => setAddressDialog(false)}>取消</button><button className="button button-primary" type="submit" disabled={busy}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : <Check size={15}/>}确认并临时添加</button></div></form></div>}
     {keyDialog && selected && keyStatus && <HostKeyDialog target={selected} status={keyStatus} fingerprint={selectedFingerprint} setFingerprint={setSelectedFingerprint} checked={trustChecked} setChecked={setTrustChecked} onTrust={trustAndConnect} onClear={clearChangedPin} onClose={() => setKeyDialog(false)} busy={busy}/>}
     {confirm && <ConfirmDialog confirm={confirm} busy={busy} onCancel={() => setConfirm(null)} onConfirm={async () => { setBusy(true); setError(''); try { await confirm.run() } catch (e) { setError(displayError(e)); setConfirm(null) } finally { setBusy(false) } }}/>}
+    {sudoRequest && <div className="modal-backdrop"><form className="modal-card" onSubmit={submitRobotSudo}><div className="modal-title"><div><div className="section-kicker">ROBOT SSH · ONE-TIME SUDO</div><h2>{sudoRequest.title}</h2></div><button type="button" className="icon-button" onClick={cancelRobotSudo} aria-label="取消"><X size={18}/></button></div><p className="modal-intro preserve-lines">{sudoRequest.description}</p><label>机器人 SSH 用户的 sudo 密码<input type="password" name="robot-sudo-password" autoComplete="off" autoFocus value={sudoPassword} onChange={event => setSudoPassword(event.target.value)} placeholder="仅用于本次操作" spellCheck={false}/></label><div className="subtle-callout"><LockKeyhole size={15}/><span>密码仅在此窗口与应用内存中短暂使用，并通过 SSH 加密连接的标准输入发送；不会放进命令参数、配置文件或诊断记录。操作完成或取消后，输入框会清空。</span></div><div className="modal-actions"><button type="button" className="button button-subtle" onClick={cancelRobotSudo} disabled={busy}>取消</button><button className="button button-primary" type="submit" disabled={busy}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : <ShieldCheck size={15}/>}授权并执行</button></div></form></div>}
     {dangerLine && <ConfirmDialog confirm={{ title: '高风险终端命令', description: `目标：${selected?.username}@${selected?.host}\n命令：${dangerLine}\n\n此命令可能改变网络、服务或磁盘。确认后才会将回车发送到远端 Shell。`, danger: true, run: async () => { await terminalWriterRef.current?.confirmDangerous(); setDangerLine('') } }} onCancel={async () => { await terminalWriterRef.current?.cancelDangerous(); setDangerLine('') }} onConfirm={async () => { await terminalWriterRef.current?.confirmDangerous(); setDangerLine('') }}/>}
     {pastePreview && <ConfirmDialog confirm={{ title: '确认粘贴多行命令？', description: `目标：${selected?.username}@${selected?.host}\n\n${pastePreview.slice(0, 1600)}${pastePreview.length > 1600 ? '\n…（预览已截断）' : ''}\n\n粘贴内容可能包含多个会执行的命令。请先检查目标和每一行。`, danger: true, run: async () => { await terminalWriterRef.current?.confirmPaste(); setPastePreview('') } }} onCancel={async () => { await terminalWriterRef.current?.cancelPaste(); setPastePreview('') }} onConfirm={async () => { await terminalWriterRef.current?.confirmPaste(); setPastePreview('') }}/>}
     {toast && <div className="toast"><Check size={16}/>{toast}</div>}

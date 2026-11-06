@@ -311,6 +311,86 @@ pub fn shell_quote(value: &str) -> String {
 }
 
 pub fn remote_command(state: &AppState, target: &Target, script: &str) -> Result<String, String> {
+    run_remote_script(state, target, script, None)
+}
+
+pub fn validate_sudo_password(password: &str) -> Result<(), String> {
+    if password.len() > 1024 || password.chars().any(|c| matches!(c, '\0' | '\n' | '\r')) {
+        return Err("机器人 sudo 密码格式无效".into());
+    }
+    Ok(())
+}
+
+/// Runs an allowlisted remote operation as root. The password is sent only over SSH stdin.
+pub fn remote_command_sudo(
+    state: &AppState,
+    target: &Target,
+    script: &str,
+    password: &str,
+) -> Result<String, String> {
+    validate_sudo_password(password)?;
+    let elevated = format!("sudo -S -p '' -- sh -lc {}", shell_quote(script));
+    run_remote_script(state, target, &elevated, Some(password))
+}
+
+/// Runs a Wi-Fi operation after pinning only the active SSH client's return route to Ethernet.
+/// No default route or DNS setting is changed, so ordinary internet traffic may use Wi-Fi.
+pub fn remote_wifi_command_sudo(
+    state: &AppState,
+    target: &Target,
+    script: &str,
+    password: &str,
+) -> Result<String, String> {
+    validate_sudo_password(password)?;
+    let guarded = wifi_route_guarded_command(script, false);
+    run_remote_script(state, target, &guarded, Some(password))
+}
+
+/// Builds an interactive remote command for Wi-Fi connect, where sudo and nmcli may both prompt.
+pub fn wifi_route_guarded_command(script: &str, interactive: bool) -> String {
+    let sudo = if interactive {
+        "sudo -p '[sudo] password for %u: ' --"
+    } else {
+        "sudo -S -p '' --"
+    };
+    let privileged = "set -eu; client=$1; server=$2; dev=$3; via=$4; family=$5; prefix=$6; needs_route=$7; shift 7; if [ \"$needs_route\" = 1 ]; then if [ -n \"$via\" ]; then ip \"$family\" route add \"$client/$prefix\" via \"$via\" dev \"$dev\" src \"$server\"; else ip \"$family\" route add \"$client/$prefix\" dev \"$dev\" src \"$server\"; fi; fi; exec sh -lc \"$1\"";
+    format!(
+        r#"set -eu
+if [ -z "${{SSH_CONNECTION:-}}" ]; then echo '无法读取当前 SSH 连接信息；为保护有线管理连接，已取消 Wi-Fi 操作。' >&2; exit 1; fi
+set -f
+set -- $SSH_CONNECTION
+if [ "$#" -lt 4 ]; then echo 'SSH 连接信息无效；为保护有线管理连接，已取消 Wi-Fi 操作。' >&2; exit 1; fi
+client=$1
+server=$3
+case "$client" in *:*) family=-6; prefix=128;; *) family=-4; prefix=32;; esac
+route=$(ip "$family" route get "$client" from "$server" 2>/dev/null || true)
+route_field() {{ printf '%s\n' "$route" | awk -v key="$1" '{{ for (i = 1; i < NF; i++) if ($i == key) {{ print $(i + 1); exit }} }}'; }}
+dev=$(route_field dev)
+via=$(route_field via)
+src=$(route_field src)
+type=$(cat "/sys/class/net/$dev/type" 2>/dev/null || true)
+if [ -z "$dev" ] || [ "$src" != "$server" ] || [ "$type" != 1 ] || [ -e "/sys/class/net/$dev/wireless" ]; then echo '无法确认当前 SSH 回程经过有线网卡；为避免断开管理连接，已取消 Wi-Fi 操作。请先通过有线 SSH 连接机器人。' >&2; exit 1; fi
+exact=$(ip "$family" route show exact "$client/$prefix" 2>/dev/null || true)
+needs_route=1
+if [ -n "$exact" ]; then
+  exact_dev=$(printf '%s\n' "$exact" | awk '{{ for (i = 1; i < NF; i++) if ($i == "dev") {{ print $(i + 1); exit }} }}')
+  exact_via=$(printf '%s\n' "$exact" | awk '{{ for (i = 1; i < NF; i++) if ($i == "via") {{ print $(i + 1); exit }} }}')
+  if [ "$exact_dev" != "$dev" ] || [ "$exact_via" != "$via" ]; then echo '目标主机已有不同的静态路由；为避免覆盖用户网络设置，已取消 Wi-Fi 操作。' >&2; exit 1; fi
+  needs_route=0
+fi
+{sudo} sh -c {privileged} sh "$client" "$server" "$dev" "$via" "$family" "$prefix" "$needs_route" {script}"#,
+        sudo = sudo,
+        privileged = shell_quote(privileged),
+        script = shell_quote(script),
+    )
+}
+
+fn run_remote_script(
+    state: &AppState,
+    target: &Target,
+    script: &str,
+    password: Option<&str>,
+) -> Result<String, String> {
     ensure_pinned(state, target)?;
     if script.len() > 24_000 || script.contains('\0') {
         return Err("远端命令长度无效".into());
@@ -319,7 +399,31 @@ pub fn remote_command(state: &AppState, target: &Target, script: &str) -> Result
     cmd.args(ssh_args(state, target, false, true));
     cmd.arg(ssh_destination(target));
     cmd.arg(format!("timeout 18s sh -lc {}", shell_quote(script)));
-    let output = cmd.output().map_err(|e| format!("无法运行 OpenSSH：{e}"))?;
+    if password.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("无法运行 OpenSSH：{e}"))?;
+    if let Some(password) = password {
+        let mut bytes = password.as_bytes().to_vec();
+        bytes.push(b'\n');
+        let write_result = child
+            .stdin
+            .take()
+            .ok_or_else(|| "无法安全传入机器人 sudo 认证".to_string())?
+            .write_all(&bytes);
+        bytes.fill(0);
+        if write_result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("无法安全传入机器人 sudo 认证；操作未执行".into());
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("等待 OpenSSH 命令结束失败：{e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if !output.status.success() {
         let stderr = safe_stderr(&output.stderr);
@@ -328,6 +432,24 @@ pub fn remote_command(state: &AppState, target: &Target, script: &str) -> Result
         } else {
             stderr
         };
+        if password.is_some() {
+            let lower = detail.to_ascii_lowercase();
+            if [
+                "sorry, try again",
+                "incorrect password",
+                "a password is required",
+                "not in the sudoers",
+                "not allowed to execute",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
+            {
+                return Err(
+                    "机器人 sudo 认证失败：密码不正确，或当前 SSH 用户没有 sudo 权限。操作未完成。"
+                        .into(),
+                );
+            }
+        }
         return Err(if detail.is_empty() {
             format!("SSH 命令失败，退出码 {:?}", output.status.code())
         } else {
@@ -596,6 +718,54 @@ mod tests {
     fn shell_quotes_arbitrary_network_names() {
         assert_eq!(shell_quote("Lab's WiFi"), "'Lab'\\''s WiFi'");
         assert_eq!(shell_quote("$(touch /tmp/x)"), "'$(touch /tmp/x)'");
+    }
+
+    #[test]
+    fn sudo_password_is_ephemeral_input_and_rejects_line_breaks() {
+        assert!(validate_sudo_password("").is_ok());
+        assert!(validate_sudo_password("safe password").is_ok());
+        assert!(validate_sudo_password("first\nsecond").is_err());
+        assert!(validate_sudo_password("first\rsecond").is_err());
+        assert!(validate_sudo_password("nul\0byte").is_err());
+        assert!(validate_sudo_password(&"x".repeat(1025)).is_err());
+    }
+
+    #[test]
+    fn wifi_route_guard_adds_only_ssh_host_route_and_preserves_existing_routes() {
+        let command = wifi_route_guarded_command("nmcli radio wifi on", false);
+        assert!(command.contains("SSH_CONNECTION"));
+        assert!(command.contains("ip \"$family\" route add \"$client/$prefix\""));
+        assert!(command.contains("route show exact \"$client/$prefix\""));
+        assert!(command.contains("已有不同的静态路由"));
+        assert!(command.contains("sudo -S -p '' --"));
+        assert!(command.contains("nmcli radio wifi on"));
+        assert!(!command.contains("route add default"));
+        assert!(!command.contains("route replace default"));
+    }
+
+    #[test]
+    fn interactive_wifi_route_command_keeps_sudo_and_nmcli_prompts_on_pty() {
+        let command =
+            wifi_route_guarded_command("nmcli --ask device wifi connect 'Lab WiFi'", true);
+        assert!(command.contains("sudo -p '[sudo] password for %u: ' --"));
+        assert!(command.contains("nmcli --ask device wifi connect"));
+        assert!(command.contains("Lab WiFi"));
+    }
+
+    #[test]
+    fn wifi_route_guarded_commands_are_valid_posix_shell() {
+        for interactive in [false, true] {
+            let command = wifi_route_guarded_command("nmcli radio wifi on", interactive);
+            let checked = std::process::Command::new("sh")
+                .args(["-n", "-c", &command])
+                .output()
+                .expect("POSIX shell should be available for tests");
+            assert!(
+                checked.status.success(),
+                "generated shell syntax is invalid: {}",
+                String::from_utf8_lossy(&checked.stderr)
+            );
+        }
     }
 
     #[test]
