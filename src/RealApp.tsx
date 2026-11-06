@@ -18,7 +18,7 @@ type Target = { id: string; name: string; host: string; port: number; username: 
 type HostInterface = { name: string; kind: string; mac?: string; ipv4: string[]; carrier: boolean; state: string; mtu?: number }
 type HostInfo = { hostname: string; os: string; interfaces: HostInterface[] }
 type DiscoveredHost = { address: string; interface: string; mac: string; port: number; portOpen: boolean; routeReady: boolean; source: string; confidence: string; arpReachable?: boolean | null; icmpReachable?: boolean | null; portChecked: boolean; ipv4?: string[]; ipv6?: string[] }
-type DiscoveryOptions = { passiveArp: boolean; passiveDhcp: boolean; passiveIpv6: boolean; mdns: boolean; activeArp: boolean; icmp: boolean; tcp: boolean; ipv4LinkLocal: boolean; ipv6LinkLocal: boolean }
+type DiscoveryOptions = { passiveArp: boolean; passiveDhcp: boolean; passiveIpv6: boolean; mdns: boolean; activeArp: boolean; icmp: boolean; tcp: boolean; ipv4LinkLocal: boolean; ipv6LinkLocal: boolean; arpSweep: boolean; arpSweepDeep: boolean }
 type DiscoveryReport = { hosts: DiscoveredHost[]; skippedInterfaces: string[]; warnings: string[] }
 type DhcpStatus = { interface: string; cidr: string; running: boolean; owned: boolean; message: string; id: string }
 type OwnedNetworkAddress = { interface: string; cidr: string; peer: string; persistent: boolean }
@@ -89,7 +89,7 @@ export default function RealApp() {
   const [scanPort, setScanPort] = useState('22')
   const [discovered, setDiscovered] = useState<DiscoveredHost[]>([])
   const [discoveryReport, setDiscoveryReport] = useState<DiscoveryReport | null>(null)
-  const defaultDiscoveryOptions: DiscoveryOptions = { passiveArp: true, passiveDhcp: true, passiveIpv6: true, mdns: true, activeArp: true, icmp: false, tcp: true, ipv4LinkLocal: true, ipv6LinkLocal: true }
+  const defaultDiscoveryOptions: DiscoveryOptions = { passiveArp: true, passiveDhcp: true, passiveIpv6: true, mdns: true, activeArp: true, icmp: false, tcp: true, ipv4LinkLocal: true, ipv6LinkLocal: true, arpSweep: true, arpSweepDeep: true }
   const [discoveryOptions, setDiscoveryOptions] = useState<DiscoveryOptions>(() => {
     try { const saved = JSON.parse(localStorage.getItem('robolink-discovery-options') ?? '{}'); return Object.fromEntries(Object.entries(defaultDiscoveryOptions).map(([key, value]) => [key, typeof saved?.[key] === 'boolean' ? saved[key] : value])) as DiscoveryOptions } catch { return defaultDiscoveryOptions }
   })
@@ -125,6 +125,10 @@ export default function RealApp() {
   const [logs, setLogs] = useState<AppLog[]>([])
   const [mobileNav, setMobileNav] = useState(false)
   const [refreshCount, setRefreshCount] = useState(0)
+  const [pageLoading, setPageLoading] = useState(false)
+  // Remote page data is cached per target/page so switching pages does not re-run SSH queries every time.
+  const pageLoadedAtRef = useRef<Map<string, number>>(new Map())
+  const pageRefreshSeenRef = useRef(0)
   const [serviceQuery, setServiceQuery] = useState('')
   const [sourceVolume, setSourceVolume] = useState(100)
   const [sinkVolume, setSinkVolume] = useState(68)
@@ -174,9 +178,16 @@ export default function RealApp() {
 
   useEffect(() => {
     if (!selectedId || !keyStatus?.trusted || !sshReady) return
+    const cacheKey = `${selectedId}:${page}`
+    const forced = pageRefreshSeenRef.current !== refreshCount
+    pageRefreshSeenRef.current = refreshCount
+    if (forced) pageLoadedAtRef.current.clear()
+    const loadedAt = pageLoadedAtRef.current.get(cacheKey)
+    if (loadedAt && Date.now() - loadedAt < 30_000) return
+    if (!['overview', 'services', 'network', 'bluetooth', 'audio'].includes(page)) return
     let cancelled = false
     const load = async () => {
-      setBusy(true); setError('')
+      setPageLoading(true)
       try {
         if (page === 'overview') {
           const [o, s] = await Promise.all([invoke<RemoteOverview>('get_remote_overview', { targetId: selectedId }), invoke<Service[]>('list_services', { targetId: selectedId })])
@@ -190,12 +201,15 @@ export default function RealApp() {
         } else if (page === 'audio') {
           const data = await invoke<AudioSnapshot>('get_audio_snapshot', { targetId: selectedId }); if (!cancelled) { setAudio(data); setSinkVolume(data.defaultSinkVolume ?? 100); setSourceVolume(data.defaultSourceVolume ?? 100) }
         }
+        if (!cancelled) pageLoadedAtRef.current.set(cacheKey, Date.now())
       } catch (e) { if (!cancelled) setError(displayError(e)) }
-      finally { if (!cancelled) setBusy(false) }
+      finally { if (!cancelled) setPageLoading(false) }
     }
     void load()
-    return () => { cancelled = true }
+    return () => { cancelled = true; setPageLoading(false) }
   }, [page, selectedId, keyStatus?.trusted, sshReady, refreshCount])
+
+  useEffect(() => { if (!sshReady) pageLoadedAtRef.current.clear() }, [sshReady])
 
   useEffect(() => {
     localStorage.setItem('robolink-selected-target', selectedId)
@@ -251,6 +265,7 @@ export default function RealApp() {
     const remaining = await invoke<OwnedNetworkAddress[]>('cleanup_session_network_addresses').catch(() => null)
     if (remaining) setOwnedNetworkAddresses(remaining)
     terminalOutputQueue.delete(sessionId); terminalExitQueue.delete(sessionId); activeTerminalRef.current = ''; terminalWriterRef.current = null; setSessionId(''); setTerminalExited(false); setSshReady(false)
+    pageLoadedAtRef.current.clear()
     setRemoteOverview(null); setServices([]); setRemoteNetwork(null); setBluetooth(null); setAudio(null)
     setSelectedId(id); setKeyStatus(null); setError(''); setPage('overview')
   }
@@ -318,8 +333,8 @@ export default function RealApp() {
     const requestedPort = Number(scanPort)
     if (discoveryOptions.tcp && (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 65535)) { setError('TCP 探测端口必须是 1–65535 的整数'); return }
     const port = Number.isInteger(requestedPort) && requestedPort >= 1 && requestedPort <= 65535 ? requestedPort : 22
-    const hasSource = discoveryOptions.passiveArp || discoveryOptions.passiveDhcp || discoveryOptions.passiveIpv6 || discoveryOptions.mdns || discoveryOptions.ipv4LinkLocal || discoveryOptions.ipv6LinkLocal
-    if (!hasSource) { setError('至少选择一种发现来源：被动监听或 IPv4/IPv6 Link-Local'); return }
+    const hasSource = discoveryOptions.arpSweep || discoveryOptions.passiveArp || discoveryOptions.passiveDhcp || discoveryOptions.passiveIpv6 || discoveryOptions.mdns || discoveryOptions.ipv4LinkLocal || discoveryOptions.ipv6LinkLocal
+    if (!hasSource) { setError('至少选择一种发现来源：主动 ARP 扫描、被动监听或 IPv4/IPv6 Link-Local'); return }
     setDiscovered([]); setDiscoveryReport(null)
     const found = await withBusy(() => invoke<DiscoveryReport>('discover_direct_devices', { port, interfaces: scanNic ? [scanNic] : [], options: discoveryOptions }))
     if (found) {
@@ -327,7 +342,7 @@ export default function RealApp() {
       const portCount = found.hosts.filter(host => host.portChecked && host.portOpen).length
       const links = [...new Set(found.hosts.map(host => host.interface))]
       log(`在 ${links.length} 张网卡发现 ${found.hosts.length} 个地址候选，TCP/${port} 已确认 ${portCount} 个`, found.hosts.length ? 'ok' : 'info')
-      if (!found.hosts.length) notify('未发现候选；静默设备或未发送可观察报文的静态地址可能无法自动发现')
+      if (!found.hosts.length) notify('未发现候选；请确认开发板已开机、网线两端指示灯亮，或展开发现策略开启深度扫描')
     }
   }
   const openAddressDialog = (host: DiscoveredHost) => {
@@ -471,7 +486,7 @@ export default function RealApp() {
     <main className="main-area">
       <header className="topbar"><div className="topbar-left"><button className="icon-button menu-button" onClick={() => setMobileNav(true)} aria-label="打开菜单"><Menu size={19}/></button><div className="breadcrumb">RoboLink <ChevronRight size={14}/><strong>{selected?.name ?? '未选择设备'}</strong></div></div><div className="topbar-actions"><div className="secure-pill"><LockKeyhole size={13}/>{sshReady ? 'SSH 已认证' : keyStatus?.trusted ? sessionId && !terminalExited ? '指纹已固定 · 认证中' : 'SSH 指纹已固定' : '本地会话'}</div>{selected && <button className={`button ${sessionId && !terminalExited ? 'button-subtle' : 'button-primary'} connect-button`} onClick={sessionId && !terminalExited ? () => navPage('terminal') : connectTarget} disabled={busy}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : sessionId && !terminalExited ? <Terminal size={15}/> : <Cable size={15}/>}<span>{sessionId && !terminalExited ? '打开终端' : '连接机器人'}</span></button>}<button className="icon-button" onClick={() => notify('默认只读本机网卡；只有经 GUI 明确确认后，才会临时配置地址或启动直连 DHCP。SSH 使用本应用的指纹 pin。')} aria-label="安全说明"><CircleHelp size={18}/></button><div className="top-avatar">RL</div></div></header>
       <div className="content-wrap">
-        <div className="page-heading"><div><div className="eyebrow">LINUX HOST <span>·</span> DIRECT ETHERNET / SSH</div><h1>{pageInfo[page].title}</h1><p>{pageInfo[page].subtitle}</p></div><div className="heading-actions"><span className={`runtime-tag ${selected && keyStatus?.trusted ? 'live' : ''}`}><span/>{selected && keyStatus?.trusted ? '真实设备' : '尚未连接'}</span><button className="button button-subtle" onClick={refreshNow} disabled={busy}><RefreshCw size={15}/>刷新</button></div></div>
+        <div className="page-heading"><div><div className="eyebrow">LINUX HOST <span>·</span> DIRECT ETHERNET / SSH</div><h1>{pageInfo[page].title}</h1><p>{pageInfo[page].subtitle}</p></div><div className="heading-actions"><span className={`runtime-tag ${selected && keyStatus?.trusted ? 'live' : ''}`}><span/>{selected && keyStatus?.trusted ? '真实设备' : '尚未连接'}</span><button className="button button-subtle" onClick={refreshNow} disabled={busy || pageLoading}>{pageLoading ? <LoaderCircle className="spin-icon" size={15}/> : <RefreshCw size={15}/>}{pageLoading ? '读取中' : '刷新'}</button></div></div>
         {error && <div className="inline-error" ref={errorRef} role="alert"><AlertTriangle size={16}/><span className="error-copy"><strong>{errorHeading(error)}</strong>{error}</span><button onClick={() => setError('')} aria-label="关闭错误"><X size={15}/></button></div>}
         <div className="page-view" hidden={page !== 'overview'}>{visitedPages.has('overview') && <OverviewPage hostInfo={hostInfo} target={selected} trusted={!!keyStatus?.trusted} connected={sshReady && !terminalExited} remote={remoteOverview} services={services} onAdd={() => openNewTarget()} onConnect={connectTarget} onPage={navPage}/>}</div>
         <div className="page-view" hidden={page !== 'network'}>{visitedPages.has('network') && <NetworkPage hostInfo={hostInfo} interfaces={wiredInterfaces} selectedInterface={localInterface} setSelectedInterface={setLocalInterface} scanNic={scanNic} setScanNic={name => { setScanNic(name); setDiscovered([]) }} scanPort={scanPort} setScanPort={setScanPort} options={discoveryOptions} setOptions={setDiscoveryOptions} report={discoveryReport} discovered={discovered} ownedAddresses={ownedNetworkAddresses} onScan={scanInterface} onAddAddress={openAddressDialog} onRemoveAddress={removeOwnedAddress} onCleanupAddresses={cleanupOwnedAddresses} dhcpStatuses={dhcpStatuses} dhcpInterface={dhcpInterface} setDhcpInterface={setDhcpInterface} dhcpCidr={dhcpCidr} setDhcpCidr={setDhcpCidr} onQueryDhcp={queryDhcpStatus} onStartDhcp={startDhcpServer} onStopDhcp={stopDhcpServer} network={remoteNetwork} wifi={wifiNetworks} onScanWifi={scanWifi} onToggleWifi={toggleWifiRadio} onConnectWifi={connectWifi} onAddHost={(host, port) => openNewTarget(host, port, 'sunrise')} busy={busy}/>}</div>
@@ -521,17 +536,17 @@ function NetworkPage({ hostInfo, interfaces, selectedInterface, setSelectedInter
   const selectedLink = interfaces.find(i => i.name === selectedInterface)
   const setOption = (key: keyof DiscoveryOptions, checked: boolean) => setOptions({ ...options, [key]: checked })
   const toggle = (key: keyof DiscoveryOptions, title: string, description: string) => <label className="strategy-option" key={key}><input type="checkbox" checked={options[key]} onChange={e => setOption(key, e.target.checked)} disabled={busy}/><span><strong>{title}</strong><small>{description}</small></span></label>
-  const sourceEnabled = options.passiveArp || options.passiveDhcp || options.passiveIpv6 || options.mdns || options.ipv4LinkLocal || options.ipv6LinkLocal
+  const sourceEnabled = options.arpSweep || options.passiveArp || options.passiveDhcp || options.passiveIpv6 || options.mdns || options.ipv4LinkLocal || options.ipv6LinkLocal
   const dhcpLinkReady = interfaces.some(i => i.name === dhcpInterface && i.carrier)
   const dhcpLabel = dhcpStatuses === null ? '默认不开启 · 状态未查询' : dhcpStatuses.some(s => s.running) ? `${dhcpStatuses.filter(s => s.running).length} 个运行中` : '已查询 · 当前无运行服务'
   const portStatus = (host: DiscoveredHost) => !host.portChecked ? 'TCP 未探测（未选择或未执行）' : host.portOpen ? `TCP/${host.port} 可达` : host.routeReady ? `已探测 TCP/${host.port}，未连接；这不代表设备离线` : `已探测 TCP/${host.port}，本机路由未指向此接口；不能据此判断设备离线`
-  return <div className="page-stack"><div className="network-warning"><div className="warning-icon"><AlertTriangle size={18}/></div><div><strong>被动发现、主动验证与网络配置彼此独立</strong><p>扫描默认只读；不会扫描任意 IPv4 段，也不能保证发现未发报文的静态 IP。B 类 ARP/ICMP/TCP 只验证已发现候选；启用 IPv6 Link-local 时另有受限链路本地全节点探测，均不扫描 IPv4 网段。</p></div></div>
+  return <div className="page-stack"><div className="network-warning"><div className="warning-icon"><AlertTriangle size={18}/></div><div><strong>发现、验证与网络配置彼此独立</strong><p>扫描不会修改本机或机器人网络。网线直连时默认对常见开发板网段（含 192.168.0.0/16 与 169.254/16）发送 ARP 地址探测，即使开发板不主动发包、本机网口没有 IPv4 也能找到它；承载默认路由的接口（接了路由器/局域网）只扫描本机所在网段。</p></div></div>
     <section className="panel detail-panel"><div className="panel-heading"><div className="heading-icon cable-bg"><Cable size={18}/></div><div><div className="section-kicker">LOCAL LINUX HOST · MULTI-NIC</div><h2>开发机有线网卡</h2></div><span className="small-muted push-right">{hostInfo?.hostname ?? '读取中'}</span></div>
       {!interfaces.length ? <EmptyState text="未检测到物理有线网卡。请插入网线或检查网络设备。"/> : <div className="interface-cards">{interfaces.map(i => <button type="button" className={`interface-card ${selectedInterface === i.name ? 'selected' : ''}`} key={i.name} onClick={() => setSelectedInterface(i.name)} disabled={busy}><span className="interface-card-top"><Cable size={15}/><strong>{i.name}</strong><i className={i.carrier ? 'carrier-up' : 'carrier-down'}/></span><span>{i.carrier ? '物理链路已连接' : '无物理链路'}</span><small>{i.ipv4.join(' · ') || '未配置 IPv4'}{i.mac ? ` · ${i.mac}` : ''}</small></button>)}</div>}
       <div className={`direct-link-state ${selectedLink?.carrier ? 'ready' : 'needs-setup'}`}><Cable size={16}/><div><strong>{!selectedLink ? '先选择直连接口' : !selectedLink.carrier ? '尚未检测到所选网口链路' : !selectedLink.ipv4.length ? '网线已连通；开发机网口暂时没有 IPv4 地址' : '直连接口已配置 IPv4'}</strong><p>{!selectedLink ? '选择用于本机临时地址等设置的物理以太网口；扫描网卡可以单独选择。' : !selectedLink.carrier ? '所选网口目前没有链路；检查机器人电源、网线两端。' : !selectedLink.ipv4.length ? '可被动发现候选；只有点击并确认后才会给此接口临时配置 IPv4。' : `当前网口地址：${selectedLink.ipv4.join(' · ')}。`}</p>{selectedLink?.carrier && <button className="text-button" onClick={() => onAddHost()}>我已知道机器人 IP / 主机名，手动添加 <ChevronRight size={14}/></button>}</div></div>
-      <div className="connection-steps"><strong>发现边界</strong><ol><li>被动监听 ARP（包括 gratuitous/probe）、DHCP Discover/Request、IPv6 ND 与 mDNS，均可单独选择。</li><li>主动 ARP、ICMP 与指定单一 TCP/SSH 端口只验证已有候选，不探测 IP 网段；TCP 默认端口 22。</li><li>静态地址只有设备发出可观察报文、命中 Link-Local 或 mDNS 等已选来源时才可能出现；不保证发现任意静态 IP。</li><li>可分别选择扫描所有物理有线网口或单张网卡；此选择独立于本机地址配置网卡。</li></ol></div>
-      <details className="strategy-panel"><summary>发现策略（展开说明与选择）</summary><div className="strategy-groups"><fieldset><legend>A · 被动发现来源</legend>{toggle('passiveArp','被动 ARP（默认开）','监听 ARP 请求、应答、gratuitous ARP 与 probe；只将可判定的设备候选列出。')}{toggle('passiveDhcp','DHCP Discover / Request（默认开）','观察 DHCP 请求及本应用的 DHCPACK 日志缓存线索；不会启动 DHCP 服务，缓存仍需复验。')}{toggle('passiveIpv6','IPv6 Neighbor Discovery（默认开）','被动观察 IPv6 ND 消息与邻居线索。')}{toggle('mdns','mDNS（默认开）','观察本链路 mDNS 报文的源 IP/MAC；不确认所有广告主机记录。')}</fieldset><fieldset><legend>B · 对候选地址主动验证（不扫描网段）</legend>{toggle('activeArp','候选地址 ARP 验证（默认开）','仅对发现得到的候选地址进行 ARP 验证，不枚举或探测任意 IPv4 段。')}{toggle('icmp','ICMP 辅助验证（默认关）','对候选地址发送 ICMP 探测；不回应不等于设备离线。')}{toggle('tcp','单一 TCP / SSH 端口（默认 22）','只对候选地址检查下方指定的一个端口；无路由或端口不通都不能证明设备离线。')}</fieldset><fieldset><legend>D · Link-Local 设备候选</legend>{toggle('ipv4LinkLocal','IPv4 Link-Local（默认开）','识别 169.254/16 范围候选；需要配置本机地址时默认建议 /16。')}{toggle('ipv6LinkLocal','IPv6 Link-Local（默认开）','读取邻居并发送受限 IPv6 全节点探测；fe80::/10 候选保留 %scope，不回应不代表离线。')}</fieldset></div><p className="strategy-footnote">至少勾选一种 A 类被动来源或 D 类 Link-Local；B 类验证选项本身不构成发现来源。策略会保存在本机浏览器存储中。</p></details>
-      <div className="scan-controls scan-controls-expanded"><label className="scan-port-field"><span>扫描接口</span><select aria-label="选择发现扫描网卡" value={scanNic} onChange={e => setScanNic(e.target.value)} disabled={busy}><option value="">全部物理有线网卡</option>{interfaces.map(i => <option key={i.name} value={i.name}>{i.name}{i.carrier ? ' · 链路已连接' : ''}</option>)}</select></label><label className="scan-port-field"><span>SSH TCP 单端口</span><input aria-label="SSH TCP 探测端口" type="number" min="1" max="65535" step="1" value={scanPort} onChange={event => setScanPort(event.target.value)} disabled={busy || !options.tcp}/></label><button className="button button-primary" onClick={onScan} disabled={busy || !interfaces.length || !sourceEnabled || (options.tcp && (!Number.isInteger(Number(scanPort)) || Number(scanPort) < 1 || Number(scanPort) > 65535))}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : <Search size={15}/>}开始发现</button><span className="small-muted">被动监听约 8 秒，随后按已选策略验证候选</span></div>
+      <div className="connection-steps"><strong>发现边界</strong><ol><li>主动 ARP 扫描：以 0.0.0.0 为源地址发送 ARP 探测（RFC 5227），Linux 开发板会为自己的 IP 应答，无需开发板重启或主动发包。</li><li>被动监听 ARP（包括 gratuitous/probe）、DHCP Discover/Request、IPv6 ND 与 mDNS，可作为补充，均可单独选择。</li><li>ICMP 与指定单一 TCP/SSH 端口只验证已有候选；TCP 默认端口 22，需要本机网口与开发板同网段后才能验证。</li><li>可分别选择扫描所有物理有线网口或单张网卡；此选择独立于本机地址配置网卡。</li></ol></div>
+      <details className="strategy-panel"><summary>发现策略（展开说明与选择）</summary><div className="strategy-groups"><fieldset><legend>A0 · 主动 ARP 扫描（推荐）</legend>{toggle('arpSweep','常见开发板网段 ARP 扫描（默认开）','对本机网段及 192.168.1/0/127/137/55、10.42.0 等约 30 个常见 /24 发送 ARP 探测；开发板静默时也能发现。')}{toggle('arpSweepDeep','网线直连深度扫描（默认开）','额外覆盖整个 192.168.0.0/16（勾选 IPv4 Link-Local 时含 169.254/16），约 5 秒发完；承载默认路由的接口自动跳过。')}</fieldset><fieldset><legend>A · 被动发现来源</legend>{toggle('passiveArp','被动 ARP（默认开）','监听 ARP 请求、应答、gratuitous ARP 与 probe；只将可判定的设备候选列出。')}{toggle('passiveDhcp','DHCP Discover / Request（默认开）','观察 DHCP 请求及本应用的 DHCPACK 日志缓存线索；不会启动 DHCP 服务，缓存仍需复验。')}{toggle('passiveIpv6','IPv6 Neighbor Discovery（默认开）','被动观察 IPv6 ND 消息与邻居线索。')}{toggle('mdns','mDNS（默认开）','观察本链路 mDNS 报文的源 IP/MAC；不确认所有广告主机记录。')}</fieldset><fieldset><legend>B · 对候选地址主动验证</legend>{toggle('activeArp','候选地址 ARP 验证（默认开）','仅对发现得到的候选地址进行 ARP 验证，不枚举或探测任意 IPv4 段。')}{toggle('icmp','ICMP 辅助验证（默认关）','对候选地址发送 ICMP 探测；不回应不等于设备离线。')}{toggle('tcp','单一 TCP / SSH 端口（默认 22）','只对候选地址检查下方指定的一个端口；无路由或端口不通都不能证明设备离线。')}</fieldset><fieldset><legend>D · Link-Local 设备候选</legend>{toggle('ipv4LinkLocal','IPv4 Link-Local（默认开）','识别 169.254/16 范围候选；需要配置本机地址时默认建议 /16。')}{toggle('ipv6LinkLocal','IPv6 Link-Local（默认开）','读取邻居并发送受限 IPv6 全节点探测；fe80::/10 候选保留 %scope，不回应不代表离线。')}</fieldset></div><p className="strategy-footnote">至少勾选一种 A0/A 类来源或 D 类 Link-Local；B 类验证选项本身不构成发现来源。策略会保存在本机浏览器存储中。</p></details>
+      <div className="scan-controls scan-controls-expanded"><label className="scan-port-field"><span>扫描接口</span><select aria-label="选择发现扫描网卡" value={scanNic} onChange={e => setScanNic(e.target.value)} disabled={busy}><option value="">全部物理有线网卡</option>{interfaces.map(i => <option key={i.name} value={i.name}>{i.name}{i.carrier ? ' · 链路已连接' : ''}</option>)}</select></label><label className="scan-port-field"><span>SSH TCP 单端口</span><input aria-label="SSH TCP 探测端口" type="number" min="1" max="65535" step="1" value={scanPort} onChange={event => setScanPort(event.target.value)} disabled={busy || !options.tcp}/></label><button className="button button-primary" onClick={onScan} disabled={busy || !interfaces.length || !sourceEnabled || (options.tcp && (!Number.isInteger(Number(scanPort)) || Number(scanPort) < 1 || Number(scanPort) > 65535))}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : <Search size={15}/>}开始发现</button><span className="small-muted">主动扫描与监听约 8 秒，随后按已选策略验证候选</span></div>
       {(report?.skippedInterfaces.length || report?.warnings.length) ? <div className="report-notes">{report.skippedInterfaces.map((item, i) => <p key={`skip-${i}`}><strong>未扫描接口：</strong>{item}</p>)}{report.warnings.map((item, i) => <p key={`warn-${i}`}><strong>发现提示：</strong>{item}</p>)}</div> : null}
       {report && <div className="discovery-list"><div className="section-kicker">发现报告 · {discovered.length} 个候选</div>{discovered.length ? discovered.map((host, index) => <div className="discovered-row" key={`${host.interface}-${host.address}-${host.mac}-${index}`}><span className="wifi-small-icon"><Signal size={16}/></span><span className="discovered-copy"><strong>{host.address}</strong><small>{host.interface} · MAC {host.mac || '未报告'} · 来源 {host.source}（{host.confidence}）</small>{(host.ipv4?.length || host.ipv6?.length) ? <small>IPv4 {host.ipv4?.join('、') || '—'} · IPv6 {host.ipv6?.join('、') || '—'}</small> : null}<small>接口路由：{host.routeReady ? '已就绪' : '未就绪/未确认'} · 主动验证：ARP {host.arpReachable == null ? '未提供结果' : host.arpReachable ? '可达' : '未回应'} · ICMP {host.icmpReachable == null ? '未探测/未提供' : host.icmpReachable ? '可达' : '未回应'} · {portStatus(host)}</small></span><div className="discovery-actions">{!host.address.includes(':') && !host.routeReady && <button className="button button-subtle" onClick={() => onAddAddress(host)} disabled={busy}>临时配置本机 IPv4</button>}<button className="button button-subtle" onClick={() => onAddHost(host.address, host.port)} disabled={busy}>添加为 SSH 主机</button></div></div>) : <EmptyState text="没有候选地址。静态 IP 设备若未发报文，可能需要从设备资料手动添加；扫描不保证发现任意地址。"/>}</div>}
       {discovered.some(host => !host.address.includes(':')) && <div className="subtle-callout"><Activity size={15}/><span>已发现 IPv4 地址时，通常无需 DHCP；TCP 未探测或不通不代表机器人离线。</span></div>}

@@ -14,7 +14,7 @@ use std::time::Duration;
 use tauri::{AppHandle, State};
 use uuid::Uuid;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_host_info() -> Result<HostInfo, String> {
     let hostname = command_text("hostname", &[]).unwrap_or_else(|_| "Linux 开发机".into());
     let os_release = fs::read_to_string("/etc/os-release").unwrap_or_default();
@@ -108,12 +108,12 @@ fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_targets(state: State<'_, AppState>) -> Result<Vec<Target>, String> {
     state.load_targets()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_target(state: State<'_, AppState>, draft: TargetDraft) -> Result<Target, String> {
     let name = draft.name.trim();
     if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control) {
@@ -150,7 +150,7 @@ pub fn save_target(state: State<'_, AppState>, draft: TargetDraft) -> Result<Tar
     Ok(target)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_target(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let mut targets = state.load_targets()?;
     let target = targets
@@ -164,7 +164,7 @@ pub fn delete_target(state: State<'_, AppState>, id: String) -> Result<(), Strin
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_host_key_status(
     state: State<'_, AppState>,
     target_id: String,
@@ -173,7 +173,7 @@ pub fn get_host_key_status(
     ssh::host_key_status(&state, &target)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn trust_host_key(
     state: State<'_, AppState>,
     target_id: String,
@@ -184,19 +184,19 @@ pub fn trust_host_key(
     Ok(true)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn forget_host_key(state: State<'_, AppState>, target_id: String) -> Result<(), String> {
     let target = ssh::lookup_target(&state, &target_id)?;
     ssh::forget_host_key(&state, &target)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn ssh_connection_ready(state: State<'_, AppState>, target_id: String) -> Result<bool, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
     ssh::connection_ready(&state, &target)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn scan_direct_interface(interface: String, port: u16) -> Result<Vec<DiscoveredHost>, String> {
     validate_ifname(&interface)?;
     validate_scan_port(port)?;
@@ -658,7 +658,7 @@ fn probe_discovered(
     (true, tcp_result.0, tcp_result.1, icmp_result)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn discover_direct_devices(
     port: u16,
     interfaces: Vec<String>,
@@ -922,7 +922,7 @@ pub fn discover_direct_devices(
     Ok(report)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_dhcp_status() -> Result<Vec<DhcpStatus>, String> {
     let s = run_network_helper(&["dhcp-status".into()])?;
     serde_json::from_str(&s).map_err(|e| format!("解析 DHCP 状态失败：{e}"))
@@ -944,7 +944,7 @@ fn validate_dhcp_cidr(cidr: &str) -> Result<(), String> {
     }
     Ok(())
 }
-#[tauri::command]
+#[tauri::command(async)]
 pub fn start_direct_dhcp(interface: String, cidr: String) -> Result<Vec<DhcpStatus>, String> {
     validate_ifname(&interface)?;
     validate_dhcp_cidr(&cidr)?;
@@ -959,26 +959,26 @@ pub fn start_direct_dhcp(interface: String, cidr: String) -> Result<Vec<DhcpStat
     let s = run_network_helper(&["dhcp-start".into(), interface, cidr])?;
     serde_json::from_str(&s).map_err(|e| format!("解析 DHCP 启动结果失败：{e}"))
 }
-#[tauri::command]
+#[tauri::command(async)]
 pub fn stop_direct_dhcp(interface: String) -> Result<Vec<DhcpStatus>, String> {
     validate_ifname(&interface)?;
     let s = run_network_helper(&["dhcp-stop".into(), interface])?;
     serde_json::from_str(&s).map_err(|e| format!("解析 DHCP 停止结果失败：{e}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn scan_direct_interfaces(port: u16) -> Result<Vec<DiscoveredHost>, String> {
     discover_direct_devices(port, vec![], DiscoveryOptions::default()).map(|r| r.hosts)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_owned_network_addresses(
     state: State<'_, AppState>,
 ) -> Result<Vec<OwnedNetworkAddress>, String> {
     state.load_network_addresses()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_temporary_network_address(
     state: State<'_, AppState>,
     interface: String,
@@ -1038,7 +1038,7 @@ pub fn add_temporary_network_address(
     Ok(owned)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_owned_network_address(
     state: State<'_, AppState>,
     interface: String,
@@ -1057,7 +1057,7 @@ pub fn remove_owned_network_address(
     Ok(owned)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cleanup_session_network_addresses(
     state: State<'_, AppState>,
 ) -> Result<Vec<OwnedNetworkAddress>, String> {
@@ -1090,7 +1090,7 @@ pub fn cleanup_session_network_addresses(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cleanup_owned_network_addresses(
     state: State<'_, AppState>,
 ) -> Result<Vec<OwnedNetworkAddress>, String> {
@@ -1213,7 +1213,7 @@ fn link_local_neighbors(rows: &[Value], interface: &str, local: Ipv4Addr) -> Vec
     peers
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_remote_overview(
     state: State<'_, AppState>,
     target_id: String,
@@ -1243,7 +1243,7 @@ pub fn get_remote_overview(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_services(
     state: State<'_, AppState>,
     target_id: String,
@@ -1285,7 +1285,7 @@ pub fn list_services(
     Ok(services)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn service_action(
     state: State<'_, AppState>,
     target_id: String,
@@ -1339,7 +1339,7 @@ fn wifi_rows(lines: &str) -> Vec<WifiNetwork> {
         .collect()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_remote_network(
     state: State<'_, AppState>,
     target_id: String,
@@ -1389,7 +1389,7 @@ pub fn get_remote_network(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn scan_remote_wifi(
     state: State<'_, AppState>,
     target_id: String,
@@ -1400,7 +1400,7 @@ pub fn scan_remote_wifi(
     Ok(wifi_rows(&output))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_remote_wifi_radio(
     state: State<'_, AppState>,
     target_id: String,
@@ -1412,7 +1412,7 @@ pub fn set_remote_wifi_radio(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn start_wifi_connect(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -1520,7 +1520,7 @@ fn bluetooth_parts(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_bluetooth_snapshot(
     state: State<'_, AppState>,
     target_id: String,
@@ -1529,7 +1529,7 @@ pub fn get_bluetooth_snapshot(
     bluetooth_parts(&state, &target, false)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn scan_bluetooth(
     state: State<'_, AppState>,
     target_id: String,
@@ -1538,7 +1538,7 @@ pub fn scan_bluetooth(
     bluetooth_parts(&state, &target, true)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_bluetooth_power(
     state: State<'_, AppState>,
     target_id: String,
@@ -1550,7 +1550,7 @@ pub fn set_bluetooth_power(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn bluetooth_action(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -1633,7 +1633,7 @@ fn parse_alsa_devices(text: &str, direction: &str) -> Vec<AudioDevice> {
         .collect()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_audio_snapshot(
     state: State<'_, AppState>,
     target_id: String,
@@ -1713,7 +1713,7 @@ if [ -r /proc/asound/pcm ]; then cat /proc/asound/pcm; else printf 'UNAVAILABLE\
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_audio_default(
     state: State<'_, AppState>,
     target_id: String,
@@ -1745,7 +1745,7 @@ pub fn set_audio_default(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_audio_volume(
     state: State<'_, AppState>,
     target_id: String,
@@ -1785,14 +1785,14 @@ pub fn set_audio_volume(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn play_test_audio(state: State<'_, AppState>, target_id: String) -> Result<(), String> {
     let target = ssh::lookup_target(&state, &target_id)?;
     ssh::remote_command(&state, &target, "command -v speaker-test >/dev/null 2>&1 || { echo '机器人未安装 alsa-utils/speaker-test'; exit 127; }; timeout 4s speaker-test -t sine -f 440 -l 1")?;
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_ssh_terminal(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -1802,7 +1802,7 @@ pub fn open_ssh_terminal(
     ssh::start_terminal(&app, &state, &target, None)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn send_terminal_input(
     state: State<'_, AppState>,
     session_id: String,
@@ -1811,7 +1811,7 @@ pub fn send_terminal_input(
     ssh::send_terminal_input(&state, &session_id, &data)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn resize_terminal(
     state: State<'_, AppState>,
     session_id: String,
@@ -1821,7 +1821,7 @@ pub fn resize_terminal(
     ssh::resize_terminal(&state, &session_id, cols, rows)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn close_ssh_terminal(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
     ssh::close_terminal(&state, &session_id)
 }

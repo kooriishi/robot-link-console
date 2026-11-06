@@ -1,6 +1,6 @@
 [package]
 name = "robolink-net-helper"
-version = "0.4.0"
+version = "0.4.2"
 edition = "2021"
 publish = false
 

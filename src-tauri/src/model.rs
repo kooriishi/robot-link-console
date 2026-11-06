@@ -69,6 +69,8 @@ pub struct DiscoveryOptions {
     pub tcp: bool,
     pub ipv4_link_local: bool,
     pub ipv6_link_local: bool,
+    pub arp_sweep: bool,
+    pub arp_sweep_deep: bool,
 }
 
 impl Default for DiscoveryOptions {
@@ -83,6 +85,8 @@ impl Default for DiscoveryOptions {
             tcp: true,
             ipv4_link_local: true,
             ipv6_link_local: true,
+            arp_sweep: true,
+            arp_sweep_deep: true,
         }
     }
 }
@@ -99,6 +103,8 @@ impl DiscoveryOptions {
             self.tcp,
             self.ipv4_link_local,
             self.ipv6_link_local,
+            self.arp_sweep,
+            self.arp_sweep_deep,
         ]
         .into_iter()
         .any(|enabled| enabled)
@@ -361,11 +367,13 @@ mod tests {
             tcp: false,
             ipv4_link_local: false,
             ipv6_link_local: false,
+            arp_sweep: false,
+            arp_sweep_deep: false,
         };
         assert!(options.validate().is_err());
         assert!(DiscoveryOptions::default().validate().is_ok());
         let partial: DiscoveryOptions = serde_json::from_str("{\"icmp\":true}").unwrap();
-        assert!(partial.icmp && partial.tcp && partial.passive_arp);
+        assert!(partial.icmp && partial.tcp && partial.passive_arp && partial.arp_sweep);
     }
 
     #[test]
