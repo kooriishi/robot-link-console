@@ -47,6 +47,7 @@ pub struct DiscoveredHost {
     pub address: String,
     pub interface: String,
     pub port: u16,
+    pub port_open: bool,
     pub source: String,
 }
 

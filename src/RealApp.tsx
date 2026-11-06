@@ -17,7 +17,7 @@ type Page = 'overview' | 'network' | 'services' | 'bluetooth' | 'audio' | 'termi
 type Target = { id: string; name: string; host: string; port: number; username: string }
 type HostInterface = { name: string; kind: string; mac?: string; ipv4: string[]; carrier: boolean; state: string; mtu?: number }
 type HostInfo = { hostname: string; os: string; interfaces: HostInterface[] }
-type DiscoveredHost = { address: string; interface: string; port: number; source: string }
+type DiscoveredHost = { address: string; interface: string; port: number; portOpen: boolean; source: string }
 type HostKeyStatus = { fingerprints: string[]; pinnedFingerprints: string[]; trusted: boolean; changed: boolean }
 type RemoteOverview = { hostname: string; uptime: string; load: string; memoryTotalKb?: number; memoryAvailableKb?: number; temperatureC?: number }
 type Service = { name: string; description: string; active: string; subState: string; enabled: string }
@@ -74,6 +74,7 @@ export default function RealApp() {
   const [selectedId, setSelectedId] = useState(localStorage.getItem('robolink-selected-target') ?? '')
   const selected = useMemo(() => targets.find(t => t.id === selectedId), [targets, selectedId])
   const [localInterface, setLocalInterface] = useState('')
+  const [scanPort, setScanPort] = useState('22')
   const [discovered, setDiscovered] = useState<DiscoveredHost[]>([])
   const [remoteOverview, setRemoteOverview] = useState<RemoteOverview | null>(null)
   const [services, setServices] = useState<Service[]>([])
@@ -220,8 +221,8 @@ export default function RealApp() {
     setSelectedId(id); setKeyStatus(null); setError(''); setPage('overview')
   }
   const refreshNow = () => { setRefreshCount(n => n + 1); void invoke<HostInfo>('get_host_info').then(setHostInfo).catch(e => setError(displayError(e))) }
-  const openNewTarget = (prefill = '') => {
-    setTargetDraft({ id: '', name: prefill ? `机器人 ${prefill}` : '', host: prefill, port: '22', username: 'robot' })
+  const openNewTarget = (prefill = '', port = 22) => {
+    setTargetDraft({ id: '', name: prefill ? `机器人 ${prefill}` : '', host: prefill, port: String(port), username: 'robot' })
     setTargetDialog(true)
   }
   const saveTarget = async (e: FormEvent) => {
@@ -279,9 +280,17 @@ export default function RealApp() {
   }
   const scanInterface = async () => {
     if (!localInterface) { setError('请先选择本机物理有线网卡'); return }
+    const port = Number(scanPort)
+    if (!Number.isInteger(port) || port < 1 || port > 65535) { setError('TCP 探测端口必须是 1–65535 的整数'); return }
     setDiscovered([])
-    const found = await withBusy(() => invoke<DiscoveredHost[]>('scan_direct_interface', { interface: localInterface }))
-    if (found) { setDiscovered(found); log(`在 ${localInterface} 的直连网段发现 ${found.length} 个 SSH 主机`, found.length ? 'ok' : 'info'); if (!found.length) notify('本次扫描未发现开放 SSH 的设备；可手动输入机器人 IP') }
+    const found = await withBusy(() => invoke<DiscoveredHost[]>('scan_direct_interface', { interface: localInterface, port }))
+    if (found) {
+      setDiscovered(found)
+      const portCount = found.filter(host => host.portOpen).length
+      log(`在 ${localInterface} 发现 ${found.length} 个邻居 IP 候选，其中 ${portCount} 个 TCP/${port} 可达`, found.length ? 'ok' : 'info')
+      if (!found.length) notify('未发现邻居 IP；请确认两端 IPv4 同网段、网线和机器人电源')
+      else if (!portCount) notify(`已发现邻居 IP，但 TCP/${port} 未确认；若 SSH 使用其他端口，请修改端口后重试`)
+    }
   }
   const showConfirm = (title: string, description: string, run: () => Promise<void>, danger = false) => setConfirm({ title, description, run, danger })
 
@@ -382,13 +391,13 @@ export default function RealApp() {
         <div className="page-heading"><div><div className="eyebrow">LINUX HOST <span>·</span> DIRECT ETHERNET / SSH</div><h1>{pageInfo[page].title}</h1><p>{pageInfo[page].subtitle}</p></div><div className="heading-actions"><span className={`runtime-tag ${selected && keyStatus?.trusted ? 'live' : ''}`}><span/>{selected && keyStatus?.trusted ? '真实设备' : '尚未连接'}</span><button className="button button-subtle" onClick={refreshNow} disabled={busy}><RefreshCw size={15}/>刷新</button></div></div>
         {error && <div className="inline-error"><AlertTriangle size={16}/><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误"><X size={15}/></button></div>}
     {page === 'overview' && <OverviewPage hostInfo={hostInfo} target={selected} trusted={!!keyStatus?.trusted} connected={sshReady && !terminalExited} remote={remoteOverview} services={services} onAdd={() => openNewTarget()} onConnect={connectTarget} onPage={navPage}/ >}
-        {page === 'network' && <NetworkPage hostInfo={hostInfo} interfaces={wiredInterfaces} selectedInterface={localInterface} setSelectedInterface={setLocalInterface} discovered={discovered} onScan={scanInterface} network={remoteNetwork} wifi={wifiNetworks} onScanWifi={scanWifi} onToggleWifi={toggleWifiRadio} onConnectWifi={connectWifi} onAddHost={openNewTarget} busy={busy}/ >}
+        {page === 'network' && <NetworkPage hostInfo={hostInfo} interfaces={wiredInterfaces} selectedInterface={localInterface} setSelectedInterface={name => { setLocalInterface(name); setDiscovered([]) }} scanPort={scanPort} setScanPort={setScanPort} discovered={discovered} onScan={scanInterface} network={remoteNetwork} wifi={wifiNetworks} onScanWifi={scanWifi} onToggleWifi={toggleWifiRadio} onConnectWifi={connectWifi} onAddHost={openNewTarget} busy={busy}/ >}
         {page === 'services' && <ServicesPage services={visibleServices} query={serviceQuery} setQuery={setServiceQuery} onAction={doServiceAction} busy={busy}/ >}
         {page === 'bluetooth' && <BluetoothPage snapshot={bluetooth} onScan={scanBluetooth} onTogglePower={toggleBluetoothPower} onAction={bluetoothAction} busy={busy}/ >}
         {page === 'audio' && <AudioPage snapshot={audio} sourceVolume={sourceVolume} sinkVolume={sinkVolume} setSourceVolume={setSourceVolume} setSinkVolume={setSinkVolume} onDefault={setDefaultAudio} onVolume={commitAudioVolume} onTest={playTestAudio} busy={busy}/ >}
         {page === 'terminal' && <TerminalPage key={sessionId} sessionId={sessionId} exited={terminalExited} sshReady={sshReady} target={selected} theme={theme} onConnect={connectTarget} onDisconnect={disconnectTerminal} onRisk={setDangerLine} onPaste={setPastePreview} onError={setError}/ >}
         {page === 'logs' && <LogsPage logs={logs} onClear={() => setConfirm({ title: '清空本地诊断记录？', description: '只删除 RoboLink 本机界面中的操作记录，不会影响机器人。', run: async () => { setLogs([]); setConfirm(null) } })}/ >}
-        <footer className="footer-note"><ShieldCheck size={14}/>默认只读本机网卡 · SSH 使用独立 known_hosts · RoboLink v0.2.0 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
+        <footer className="footer-note"><ShieldCheck size={14}/>默认只读本机网卡 · SSH 使用独立 known_hosts · RoboLink v0.2.1 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
       </div>
     </main>
     {targetDialog && <TargetDialog value={targetDraft} setValue={setTargetDraft} onClose={() => setTargetDialog(false)} onSubmit={saveTarget} busy={busy}/>}
@@ -424,16 +433,17 @@ function HealthRow({ icon: Icon, label, value, sub, percent, color }: { icon: ty
 function QuickAction({ icon: Icon, title, detail, onClick }: { icon: typeof Terminal; title: string; detail: string; onClick: () => void }) { return <button className="quick-action" onClick={onClick}><span className="quick-icon blue"><Icon size={17}/></span><span><strong>{title}</strong><small>{detail}</small></span><ChevronRight size={16}/></button> }
 function EmptyState({ text }: { text: string }) { return <div className="empty-state"><Activity size={17}/><span>{text}</span></div> }
 
-function NetworkPage({ hostInfo, interfaces, selectedInterface, setSelectedInterface, discovered, onScan, network, wifi, onScanWifi, onToggleWifi, onConnectWifi, onAddHost, busy }: { hostInfo: HostInfo | null; interfaces: HostInterface[]; selectedInterface: string; setSelectedInterface: (v: string) => void; discovered: DiscoveredHost[]; onScan: () => void; network: RemoteNetwork | null; wifi: WifiNetwork[]; onScanWifi: () => void; onToggleWifi: (v: boolean) => void; onConnectWifi: (n: WifiNetwork) => void; onAddHost: (host?: string) => void; busy: boolean }) {
+function NetworkPage({ hostInfo, interfaces, selectedInterface, setSelectedInterface, scanPort, setScanPort, discovered, onScan, network, wifi, onScanWifi, onToggleWifi, onConnectWifi, onAddHost, busy }: { hostInfo: HostInfo | null; interfaces: HostInterface[]; selectedInterface: string; setSelectedInterface: (v: string) => void; scanPort: string; setScanPort: (v: string) => void; discovered: DiscoveredHost[]; onScan: () => void; network: RemoteNetwork | null; wifi: WifiNetwork[]; onScanWifi: () => void; onToggleWifi: (v: boolean) => void; onConnectWifi: (n: WifiNetwork) => void; onAddHost: (host?: string, port?: number) => void; busy: boolean }) {
   const selectedLink = interfaces.find(i => i.name === selectedInterface)
   const linkLocalOnly = !!selectedLink?.ipv4.length && selectedLink.ipv4.every(address => address.startsWith('169.254.'))
   return <div className="page-stack"><div className="network-warning"><div className="warning-icon"><AlertTriangle size={18}/></div><div><strong>有线网络按点对点连接处理</strong><p>网线直接连接 Linux 开发机和机器人，不依赖交换机或路由器。这里不会自动改开发机地址、默认路由、DNS 或防火墙。</p></div></div>
     <section className="panel detail-panel"><div className="panel-heading"><div className="heading-icon cable-bg"><Cable size={18}/></div><div><div className="section-kicker">LOCAL LINUX HOST</div><h2>开发机有线网卡</h2></div><span className="small-muted push-right">{hostInfo?.hostname ?? '读取中'}</span></div>
       {!interfaces.length ? <EmptyState text="未检测到物理有线网卡。请插入网线或检查 iproute2。"/> : <div className="interface-cards">{interfaces.map(i => <button className={`interface-card ${selectedInterface === i.name ? 'selected' : ''}`} key={i.name} onClick={() => setSelectedInterface(i.name)}><span className="interface-card-top"><Cable size={15}/><strong>{i.name}</strong><i className={i.carrier ? 'carrier-up' : 'carrier-down'}/></span><span>{i.carrier ? '物理链路已连接' : '无物理链路'}</span><small>{i.ipv4.join(' · ') || '未配置 IPv4'}{i.mac ? ` · ${i.mac}` : ''}</small></button>)}</div>}
-      <div className={`direct-link-state ${selectedLink?.carrier && selectedLink.ipv4.length ? 'ready' : 'needs-setup'}`}><Cable size={16}/><div><strong>{!selectedLink ? '先选择直连接口' : !selectedLink.carrier ? '尚未检测到网线链路' : !selectedLink.ipv4.length ? '网线已连通，但开发机接口尚无 IPv4 地址' : linkLocalOnly ? '检测到 IPv4 链路本地地址' : '直连接口已配置 IPv4'}</strong><p>{!selectedLink ? '插网线并选中开发机到机器人的物理网卡。' : !selectedLink.carrier ? '无 Internet 不妨碍 SSH，但物理链路必须连通；检查网线与机器人电源。' : !selectedLink.ipv4.length ? '直连 SSH 不需要 Internet，但两端必须处于同一可达 IP 网段，机器人也必须已启用 SSH。先按机器人固件说明为开发机与机器人配置相配的临时静态 IP；RoboLink 不会静默改动网络。' : linkLocalOnly ? '169.254/16 可用于无路由器直连；自动发现仅检查该接口的已知邻居，不扫描整个 /16。若未发现设备，可手动添加已知 169.254.x.x 或 robot.local 地址。' : `当前开发机地址：${selectedLink.ipv4.join(' · ')}。这条直连不需要 Internet；请确认机器人地址与之同网段且 SSH 服务正在运行。`}</p>{selectedLink?.carrier && <button className="text-button" onClick={() => onAddHost()}>我已知道机器人 IP / 主机名，手动添加 <ChevronRight size={14}/></button>}</div></div>
-      <div className="subtle-callout"><ShieldCheck size={16}/><span>{linkLocalOnly ? '链路本地模式只探测已知邻居；普通网段扫描会绑定所选接口源地址，只探测其 /24–/30 子网中的 SSH TCP/22，并确认路由仍经过这张网卡。不会扫描 Wi‑Fi 或其他接口。' : '普通网段扫描只绑定所选有线网卡源地址，最多探测 254 个 SSH TCP/22 地址，并验证内核路由；不改本机网络设置。'}</span></div>
-      <div className="panel-actions"><button className="button button-primary" onClick={onScan} disabled={busy || !selectedInterface}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : <Search size={15}/>}扫描此直连接口</button></div>
-      {discovered.length > 0 && <div className="discovery-list"><div className="section-kicker">SSH HOSTS FOUND</div>{discovered.map(host => <div className="discovered-row" key={host.address}><span className="wifi-small-icon"><Signal size={16}/></span><span><strong>{host.address}:22</strong><small>{host.interface} · {host.source}</small></span><button className="button button-subtle" onClick={() => onAddHost(host.address)}>添加为目标</button></div>)}</div>}
+      <div className={`direct-link-state ${selectedLink?.carrier && selectedLink.ipv4.length ? 'ready' : 'needs-setup'}`}><Cable size={16}/><div><strong>{!selectedLink ? '先选择直连接口' : !selectedLink.carrier ? '尚未检测到网线链路' : !selectedLink.ipv4.length ? '网线已连通，但开发机接口尚无 IPv4 地址' : linkLocalOnly ? '检测到 IPv4 链路本地地址' : '直连接口已配置 IPv4'}</strong><p>{!selectedLink ? '插入直连网线后，选择连接机器人的本机物理以太网口。' : !selectedLink.carrier ? '检查机器人电源、网线两端和所选网卡。直连不需要 Internet，但必须先建立物理链路。' : !selectedLink.ipv4.length ? '本机接口没有 IPv4 时，单靠网线不能推导机器人任意静态 IP。请按机器人说明为两端设置同一网段地址，例如开发机 192.168.77.1/24、机器人 192.168.77.2/24；应用不会自动改本机网络。' : linkLocalOnly ? '169.254/16 可用于无路由器直连；扫描只检查此接口已知的链路本地邻居，不遍历整个 /16。若没有邻居，请按机器人说明配置同网段地址或使用已知 IP。' : `本机直连接口地址：${selectedLink.ipv4.join(' · ')}。无需预先知道机器人 IP；扫描会列出同网段邻居 IP 候选。`}</p>{selectedLink?.carrier && <button className="text-button" onClick={() => onAddHost()}>我已知道机器人 IP / 主机名，手动添加 <ChevronRight size={14}/></button>}</div></div>
+      <div className="connection-steps"><strong>直连操作步骤</strong><ol><li>用网线把本机和已开机的机器人直接相连。</li><li>选择显示“物理链路已连接”、且本机 IPv4 与机器人同网段的有线网卡。</li><li>设置机器人 SSH 的 TCP 端口（默认 22；若使用其他端口，请在下方修改），再点击扫描。</li><li>将 IP 添加为机器人目标；端口可达仍不代表 SSH 身份已验证，首次连接要核对主机指纹。</li></ol></div>
+      <div className="subtle-callout"><ShieldCheck size={16}/><span>扫描只使用所选物理网卡：普通地址仅限其 /24–/30 子网（最多 254 个候选）；169.254/16 只看已知邻居，不扫完整 /16。邻居缓存可能含过期地址；结果标注的是你选定 TCP 端口的可达性，不验证 SSH 握手。不会扫描 Wi‑Fi/其他接口，也不会改本机 IP、路由或防火墙。</span></div>
+      <div className="scan-controls"><label className="scan-port-field"><span>SSH TCP 端口</span><input aria-label="SSH TCP 端口" type="number" min="1" max="65535" step="1" value={scanPort} onChange={event => setScanPort(event.target.value)} disabled={busy}/></label><button className="button button-primary" onClick={onScan} disabled={busy || !selectedInterface || !Number.isInteger(Number(scanPort)) || Number(scanPort) < 1 || Number(scanPort) > 65535}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : <Search size={15}/>}扫描直连设备 IP</button></div>
+      {discovered.length > 0 && <div className="discovery-list"><div className="section-kicker">发现结果 · {discovered.length}</div>{discovered.map(host => <div className="discovered-row" key={host.address}><span className="wifi-small-icon"><Signal size={16}/></span><span><strong>{host.address}</strong><small>{host.interface} · {host.source} · TCP/{host.port} {host.portOpen ? '可达' : '未确认'}</small></span><button className="button button-subtle" onClick={() => onAddHost(host.address, host.port)}>添加为机器人</button></div>)}</div>}
     </section>
     <section className="panel detail-panel"><div className="panel-heading"><div className="heading-icon wifi-bg"><Wifi size={18}/></div><div><div className="section-kicker">ROBOT ONLY · NETWORKMANAGER</div><h2>机器人 Wi-Fi</h2></div>{network?.supported && <span className={`connected-pill ${network.wifiEnabled ? '' : 'not-connected'} push-right`}><span/>{network.wifiEnabled ? '无线已开启' : '无线已关闭'}</span>}</div>
       {!network ? <EmptyState text="连接机器人并固定 SSH 指纹后读取 NetworkManager 状态。"/> : !network.supported ? <EmptyState text={network.note ?? '机器人没有可用的 NetworkManager/nmcli。'}/> : <><div className="remote-device-list">{network.devices.filter(d => d.kind.toLowerCase().includes('wifi') || d.kind.toLowerCase().includes('wireless')).map(d => <InfoRow key={d.device} label={`${d.device} · ${d.kind}`} value={`${d.state}${d.connection ? ` · ${d.connection}` : ''}`}/>)}</div><div className="wifi-actions"><div className="section-kicker">AVAILABLE NETWORKS</div><div className="inline-actions"><button className="button button-subtle" onClick={onScanWifi} disabled={busy}><RefreshCw size={14}/>扫描机器人 Wi-Fi</button><button className="button button-subtle" onClick={() => onToggleWifi(!network.wifiEnabled)} disabled={busy}><Power size={14}/>{network.wifiEnabled ? '关闭无线…' : '开启无线…'}</button></div></div><div className="wifi-list">{wifi.map((w, i) => <div className="wifi-row real-wifi-row" key={`${w.ssid}-${i}`}><span className="wifi-small-icon"><Wifi size={16}/></span><span className="wifi-row-copy"><strong>{w.ssid || '(隐藏网络)'} {w.inUse && <span className="current-badge">当前网络</span>}</strong><small>{w.security || '开放网络'} · 信号 {w.signal}%</small></span><button className="button button-subtle" onClick={() => onConnectWifi(w)} disabled={busy}>{w.inUse ? '重新连接…' : '连接…'}</button></div>)}</div></>}

@@ -196,8 +196,9 @@ pub fn ssh_connection_ready(state: State<'_, AppState>, target_id: String) -> Re
 }
 
 #[tauri::command]
-pub fn scan_direct_interface(interface: String) -> Result<Vec<DiscoveredHost>, String> {
+pub fn scan_direct_interface(interface: String, port: u16) -> Result<Vec<DiscoveredHost>, String> {
     validate_ifname(&interface)?;
+    validate_scan_port(port)?;
     let host_info = get_host_info()?;
     let iface = host_info
         .interfaces
@@ -210,7 +211,6 @@ pub fn scan_direct_interface(interface: String) -> Result<Vec<DiscoveredHost>, S
             iface.name
         ));
     }
-    let mut found = HashSet::new();
     let mut subnet = None;
     let mut link_local = None;
     for cidr in &iface.ipv4 {
@@ -247,11 +247,20 @@ pub fn scan_direct_interface(interface: String) -> Result<Vec<DiscoveredHost>, S
             .map_err(|e| format!("解析链路本地邻居缓存失败：{e}"))?;
         let peers = link_local_neighbors(&rows, &interface, local);
         if peers.is_empty() {
-            return Err("开发机与网线已建立链路本地地址，但 Linux 邻居缓存中还没有机器人地址。若机器人支持 IPv4 link-local/mDNS，请输入已知的 169.254.x.x 或 robot.local；否则需先按机器人固件说明配置静态 IP 和 SSH 服务。".into());
+            return Err("本机已使用 169.254/16 链路本地地址，但所选网卡的邻居缓存还没有对端 IP。为避免遍历整个 /16，RoboLink 不会做全段扫描。请确认机器人也启用了 IPv4 link-local，先从本机对机器人发起一次连接/探测后重试；或按固件说明给两端配置同网段地址，再扫描。机器人还需启用 SSH 才能连接。".into());
         }
         (local, peers, true)
     } else {
-        return Err("网线已连接，但开发机这张网卡没有可扫描的 IPv4 地址。无 Internet 仍可直连 SSH，但开发机与机器人必须有同网段 IP，且机器人已启用 SSH；请按机器人固件说明设置临时静态地址。本程序不会擅自修改网络。".into());
+        let message = if iface.ipv4.is_empty() {
+            "网线链路已连接，但开发机所选网卡没有 IPv4 地址。仅有网线不能推导任意静态 IP；请先按机器人固件说明，为开发机和机器人配置同一 IPv4 子网（例如开发机 192.168.77.1/24、机器人 192.168.77.2/24），然后重新扫描。RoboLink 不会擅自修改本机网络。"
+                .to_string()
+        } else {
+            format!(
+                "开发机网卡有 IPv4 地址（{}），但扫描目前只支持 /24–/30 或 169.254/16 链路本地前缀。请将两端配置到受支持的同一 IPv4 子网后重新扫描。RoboLink 不会擅自修改本机网络。",
+                iface.ipv4.join("、")
+            )
+        };
+        return Err(message);
     };
     if candidates.len() > 1024 {
         return Err("直连候选地址超过 1024 个，已停止扫描".into());
@@ -284,6 +293,7 @@ pub fn scan_direct_interface(interface: String) -> Result<Vec<DiscoveredHost>, S
                 .into(),
         );
     }
+    let candidate_set = candidates.iter().copied().collect::<HashSet<_>>();
     let queue = Arc::new(Mutex::new(VecDeque::from(candidates)));
     let (tx, rx) = mpsc::channel();
     let workers = 16.min(queue.lock().map_err(|_| "扫描状态不可用")?.len().max(1));
@@ -293,34 +303,58 @@ pub fn scan_direct_interface(interface: String) -> Result<Vec<DiscoveredHost>, S
         thread::spawn(move || loop {
             let next = q.lock().ok().and_then(|mut q| q.pop_front());
             let Some(ip) = next else { break };
-            let remote = SockAddr::from(SocketAddrV4::new(ip, 22));
+            let remote = SockAddr::from(SocketAddrV4::new(ip, port));
             let source = SockAddr::from(SocketAddrV4::new(local, 0));
-            let reachable = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-                .and_then(|socket| {
+            let probe =
+                Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).and_then(|socket| {
                     socket.bind(&source)?;
                     socket.connect_timeout(&remote, Duration::from_millis(160))
-                })
-                .is_ok();
-            if reachable {
-                let _ = tx.send(ip);
+                });
+            let port_open = match probe {
+                Ok(_) => Some(true),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Some(false),
+                Err(_) => None,
+            };
+            if let Some(port_open) = port_open {
+                let _ = tx.send((ip, port_open));
             }
         });
     }
     drop(tx);
-    for ip in rx {
-        found.insert(ip.to_string());
+    let mut found = HashSet::new();
+    let mut open_ips = HashSet::new();
+    for (ip, port_open) in rx {
+        found.insert(ip);
+        if port_open {
+            open_ips.insert(ip);
+        }
     }
+    let neighbors = Command::new("ip")
+        .args(["-json", "neigh", "show", "dev", &interface])
+        .output()
+        .map_err(|e| format!("读取所选网卡的邻居缓存失败：{e}"))?;
+    if !neighbors.status.success() {
+        return Err("读取 Linux 邻居缓存失败；请检查 iproute2 安装。".into());
+    }
+    let rows: Vec<Value> = serde_json::from_slice(&neighbors.stdout)
+        .map_err(|e| format!("解析所选网卡的邻居缓存失败：{e}"))?;
+    found.extend(
+        interface_neighbors(&rows, &interface)
+            .into_iter()
+            .filter(|ip| candidate_set.contains(ip)),
+    );
     let source = if link_local_mode {
-        "选定直连接口已知链路本地邻居的 TCP/22 探测"
+        "所选接口的链路本地邻居"
     } else {
-        "选定直连接口的 TCP/22 探测"
+        "所选接口同网段邻居"
     };
     let mut result: Vec<_> = found
         .into_iter()
-        .map(|address| DiscoveredHost {
-            address,
+        .map(|ip| DiscoveredHost {
+            address: ip.to_string(),
             interface: interface.clone(),
-            port: 22,
+            port,
+            port_open: open_ips.contains(&ip),
             source: source.into(),
         })
         .collect();
@@ -328,7 +362,15 @@ pub fn scan_direct_interface(interface: String) -> Result<Vec<DiscoveredHost>, S
     Ok(result)
 }
 
-fn link_local_neighbors(rows: &[Value], interface: &str, local: Ipv4Addr) -> Vec<Ipv4Addr> {
+fn validate_scan_port(port: u16) -> Result<(), String> {
+    if port == 0 {
+        Err("扫描端口必须在 1–65535 之间".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn interface_neighbors(rows: &[Value], interface: &str) -> Vec<Ipv4Addr> {
     let unusable_state = |state: &str| matches!(state, "FAILED" | "INCOMPLETE" | "NONE");
     let mut peers = rows
         .iter()
@@ -346,13 +388,20 @@ fn link_local_neighbors(rows: &[Value], interface: &str, local: Ipv4Addr) -> Vec
             if unusable {
                 return None;
             }
-            let ip = row
-                .get("dst")
-                .and_then(Value::as_str)?
-                .parse::<Ipv4Addr>()
-                .ok()?;
+            row.get("dst")?.as_str()?.parse::<Ipv4Addr>().ok()
+        })
+        .collect::<Vec<_>>();
+    peers.sort();
+    peers.dedup();
+    peers
+}
+
+fn link_local_neighbors(rows: &[Value], interface: &str, local: Ipv4Addr) -> Vec<Ipv4Addr> {
+    let mut peers = interface_neighbors(rows, interface)
+        .into_iter()
+        .filter(|ip| {
             let octets = ip.octets();
-            (ip != local && octets[0] == 169 && octets[1] == 254).then_some(ip)
+            *ip != local && octets[0] == 169 && octets[1] == 254
         })
         .collect::<Vec<_>>();
     peers.sort();
@@ -921,6 +970,30 @@ mod tests {
     fn nmcli_escaped_fields_parse_without_splitting_ssid_colons() {
         let fields = parse_nmcli("*:Lab\\:Robot:80:WPA2");
         assert_eq!(fields, vec!["*", "Lab:Robot", "80", "WPA2"]);
+    }
+
+    #[test]
+    fn scan_port_accepts_default_custom_and_maximum_ports() {
+        assert!(validate_scan_port(0).is_err());
+        assert!(validate_scan_port(22).is_ok());
+        assert!(validate_scan_port(2222).is_ok());
+        assert!(validate_scan_port(u16::MAX).is_ok());
+    }
+
+    #[test]
+    fn subnet_discovery_includes_neighbor_ips_without_requiring_port_open() {
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[
+          {"dst":"192.168.77.2","dev":"enp3s0","state":["REACHABLE"]},
+          {"dst":"192.168.77.2","dev":"enp3s0","state":["STALE"]},
+          {"dst":"192.168.77.3","dev":"wlan0","state":["REACHABLE"]},
+          {"dst":"192.168.77.4","dev":"enp3s0","state":["INCOMPLETE"]},
+          {"dst":"192.168.77.5","dev":"enp3s0","state":"FAILED"}
+        ]"#,
+        )
+        .unwrap();
+        let found = interface_neighbors(&rows, "enp3s0");
+        assert_eq!(found, vec![Ipv4Addr::new(192, 168, 77, 2)]);
     }
 
     #[test]

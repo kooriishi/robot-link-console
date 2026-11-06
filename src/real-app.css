@@ -41,6 +41,16 @@
 .wifi-row-copy small{font-size:9px;color:#7c8c9a}
 .subtle-callout{display:flex;align-items:flex-start;gap:9px;padding:11px 12px;border:1px solid #293944;border-radius:8px;background:#121d26;color:#8d9eaa;font-size:9px;line-height:1.6}
 .subtle-callout>svg{flex:none;margin-top:1px;color:#83a3ae}
+.connection-steps{padding:12px 14px;border:1px solid #293944;border-radius:8px;background:#111b25;color:#91a1ad;font-size:10px;line-height:1.65}
+.connection-steps>strong{color:#d4e0e8;font-size:10px;font-weight:600}
+.connection-steps ol{margin:7px 0 0;padding-left:19px}
+.connection-steps li+li{margin-top:3px}
+html[data-theme="light"] .connection-steps{background:#f5f8fa;border-color:#dbe5e9;color:#617782}
+html[data-theme="light"] .connection-steps>strong{color:#344c58}
+.scan-controls{display:flex;align-items:flex-end;gap:10px;margin-top:14px;flex-wrap:wrap}
+.scan-port-field{display:flex;flex-direction:column;gap:5px;color:#8697a5;font-size:9px}
+.scan-port-field input{width:150px;height:34px;padding:0 9px;border:1px solid #293945;border-radius:7px;background:#101a24;color:#d6e0e8;font-size:10px}
+html[data-theme="light"] .scan-port-field input{background:#fff;border-color:#d2dfe3;color:#344c58}
 .summary-strip{display:flex;align-items:center;gap:9px;flex-wrap:wrap;padding:12px 15px;border:1px solid #263541;border-radius:9px;background:#111a24;color:#8e9ead;font-size:10px}
 .summary-strip strong{font-size:10px;color:#ccd7df;font-weight:500}
 .summary-dot{width:7px;height:7px;border-radius:50%}
