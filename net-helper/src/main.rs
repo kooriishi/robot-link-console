@@ -26,6 +26,7 @@ struct ArpPacket {
     operation: u16,
     sender_mac: [u8; 6],
     sender_ip: Ipv4Addr,
+    target_mac: [u8; 6],
     target_ip: Ipv4Addr,
 }
 
@@ -200,6 +201,11 @@ struct DiscoverOptions {
     tcp: bool,
     ipv4_link_local: bool,
     ipv6_link_local: bool,
+    /// Actively sweep the subnets of the interface plus common development-board defaults.
+    arp_sweep: bool,
+    /// Additionally sweep all of 192.168.0.0/16 (and 169.254/16 with IPv4 link-local) on interfaces
+    /// that do not carry a default route, i.e. look like a point-to-point cable.
+    arp_sweep_deep: bool,
 }
 impl DiscoverOptions {
     fn legacy() -> Self {
@@ -380,7 +386,20 @@ fn discover(
             warnings,
         });
     }
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(seconds);
+    for (_, socket, _) in &sockets {
+        tune_capture_socket(socket);
+    }
+    let mut sweeps = if options.arp_sweep {
+        build_sweep_plans(&sockets, options, &mut warnings)
+    } else {
+        Vec::new()
+    };
+    let sweep_total = sweeps.iter().map(|p| p.targets.len()).sum::<usize>();
+    // Spread the sweep over ~60% of the listening window, 2k–40k frames per second overall.
+    let sweep_rate_per_ms = (sweep_total as f64 / (seconds as f64 * 600.0)).clamp(2.0, 40.0);
+    let mut sweep_sent = 0_usize;
     let mut candidates = HashMap::<(String, String, String), ArpCandidate>::new();
     let mut dhcp_without_address = std::collections::HashSet::new();
     let mut buffer = [0_u8; 4096];
@@ -393,10 +412,16 @@ fn discover(
                 revents: 0,
             })
             .collect::<Vec<_>>();
+        let sweeping = sweeps.iter().any(|p| p.next < p.targets.len());
+        if sweeping {
+            let budget = (started.elapsed().as_secs_f64() * 1000.0 * sweep_rate_per_ms) as usize;
+            let allowed = budget.saturating_sub(sweep_sent).min(4096);
+            sweep_sent += send_sweep_batch(&mut sweeps, &sockets, allowed, &mut warnings);
+        }
         let timeout = deadline
             .saturating_duration_since(Instant::now())
             .as_millis()
-            .min(200) as i32;
+            .min(if sweeping { 5 } else { 200 }) as i32;
         let ready =
             unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout) };
         if ready < 0 {
@@ -430,9 +455,36 @@ fn discover(
             if src_mac == sockets[i].2 {
                 continue;
             }
-            if ethertype == 0x0806 && (options.passive_arp || options.ipv4_link_local) {
+            if ethertype == 0x0806
+                && (options.passive_arp || options.ipv4_link_local || options.arp_sweep)
+            {
                 if let Some(packet) = parse_arp(frame) {
                     if packet.sender_mac == sockets[i].2 {
+                        continue;
+                    }
+                    if options.arp_sweep
+                        && is_sweep_reply(&packet, sockets[i].2)
+                        && ipv4_allowed(packet.sender_ip, options)
+                    {
+                        add_candidate(
+                            &mut candidates,
+                            iface,
+                            packet.sender_ip.to_string(),
+                            packet.sender_mac,
+                            "主动 ARP 扫描应答",
+                            "较高",
+                        );
+                        let key = (
+                            iface.to_string(),
+                            packet.sender_ip.to_string(),
+                            format_mac(packet.sender_mac),
+                        );
+                        if let Some(row) = candidates.get_mut(&key) {
+                            row.arp_reachable = Some(true);
+                        }
+                        continue;
+                    }
+                    if !(options.passive_arp || options.ipv4_link_local) {
                         continue;
                     }
                     // ARP targets are evidence only for a strict address probe (SPA=0); ordinary targets are not hosts.
@@ -652,6 +704,7 @@ fn parse_arp(frame: &[u8]) -> Option<ArpPacket> {
         operation: op,
         sender_mac: a[8..14].try_into().ok()?,
         sender_ip: Ipv4Addr::new(a[14], a[15], a[16], a[17]),
+        target_mac: a[18..24].try_into().ok()?,
         target_ip: Ipv4Addr::new(a[24], a[25], a[26], a[27]),
     })
 }
@@ -838,6 +891,17 @@ fn send_arp_request(
     target: Ipv4Addr,
     sender: Ipv4Addr,
 ) -> Result<(), String> {
+    send_arp_frame(fd, index, mac, target, sender, 0)
+        .map_err(|e| format!("定向 ARP 验证发送失败：{e}"))
+}
+fn send_arp_frame(
+    fd: i32,
+    index: i32,
+    mac: [u8; 6],
+    target: Ipv4Addr,
+    sender: Ipv4Addr,
+    flags: i32,
+) -> std::io::Result<()> {
     let mut frame = [0u8; 42];
     frame[..6].fill(0xff);
     frame[6..12].copy_from_slice(&mac);
@@ -861,18 +925,266 @@ fn send_arp_request(
             fd,
             frame.as_ptr() as *const libc::c_void,
             frame.len(),
-            0,
+            flags,
             &dst as *const _ as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
         )
     };
     if n != frame.len() as isize {
-        return Err(format!(
-            "定向 ARP 验证发送失败：{}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// A reply addressed to our own MAC: the answer to one of our sweep or verification requests.
+fn is_sweep_reply(packet: &ArpPacket, own_mac: [u8; 6]) -> bool {
+    packet.operation == 2 && packet.target_mac == own_mac && packet.sender_mac != own_mac
+}
+
+/// Ignore our own transmitted frames and enlarge the receive buffer so that thousands of
+/// outgoing sweep requests cannot crowd out the single reply we are waiting for.
+fn tune_capture_socket(socket: &OwnedFd) {
+    const PACKET_IGNORE_OUTGOING: libc::c_int = 23;
+    let one: libc::c_int = 1;
+    let size: libc::c_int = 4 * 1024 * 1024;
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_PACKET,
+            PACKET_IGNORE_OUTGOING,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUFFORCE,
+            &size as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) != 0
+        {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
+
+/// Default /24 networks used by common Linux development boards, phone/PC sharing and
+/// vendor images. Swept on every direct interface in addition to its own subnets.
+const COMMON_BOARD_SUBNETS: &[[u8; 3]] = &[
+    [192, 168, 1],
+    [192, 168, 0],
+    [192, 168, 127],
+    [192, 168, 137],
+    [192, 168, 2],
+    [192, 168, 3],
+    [192, 168, 5],
+    [192, 168, 6],
+    [192, 168, 7],
+    [192, 168, 8],
+    [192, 168, 10],
+    [192, 168, 11],
+    [192, 168, 31],
+    [192, 168, 42],
+    [192, 168, 43],
+    [192, 168, 50],
+    [192, 168, 55],
+    [192, 168, 77],
+    [192, 168, 88],
+    [192, 168, 100],
+    [192, 168, 123],
+    [192, 168, 199],
+    [10, 0, 0],
+    [10, 1, 1],
+    [10, 10, 10],
+    [10, 42, 0],
+    [172, 16, 0],
+    [172, 17, 0],
+];
+
+struct SweepPlan {
+    socket: usize,
+    index: i32,
+    targets: Vec<(Ipv4Addr, Ipv4Addr)>,
+    next: usize,
+}
+
+/// Pure target generation: returns (target, sender) pairs. The sender is the local address when
+/// the target lies in one of the interface's own subnets, otherwise 0.0.0.0 (an RFC 5227 probe,
+/// which Linux answers for any address configured on the receiving interface).
+fn sweep_targets(
+    locals: &[(Ipv4Addr, u8)],
+    direct_link: bool,
+    deep: bool,
+    link_local: bool,
+) -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    fn range(base: u32, prefix: u8) -> impl Iterator<Item = Ipv4Addr> {
+        let size = 1_u32 << (32 - prefix);
+        (1..size.saturating_sub(1)).map(move |host| Ipv4Addr::from(base + host))
+    }
+    let mut ordered: Vec<Ipv4Addr> = Vec::new();
+    // 1. The interface's own subnets (capped at /22, otherwise the /24 around the address).
+    for (ip, prefix) in locals {
+        if ip.is_link_local() && !(deep && direct_link && link_local) {
+            continue;
+        }
+        let prefix = if *prefix >= 22 { *prefix } else { 24 };
+        if prefix <= 30 {
+            ordered.extend(range(network(*ip, prefix).0, prefix));
+        }
+    }
+    // Interfaces carrying a default route are shared LANs: only probe our own subnet there.
+    if direct_link {
+        // 2. Well-known board defaults.
+        for net in COMMON_BOARD_SUBNETS {
+            ordered.extend(range(
+                u32::from(Ipv4Addr::new(net[0], net[1], net[2], 0)),
+                24,
+            ));
+        }
+        if deep {
+            // 3. Every 192.168.x.y.
+            ordered.extend(range(u32::from(Ipv4Addr::new(192, 168, 0, 0)), 16));
+            // 4. IPv4 link-local hosts 169.254.1.0–169.254.254.255 (RFC 3927).
+            if link_local {
+                for third in 1..=254_u8 {
+                    ordered
+                        .extend((0..=255_u8).map(|fourth| Ipv4Addr::new(169, 254, third, fourth)));
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    ordered
+        .into_iter()
+        .filter(|target| {
+            ipv4_usable_candidate(*target)
+                && !locals.iter().any(|(ip, _)| ip == target)
+                && seen.insert(*target)
+        })
+        .map(|target| {
+            let sender = locals
+                .iter()
+                .find(|(ip, prefix)| network(*ip, *prefix).0 == network(target, *prefix).0)
+                .map(|(ip, _)| *ip)
+                .unwrap_or(Ipv4Addr::UNSPECIFIED);
+            (target, sender)
+        })
+        .collect()
+}
+
+fn default_route_interfaces() -> std::collections::HashSet<String> {
+    fs::read_to_string("/proc/net/route")
+        .map(|text| parse_default_route_interfaces(&text))
+        .unwrap_or_default()
+}
+
+fn parse_default_route_interfaces(text: &str) -> std::collections::HashSet<String> {
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            (fields.len() >= 8 && fields[1] == "00000000" && fields[7] == "00000000")
+                .then(|| fields[0].to_string())
+        })
+        .collect()
+}
+
+fn build_sweep_plans(
+    sockets: &[(String, OwnedFd, [u8; 6])],
+    options: &DiscoverOptions,
+    warnings: &mut Vec<String>,
+) -> Vec<SweepPlan> {
+    let locals = all_ipv4_addresses().unwrap_or_default();
+    let uplinks = default_route_interfaces();
+    let mut plans = Vec::new();
+    for (socket, (name, _, _)) in sockets.iter().enumerate() {
+        let Ok(c) = CString::new(name.as_str()) else {
+            continue;
+        };
+        let index = unsafe { libc::if_nametoindex(c.as_ptr()) } as i32;
+        if index == 0 {
+            continue;
+        }
+        let own = locals
+            .iter()
+            .filter(|(dev, _, _)| dev == name)
+            .map(|(_, ip, prefix)| (*ip, *prefix))
+            .collect::<Vec<_>>();
+        let direct_link = !uplinks.contains(name);
+        if !direct_link {
+            warnings.push(format!(
+                "{name} 承载默认路由（像是接入了路由器/局域网），主动 ARP 扫描只覆盖其本机网段，未扫描常见开发板网段。"
+            ));
+        }
+        let targets = sweep_targets(
+            &own,
+            direct_link,
+            options.arp_sweep_deep,
+            options.ipv4_link_local,
+        );
+        if !targets.is_empty() {
+            plans.push(SweepPlan {
+                socket,
+                index,
+                targets,
+                next: 0,
+            });
+        }
+    }
+    plans
+}
+
+/// Sends up to `allowed` sweep requests round-robin across interfaces; returns how many were sent.
+fn send_sweep_batch(
+    plans: &mut [SweepPlan],
+    sockets: &[(String, OwnedFd, [u8; 6])],
+    allowed: usize,
+    warnings: &mut Vec<String>,
+) -> usize {
+    let mut sent = 0;
+    let mut progressed = true;
+    while sent < allowed && progressed {
+        progressed = false;
+        for plan in plans.iter_mut() {
+            if sent >= allowed || plan.next >= plan.targets.len() {
+                continue;
+            }
+            let (name, socket, mac) = &sockets[plan.socket];
+            let (target, sender) = plan.targets[plan.next];
+            match send_arp_frame(
+                socket.as_raw_fd(),
+                plan.index,
+                *mac,
+                target,
+                sender,
+                libc::MSG_DONTWAIT,
+            ) {
+                Ok(()) => {
+                    plan.next += 1;
+                    sent += 1;
+                    progressed = true;
+                }
+                Err(e) if matches!(e.raw_os_error(), Some(libc::EAGAIN) | Some(libc::ENOBUFS)) => {
+                    // Transmit queue full: retry this target on the next loop iteration.
+                }
+                Err(e) => {
+                    warnings.push(format!(
+                        "{name} 主动 ARP 扫描中止（已发送 {} / {}）：{e}",
+                        plan.next,
+                        plan.targets.len()
+                    ));
+                    plan.next = plan.targets.len();
+                }
+            }
+        }
+    }
+    sent
 }
 fn active_arp_verify(
     candidates: &mut HashMap<(String, String, String), ArpCandidate>,
@@ -883,6 +1195,9 @@ fn active_arp_verify(
     let mut targets = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for row in candidates.values_mut() {
+        if row.arp_reachable == Some(true) {
+            continue;
+        }
         if let Ok(ip) = row.address.parse::<Ipv4Addr>() {
             let key = (row.interface.clone(), ip);
             if targets.len() < 256 && (seen.contains(&key) || seen.insert(key.clone())) {
@@ -897,6 +1212,9 @@ fn active_arp_verify(
         }
     }
     for row in candidates.values_mut() {
+        if row.arp_reachable == Some(true) {
+            continue;
+        }
         if let Ok(ip) = row.address.parse::<Ipv4Addr>() {
             if targets
                 .iter()
@@ -1221,12 +1539,21 @@ fn add_address(interface: &str, cidr: &str, peer_text: &str) -> Result<(), Strin
         return Err(format!("检测到其他设备正在使用本机候选地址 {local}。没有添加该地址；请在窗口里选择另一个地址。"));
     }
     let cidr_arg = format!("{local}/{prefix}");
-    let output = ip_command(&["address", "add", &cidr_arg, "dev", interface])?;
-    if !output.status.success() {
-        return Err(format!(
-            "添加临时 IPv4 地址失败：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    let via_nm = nm_manages(interface);
+    if via_nm {
+        let mut addresses = nm_profile_addresses(interface).unwrap_or_default();
+        if !addresses.contains(&cidr_arg) {
+            addresses.push(cidr_arg.clone());
+        }
+        nm_apply_profile(interface, &addresses)?;
+    } else {
+        let output = ip_command(&["address", "add", &cidr_arg, "dev", interface])?;
+        if !output.status.success() {
+            return Err(format!(
+                "添加临时 IPv4 地址失败：{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
     }
     let route = ip_command(&["-4", "route", "get", &peer.to_string()])?;
     let route_text = String::from_utf8_lossy(&route.stdout);
@@ -1237,18 +1564,182 @@ fn add_address(interface: &str, cidr: &str, peer_text: &str) -> Result<(), Strin
             .windows(2)
             .any(|pair| pair[0] == "dev" && pair[1] == interface)
     {
-        let _ = ip_command(&["address", "del", &cidr_arg, "dev", interface]);
+        let _ = remove_address(interface, &cidr_arg);
         return Err(
             "添加后路由检查没有指向选定网卡；已撤销刚添加的地址，其他网络未作更改。".into(),
         );
     }
-    println!("已在 {interface} 添加临时地址 {cidr_arg}；默认路由、DNS、Wi‑Fi 和机器人端配置未修改。目标前缀 /{prefix} 为用户选择的假设。{peer}");
+    if via_nm {
+        println!("已通过 NetworkManager 临时连接“{}”在 {interface} 配置 {cidr_arg}（不设默认路由、不改 DNS），切换 Wi‑Fi 或网络重连时不会被清掉；清理后恢复该网口原来的连接。目标前缀 /{prefix} 为用户选择的假设。{peer}", nm_profile_name(interface));
+    } else {
+        println!("已在 {interface} 添加临时地址 {cidr_arg}；默认路由、DNS、Wi‑Fi 和机器人端配置未修改。目标前缀 /{prefix} 为用户选择的假设。{peer}");
+    }
+    Ok(())
+}
+
+// NetworkManager integration. A bare `ip address add` on an interface that NetworkManager manages is
+// flushed whenever NM (re)activates that interface – e.g. its DHCP profile times out and retries, or
+// the network is reconfigured after switching Wi-Fi – and traffic to the board then leaves via Wi-Fi.
+// When NM manages the interface we instead activate an in-memory (not saved to disk) manual profile
+// that never becomes the default route; deleting it lets NM bring back the user's original profile.
+
+fn nmcli_path() -> Option<&'static str> {
+    ["/usr/bin/nmcli", "/bin/nmcli"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file())
+}
+
+fn nmcli(args: &[&str]) -> Result<std::process::Output, String> {
+    let path = nmcli_path().ok_or("找不到 nmcli")?;
+    Command::new(path)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("无法运行 nmcli：{e}"))
+}
+
+fn nm_profile_name(interface: &str) -> String {
+    format!("robolink-{interface}")
+}
+
+fn nm_manages(interface: &str) -> bool {
+    if nmcli_path().is_none() || !std::path::Path::new("/run/NetworkManager").exists() {
+        return false;
+    }
+    match nmcli(&["-g", "GENERAL.STATE", "device", "show", interface]) {
+        Ok(out) if out.status.success() => {
+            nm_state_is_managed(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => false,
+    }
+}
+
+fn nm_state_is_managed(state: &str) -> bool {
+    let state = state.trim();
+    !state.is_empty() && !state.contains("unmanaged") && !state.starts_with("10 ")
+}
+
+/// Addresses of our profile for this interface, or None when the profile does not exist.
+fn nm_profile_addresses(interface: &str) -> Option<Vec<String>> {
+    nmcli_path()?;
+    let out = nmcli(&[
+        "-g",
+        "ipv4.addresses",
+        "connection",
+        "show",
+        &nm_profile_name(interface),
+    ])
+    .ok()?;
+    out.status
+        .success()
+        .then(|| parse_nm_addresses(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_nm_addresses(text: &str) -> Vec<String> {
+    text.trim()
+        .split(',')
+        .map(|item| item.trim().replace("\\", ""))
+        .filter(|item| parse_cidr(item).is_ok())
+        .collect()
+}
+
+fn nm_profile_args(interface: &str, addresses: &[String], create: bool) -> Vec<String> {
+    let name = nm_profile_name(interface);
+    let mut args: Vec<String> = if create {
+        [
+            "connection",
+            "add",
+            "save",
+            "no",
+            "type",
+            "ethernet",
+            "con-name",
+            &name,
+            "ifname",
+            interface,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    } else {
+        vec!["connection".into(), "modify".into(), name]
+    };
+    for (key, value) in [
+        ("connection.autoconnect", "yes"),
+        ("connection.autoconnect-priority", "100"),
+        ("ipv4.method", "manual"),
+        ("ipv4.addresses", &addresses.join(",")),
+        ("ipv4.gateway", ""),
+        ("ipv4.never-default", "yes"),
+        ("ipv4.ignore-auto-dns", "yes"),
+        ("ipv4.may-fail", "no"),
+        ("ipv6.method", "link-local"),
+        ("ipv6.never-default", "yes"),
+    ] {
+        args.push(key.into());
+        args.push(value.into());
+    }
+    args
+}
+
+fn nm_apply_profile(interface: &str, addresses: &[String]) -> Result<(), String> {
+    let exists = nm_profile_addresses(interface).is_some();
+    let args = nm_profile_args(interface, addresses, !exists);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let out = nmcli(&refs)?;
+    if !out.status.success() {
+        return Err(format!(
+            "创建 NetworkManager 临时连接失败：{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let name = nm_profile_name(interface);
+    let up = nmcli(&[
+        "--wait",
+        "20",
+        "connection",
+        "up",
+        &name,
+        "ifname",
+        interface,
+    ])?;
+    if !up.status.success() {
+        let detail = String::from_utf8_lossy(&up.stderr).trim().to_string();
+        if !exists {
+            let _ = nmcli(&["connection", "delete", &name]);
+        }
+        return Err(format!("启用 NetworkManager 临时连接失败：{detail}"));
+    }
     Ok(())
 }
 
 fn remove_address(interface: &str, cidr: &str) -> Result<(), String> {
     validate_ifname(interface)?;
     let (address, prefix) = parse_cidr(cidr)?;
+    let cidr_text = format!("{address}/{prefix}");
+    if let Some(addresses) = nm_profile_addresses(interface) {
+        if addresses.contains(&cidr_text) {
+            let remaining = addresses
+                .into_iter()
+                .filter(|item| *item != cidr_text)
+                .collect::<Vec<_>>();
+            let name = nm_profile_name(interface);
+            if remaining.is_empty() {
+                let out = nmcli(&["connection", "delete", &name])?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "删除 NetworkManager 临时连接失败：{}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ));
+                }
+                println!("已删除 NetworkManager 临时连接“{name}”（{cidr_text}）；该网口将恢复原来的连接，其他网络未修改。\n");
+            } else {
+                nm_apply_profile(interface, &remaining)?;
+                println!("已从 NetworkManager 临时连接“{name}”移除 {cidr_text}；其他地址和默认路由未修改。\n");
+            }
+            return Ok(());
+        }
+    }
     let current = all_ipv4_addresses()?;
     let exact = current
         .iter()
@@ -1531,6 +2022,100 @@ mod tests {
         assert!(ipv4_arp_allowed("192.0.2.1".parse().unwrap(), &options));
         assert!(ipv4_arp_allowed("169.254.1.1".parse().unwrap(), &options));
     }
+    #[test]
+    fn sweep_reply_requires_reply_addressed_to_us() {
+        let own = [0x02, 0, 0, 0, 0, 1];
+        let mut frame = arp_frame(2, Ipv4Addr::new(192, 168, 127, 10), Ipv4Addr::UNSPECIFIED);
+        frame[32..38].copy_from_slice(&own);
+        let reply = parse_arp(&frame).unwrap();
+        assert_eq!(reply.target_mac, own);
+        assert!(is_sweep_reply(&reply, own));
+        assert!(!is_sweep_reply(&reply, [0x02, 0, 0, 0, 0, 2]));
+        let request = parse_arp(&arp_frame(
+            1,
+            Ipv4Addr::new(192, 168, 127, 10),
+            Ipv4Addr::new(192, 168, 127, 1),
+        ))
+        .unwrap();
+        assert!(!is_sweep_reply(&request, own));
+    }
+
+    #[test]
+    fn sweep_targets_cover_board_defaults_and_respect_uplinks() {
+        // Unconfigured direct cable: common board subnets, probes sent from 0.0.0.0.
+        let targets = sweep_targets(&[], true, false, true);
+        let rdk = targets
+            .iter()
+            .find(|(t, _)| *t == Ipv4Addr::new(192, 168, 127, 10))
+            .unwrap();
+        assert_eq!(rdk.1, Ipv4Addr::UNSPECIFIED);
+        assert!(!targets
+            .iter()
+            .any(|(t, _)| t.octets()[3] == 0 || t.octets()[3] == 255));
+        assert!(targets.len() < 8000);
+        // Deep sweep adds all of 192.168/16 and 169.254.1-254.x without duplicates.
+        let deep = sweep_targets(&[], true, true, true);
+        assert!(deep
+            .iter()
+            .any(|(t, _)| *t == Ipv4Addr::new(192, 168, 213, 7)));
+        assert!(deep
+            .iter()
+            .any(|(t, _)| *t == Ipv4Addr::new(169, 254, 33, 0)));
+        assert!(!deep
+            .iter()
+            .any(|(t, _)| t.octets()[0] == 169 && t.octets()[2] == 0));
+        let unique = deep
+            .iter()
+            .map(|(t, _)| *t)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), deep.len());
+        // Own subnet uses the local address as sender and never targets ourselves.
+        let local = Ipv4Addr::new(192, 168, 127, 1);
+        let own = sweep_targets(&[(local, 24)], true, false, false);
+        assert_eq!(own[0].1, local);
+        assert!(!own.iter().any(|(t, _)| *t == local));
+        // Uplink (default route): only our own subnet.
+        let lan = sweep_targets(&[(Ipv4Addr::new(10, 3, 4, 5), 16)], false, true, true);
+        assert_eq!(lan.len(), 253);
+        assert!(lan.iter().all(|(t, _)| t.octets()[..3] == [10, 3, 4]));
+    }
+
+    #[test]
+    fn nm_profile_is_manual_without_default_route() {
+        let args = nm_profile_args("enp3s0", &["192.168.127.1/24".into()], true);
+        let joined = args.join(" ");
+        assert!(joined.starts_with(
+            "connection add save no type ethernet con-name robolink-enp3s0 ifname enp3s0"
+        ));
+        assert!(joined.contains("ipv4.method manual"));
+        assert!(joined.contains("ipv4.addresses 192.168.127.1/24"));
+        assert!(joined.contains("ipv4.never-default yes"));
+        let modify = nm_profile_args(
+            "enp3s0",
+            &["192.168.127.1/24".into(), "192.168.1.2/24".into()],
+            false,
+        );
+        assert_eq!(&modify[..3], ["connection", "modify", "robolink-enp3s0"]);
+        assert!(modify.contains(&"192.168.127.1/24,192.168.1.2/24".to_string()));
+        assert_eq!(
+            parse_nm_addresses("192.168.127.1/24, 192.168.1.2/24\n"),
+            vec!["192.168.127.1/24", "192.168.1.2/24"]
+        );
+        assert!(parse_nm_addresses("\n").is_empty());
+        assert!(nm_state_is_managed("100 (connected)"));
+        assert!(nm_state_is_managed("30 (disconnected)"));
+        assert!(!nm_state_is_managed("10 (unmanaged)"));
+        assert!(!nm_state_is_managed(""));
+    }
+
+    #[test]
+    fn default_route_interfaces_are_parsed_from_proc() {
+        let text = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\nwlp2s0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\nenp3s0\t007FA8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n";
+        let found = parse_default_route_interfaces(text);
+        assert!(found.contains("wlp2s0"));
+        assert!(!found.contains("enp3s0"));
+    }
+
     #[test]
     fn discovery_json_contract_uses_camel_case_and_optional_reachability() {
         let row = ArpCandidate {

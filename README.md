@@ -4,7 +4,7 @@ RoboLink 是运行在 Linux 开发机上的桌面 GUI，用 SSH 管理 Linux 机
 
 ## 版本状态
 
-当前源码为 **v0.4.0 测试候选**，在 v0.3.0 基础上把需求中的四组设备发现策略接入“网络与 Wi-Fi”页面，并修正扫描时的链路检测与授权错误分类。**没有创建 GitHub Release**，也没有真实机器人硬件验收；请先在自己的 Ubuntu 22.04.5 开发机和机器人上试用，再决定是否发布。
+当前源码为 **v0.4.2 测试候选**。v0.4.2 新增“主动 ARP 扫描”：一根网线直连时，即使开发板处于静默状态（不重启、不主动发包）、开发机网口也没有 IPv4，点击“开始发现”也能找到开发板 IP；同时把所有后端命令移出 GUI 主线程并缓存远端页面数据，解决页面切换卡顿。详见 [v0.4.2 发布说明](docs/release-notes-v0.4.2.md)。**没有创建 GitHub Release**，也没有真实机器人硬件验收；请先在自己的 Ubuntu 22.04.5 开发机和机器人上试用，再决定是否发布。
 
 已完成桌面后端 13 项、网络 helper 21 项单元测试，两部分零警告 Clippy 检查，以及 TypeScript/Vite 生产构建。最终 Debian 包已在隔离 Ubuntu 22.04 用户空间安装，并以普通用户启动出 1440×960 原生窗口；应用与 helper 的 GLIBC 最高要求均为 2.34。这些仅是自动化、模拟界面与启动冒烟检查，不表示已验证真机发现、DHCP 分配或 SSH 登录。
 
@@ -12,6 +12,7 @@ RoboLink 是运行在 Linux 开发机上的桌面 GUI，用 SSH 管理 Linux 机
 
 | 策略 | GUI 中的选择与行为 |
 |---|---|
+| A0 · 主动 ARP 扫描（默认开） | 以 `0.0.0.0` 为源地址发送 RFC 5227 ARP 探测，Linux 开发板会为自己配置的 IP 应答。覆盖本机网段及约 30 个常见开发板 /24（192.168.1/0/127/137/55、10.42.0 等）；“深度扫描”另覆盖整个 `192.168.0.0/16` 与 `169.254/16`，约 5 秒发完。承载默认路由的接口（接了路由器/局域网）只扫描本机所在网段。 |
 | A · 被动发现 | ARP Request/Reply、Gratuitous ARP、ARP Probe；DHCP Discover/Request；IPv6 Neighbor Discovery；mDNS 报文源地址。分别选择，展示接口、IP、MAC 与证据。 |
 | B · 主动验证 | 对已知候选进行定向 ARP、可选 ICMP 和指定单个 TCP 端口验证，默认 SSH 端口 22，可自定义。不会遍历任意子网或端口范围；Ping 失败不等于设备离线。 |
 | C · DHCP 发现 | 默认不启动。用户选择物理有线接口并确认后，启动本应用专属、单接口 DHCP Server；仅供直连 SSH，不下发默认网关和 DNS、不共享 Internet。可查看状态、停止并清理自身配置；自身 DHCPACK 日志仅提供待复验的缓存候选。 |
@@ -34,7 +35,7 @@ ARP Probe、DHCP 请求地址、IPv6 DAD 和邻居缓存都是不同强度的候
 
 ## Ubuntu 22.04 安装与试用
 
-收到 `RoboLink_0.4.0_ubuntu22.04_amd64.deb` 后，在 Ubuntu 文件管理器里双击，用“应用中心/软件安装”打开并点击“安装”，然后从系统应用列表启动 **RoboLink**。无需在机器人端安装 RoboLink。详细图形界面操作见[第一次直连 Linux 机器人](docs/first-direct-connection.md)。
+收到 `RoboLink_0.4.2_ubuntu22.04_amd64.deb` 后，在 Ubuntu 文件管理器里双击，用“应用中心/软件安装”打开并点击“安装”，然后从系统应用列表启动 **RoboLink**。无需在机器人端安装 RoboLink。详细图形界面操作见[第一次直连 Linux 机器人](docs/first-direct-connection.md)。
 
 测试包以 Ubuntu 22.04 amd64 用户空间构建，最高要求 GLIBC 2.34。需要 WebKitGTK 4.1 至少 2.38、GTK、OpenSSH、iproute2、polkit、iputils-ping 和 dnsmasq-base；dnsmasq-base 提供受限 DHCP 使用的二进制，不代表 RoboLink 会默认启动 DHCP 服务。若桌面安装器提示依赖不足，请先使用 Ubuntu“软件更新器”，不要从不明网站单独下载系统库。其他发行版/CPU 架构需要单独构建与验证。
 
