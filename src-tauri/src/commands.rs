@@ -796,57 +796,116 @@ fn parse_pactl_devices(text: &str, default: &str) -> Vec<AudioDevice> {
         .collect()
 }
 
+fn parse_alsa_devices(text: &str, direction: &str) -> Vec<AudioDevice> {
+    let mut seen = HashSet::new();
+    text.lines()
+        .filter_map(|line| {
+            let (index, details) = line.split_once(": ")?;
+            let (card, device) = index.split_once('-')?;
+            let card = card.parse::<u32>().ok()?;
+            let device = device.parse::<u32>().ok()?;
+            let mut fields = details.split(" : ");
+            let description = fields.next()?.trim();
+            let has_direction = fields.any(|field| {
+                field
+                    .strip_prefix(direction)
+                    .and_then(|count| count.split_whitespace().next())
+                    .and_then(|count| count.parse::<u32>().ok())
+                    .is_some_and(|count| count > 0)
+            });
+            if description.is_empty() || !has_direction {
+                return None;
+            }
+            let name = format!("hw:{card},{device}");
+            if !seen.insert(name.clone()) {
+                return None;
+            }
+            Some(AudioDevice {
+                name,
+                description: description.to_string(),
+                is_default: false,
+            })
+        })
+        .collect()
+}
+
 #[tauri::command]
 pub fn get_audio_snapshot(
     state: State<'_, AppState>,
     target_id: String,
 ) -> Result<AudioSnapshot, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
-    let script = r#"command -v pactl >/dev/null 2>&1 || { echo 'UNSUPPORTED'; exit 0; }; printf 'SINK_DEFAULT='; pactl get-default-sink 2>/dev/null || true; printf '\nSOURCE_DEFAULT='; pactl get-default-source 2>/dev/null || true; printf '\nSINK_VOLUME='; pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null | grep -oE '[0-9]+%' | head -n 1 | tr -d '%' || true; printf '\nSOURCE_VOLUME='; pactl get-source-volume @DEFAULT_SOURCE@ 2>/dev/null | grep -oE '[0-9]+%' | head -n 1 | tr -d '%' || true; printf '\nSINKS\n'; pactl list short sinks 2>/dev/null || true; printf '\nSOURCES\n'; pactl list short sources 2>/dev/null || true"#;
+    let script = r#"
+if command -v pactl >/dev/null 2>&1; then
+  printf 'PULSE_AVAILABLE=1\n'
+  printf 'SINK_DEFAULT='; pactl get-default-sink 2>/dev/null || true
+  printf '\nSOURCE_DEFAULT='; pactl get-default-source 2>/dev/null || true
+  printf '\nSINK_VOLUME='; pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null | grep -oE '[0-9]+%' | head -n 1 | tr -d '%' || true
+  printf '\nSOURCE_VOLUME='; pactl get-source-volume @DEFAULT_SOURCE@ 2>/dev/null | grep -oE '[0-9]+%' | head -n 1 | tr -d '%' || true
+  printf '\nSINKS\n'; pactl list short sinks 2>/dev/null || true
+  printf '\nSOURCES\n'; pactl list short sources 2>/dev/null || true
+else
+  printf 'PULSE_AVAILABLE=0\n'
+fi
+printf '\nALSA_PCM\n'
+if [ -r /proc/asound/pcm ]; then cat /proc/asound/pcm; else printf 'UNAVAILABLE\n'; fi
+"#;
     let output = ssh::remote_command(&state, &target, script)?;
-    if output.contains("UNSUPPORTED") {
-        return Ok(AudioSnapshot {
-            available: false,
-            sinks: vec![],
-            sources: vec![],
-            default_sink_volume: None,
-            default_source_volume: None,
-            note: Some("未安装 pactl，或音频服务器未提供 PulseAudio 兼容接口。".into()),
-        });
-    }
-    let sink_default = output
+    let (pulse_output, alsa_output) = output
+        .split_once("\nALSA_PCM\n")
+        .unwrap_or((output.as_str(), ""));
+    let pulse_available = pulse_output
+        .lines()
+        .any(|line| line.trim() == "PULSE_AVAILABLE=1");
+    let alsa_playback = parse_alsa_devices(alsa_output, "playback");
+    let alsa_capture = parse_alsa_devices(alsa_output, "capture");
+    let sink_default = pulse_output
         .lines()
         .find_map(|l| l.strip_prefix("SINK_DEFAULT="))
         .unwrap_or("");
-    let source_default = output
+    let source_default = pulse_output
         .lines()
         .find_map(|l| l.strip_prefix("SOURCE_DEFAULT="))
         .unwrap_or("");
-    let sink_volume = output
+    let sink_volume = pulse_output
         .lines()
         .find_map(|l| l.strip_prefix("SINK_VOLUME="))
         .and_then(|v| v.parse::<u8>().ok())
         .map(|v| v.min(150));
-    let source_volume = output
+    let source_volume = pulse_output
         .lines()
         .find_map(|l| l.strip_prefix("SOURCE_VOLUME="))
         .and_then(|v| v.parse::<u8>().ok())
         .map(|v| v.min(150));
-    let sinks_part = output
+    let sinks_part = pulse_output
         .split_once("SINKS\n")
         .map(|(_, r)| r.split_once("\nSOURCES\n").map(|(a, _)| a).unwrap_or(r))
         .unwrap_or("");
-    let sources_part = output
+    let sources_part = pulse_output
         .split_once("\nSOURCES\n")
         .map(|(_, r)| r)
         .unwrap_or("");
     Ok(AudioSnapshot {
-        available: true,
-        sinks: parse_pactl_devices(sinks_part, sink_default),
-        sources: parse_pactl_devices(sources_part, source_default),
+        available: pulse_available,
+        sinks: if pulse_available {
+            parse_pactl_devices(sinks_part, sink_default)
+        } else {
+            vec![]
+        },
+        sources: if pulse_available {
+            parse_pactl_devices(sources_part, source_default)
+        } else {
+            vec![]
+        },
+        alsa_playback,
+        alsa_capture,
         default_sink_volume: sink_volume,
         default_source_volume: source_volume,
-        note: None,
+        note: if pulse_available {
+            None
+        } else {
+            Some("未发现可用的 PulseAudio/PipeWire pactl 接口；以下 ALSA 硬件仅供识别，不能通过此页切换默认设备或调节音量。".into())
+        },
     })
 }
 
@@ -1011,5 +1070,23 @@ mod tests {
         .unwrap();
         let found = link_local_neighbors(&rows, "enp3s0", Ipv4Addr::new(169, 254, 12, 1));
         assert_eq!(found, vec![Ipv4Addr::new(169, 254, 12, 2)]);
+    }
+
+    #[test]
+    fn alsa_pcm_listing_is_split_by_playback_and_capture_direction() {
+        let pcm = "00-00: HDMI Audio : playback 1 : capture 0\n\
+                   00-01: USB Audio : playback 0 : capture 1\n\
+                   01-00: Built-in Codec : playback 1 : capture 1\n\
+                   02-00: Disabled Device : playback 0 : capture 0\n\
+                   malformed pcm entry";
+        let playback = parse_alsa_devices(pcm, "playback");
+        let capture = parse_alsa_devices(pcm, "capture");
+        assert_eq!(playback.len(), 2);
+        assert_eq!(playback[0].name, "hw:0,0");
+        assert_eq!(playback[1].name, "hw:1,0");
+        assert!(playback.iter().all(|device| !device.is_default));
+        assert_eq!(capture.len(), 2);
+        assert_eq!(capture[0].name, "hw:0,1");
+        assert_eq!(capture[1].name, "hw:1,0");
     }
 }

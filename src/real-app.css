@@ -17,6 +17,7 @@
 .runtime-tag.live{border-color:#284c3d;background:#14261f;color:#99d8b6}
 .runtime-tag.live>span{background:var(--mint)}
 .page-stack{display:flex;flex-direction:column;gap:15px;min-width:0}
+.page-view[hidden]{display:none}
 .detail-panel{padding:19px 20px}
 .detail-panel>.panel-heading{margin-bottom:15px}
 .heading-icon{display:grid;place-items:center;width:34px;height:34px;border-radius:9px;flex:none}
@@ -105,6 +106,12 @@ html[data-theme="light"] .scan-port-field input{background:#fff;border-color:#d2
 .audio-card-bottom{display:flex;align-items:center;justify-content:space-between;gap:8px;padding-top:12px;border-top:1px solid #26333e;color:#718190;font-size:8px}
 .audio-footnote{grid-column:1/-1;display:flex;align-items:flex-start;gap:9px;padding:12px 14px;border:1px solid #2b3b42;border-radius:8px;background:#111c23;color:#8a9b9d;font-size:9px;line-height:1.6}
 .audio-footnote svg{flex:none;color:#6fc79a}
+.alsa-panel>.subtle-callout{margin-bottom:13px}
+.alsa-device-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:8px}
+.alsa-device-row{display:flex;align-items:center;gap:10px;min-width:0;padding:9px 10px;border:1px solid #263540;border-radius:8px;background:#111a23}
+.alsa-device-row>div{display:flex;flex:1;min-width:0;flex-direction:column;gap:4px}
+.alsa-device-row strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dce5ed;font:11px 'Ubuntu Mono','DejaVu Sans Mono',monospace}
+.alsa-device-row small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#81919e;font-size:9px}
 .logs-toolbar{margin-bottom:0}
 .logs-panel{padding:4px 15px}
 .log-row{display:grid;grid-template-columns:24px 100px minmax(0,1fr) 45px;align-items:center;gap:9px;min-height:47px;border-bottom:1px solid #202b37}
@@ -175,6 +182,9 @@ html[data-theme="light"] .audio-device-display small,html[data-theme="light"] .f
 html[data-theme="light"] .volume-label strong{color:#3b5360}
 html[data-theme="light"] .audio-card-bottom,html[data-theme="light"] .audio-footnote{border-color:#dfe7eb;color:#697e89}
 html[data-theme="light"] .audio-footnote{background:#f4f8f8}
+html[data-theme="light"] .alsa-device-row{background:#fff;border-color:#dce5ea}
+html[data-theme="light"] .alsa-device-row strong{color:#344d59}
+html[data-theme="light"] .alsa-device-row small{color:#71848f}
 html[data-theme="light"] .log-row{border-color:#e2e9ed}
 html[data-theme="light"] .log-message{color:#3b515d}
 html[data-theme="light"] .log-time{color:#748591}

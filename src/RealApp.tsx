@@ -27,7 +27,7 @@ type RemoteNetwork = { supported: boolean; wifiEnabled: boolean; devices: Networ
 type BluetoothDevice = { address: string; name: string; paired: boolean; connected: boolean; trusted: boolean }
 type BluetoothSnapshot = { available: boolean; powered: boolean; adapter: string; devices: BluetoothDevice[] }
 type AudioDevice = { name: string; description: string; isDefault: boolean }
-type AudioSnapshot = { available: boolean; sinks: AudioDevice[]; sources: AudioDevice[]; defaultSinkVolume?: number; defaultSourceVolume?: number; note?: string }
+type AudioSnapshot = { available: boolean; sinks: AudioDevice[]; sources: AudioDevice[]; alsaPlayback: AudioDevice[]; alsaCapture: AudioDevice[]; defaultSinkVolume?: number; defaultSourceVolume?: number; note?: string }
 type AppLog = { at: string; text: string; tone: 'ok' | 'warn' | 'info' }
 type Confirm = { title: string; description: string; danger?: boolean; run: () => Promise<void> }
 type TerminalEvent = { sessionId: string; data: string }
@@ -46,7 +46,7 @@ const pageInfo: Record<Page, { title: string; subtitle: string }> = {
   network: { title: '网络与 Wi-Fi', subtitle: '有线点对点连接属于开发机 ↔ 机器人；机器人 Wi-Fi 单独管理。' },
   services: { title: '系统服务', subtitle: '读取机器人 systemd 服务状态；启停操作会再次确认。' },
   bluetooth: { title: '蓝牙设备', subtitle: '查看机器人 BlueZ 适配器并扫描、配对和连接设备。' },
-  audio: { title: '音频设备', subtitle: '读取机器人 PipeWire/PulseAudio 输入和输出设备并切换默认项。' },
+  audio: { title: '音频设备', subtitle: '读取 PulseAudio/PipeWire 控件和 ALSA 硬件设备；ALSA 项仅用于识别。' },
   terminal: { title: '终端', subtitle: '交互式 SSH PTY；主机、用户和危险命令提示始终可见。' },
   logs: { title: '诊断记录', subtitle: '本地记录本次会话的应用操作；不会记录密码或终端输入。' },
 }
@@ -63,6 +63,7 @@ const terminalEventsReadyRef: { current: Promise<void> } = { current: Promise.re
 
 export default function RealApp() {
   const [page, setPage] = useState<Page>('overview')
+  const [visitedPages, setVisitedPages] = useState<Set<Page>>(() => new Set<Page>(['overview']))
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     const saved = localStorage.getItem('robolink-theme')
     const value = saved === 'light' ? 'light' : 'dark'
@@ -367,7 +368,7 @@ export default function RealApp() {
   }
   const visibleServices = services.filter(s => `${s.name} ${s.description}`.toLowerCase().includes(serviceQuery.toLowerCase()))
   const wiredInterfaces = hostInfo?.interfaces.filter(i => i.kind === '有线以太网') ?? []
-  const navPage = (id: Page) => { setPage(id); setMobileNav(false); setError('') }
+  const navPage = (id: Page) => { setVisitedPages(pages => pages.has(id) ? pages : new Set(pages).add(id)); setPage(id); setMobileNav(false); setError('') }
 
   return <div className="app-shell">
     <aside className={`sidebar ${mobileNav ? 'sidebar-open' : ''}`}>
@@ -390,14 +391,14 @@ export default function RealApp() {
       <div className="content-wrap">
         <div className="page-heading"><div><div className="eyebrow">LINUX HOST <span>·</span> DIRECT ETHERNET / SSH</div><h1>{pageInfo[page].title}</h1><p>{pageInfo[page].subtitle}</p></div><div className="heading-actions"><span className={`runtime-tag ${selected && keyStatus?.trusted ? 'live' : ''}`}><span/>{selected && keyStatus?.trusted ? '真实设备' : '尚未连接'}</span><button className="button button-subtle" onClick={refreshNow} disabled={busy}><RefreshCw size={15}/>刷新</button></div></div>
         {error && <div className="inline-error"><AlertTriangle size={16}/><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误"><X size={15}/></button></div>}
-    {page === 'overview' && <OverviewPage hostInfo={hostInfo} target={selected} trusted={!!keyStatus?.trusted} connected={sshReady && !terminalExited} remote={remoteOverview} services={services} onAdd={() => openNewTarget()} onConnect={connectTarget} onPage={navPage}/ >}
-        {page === 'network' && <NetworkPage hostInfo={hostInfo} interfaces={wiredInterfaces} selectedInterface={localInterface} setSelectedInterface={name => { setLocalInterface(name); setDiscovered([]) }} scanPort={scanPort} setScanPort={setScanPort} discovered={discovered} onScan={scanInterface} network={remoteNetwork} wifi={wifiNetworks} onScanWifi={scanWifi} onToggleWifi={toggleWifiRadio} onConnectWifi={connectWifi} onAddHost={openNewTarget} busy={busy}/ >}
-        {page === 'services' && <ServicesPage services={visibleServices} query={serviceQuery} setQuery={setServiceQuery} onAction={doServiceAction} busy={busy}/ >}
-        {page === 'bluetooth' && <BluetoothPage snapshot={bluetooth} onScan={scanBluetooth} onTogglePower={toggleBluetoothPower} onAction={bluetoothAction} busy={busy}/ >}
-        {page === 'audio' && <AudioPage snapshot={audio} sourceVolume={sourceVolume} sinkVolume={sinkVolume} setSourceVolume={setSourceVolume} setSinkVolume={setSinkVolume} onDefault={setDefaultAudio} onVolume={commitAudioVolume} onTest={playTestAudio} busy={busy}/ >}
-        {page === 'terminal' && <TerminalPage key={sessionId} sessionId={sessionId} exited={terminalExited} sshReady={sshReady} target={selected} theme={theme} onConnect={connectTarget} onDisconnect={disconnectTerminal} onRisk={setDangerLine} onPaste={setPastePreview} onError={setError}/ >}
-        {page === 'logs' && <LogsPage logs={logs} onClear={() => setConfirm({ title: '清空本地诊断记录？', description: '只删除 RoboLink 本机界面中的操作记录，不会影响机器人。', run: async () => { setLogs([]); setConfirm(null) } })}/ >}
-        <footer className="footer-note"><ShieldCheck size={14}/>默认只读本机网卡 · SSH 使用独立 known_hosts · RoboLink v0.2.1 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
+        <div className="page-view" hidden={page !== 'overview'}>{visitedPages.has('overview') && <OverviewPage hostInfo={hostInfo} target={selected} trusted={!!keyStatus?.trusted} connected={sshReady && !terminalExited} remote={remoteOverview} services={services} onAdd={() => openNewTarget()} onConnect={connectTarget} onPage={navPage}/>}</div>
+        <div className="page-view" hidden={page !== 'network'}>{visitedPages.has('network') && <NetworkPage hostInfo={hostInfo} interfaces={wiredInterfaces} selectedInterface={localInterface} setSelectedInterface={name => { setLocalInterface(name); setDiscovered([]) }} scanPort={scanPort} setScanPort={setScanPort} discovered={discovered} onScan={scanInterface} network={remoteNetwork} wifi={wifiNetworks} onScanWifi={scanWifi} onToggleWifi={toggleWifiRadio} onConnectWifi={connectWifi} onAddHost={openNewTarget} busy={busy}/>}</div>
+        <div className="page-view" hidden={page !== 'services'}>{visitedPages.has('services') && <ServicesPage services={visibleServices} query={serviceQuery} setQuery={setServiceQuery} onAction={doServiceAction} busy={busy}/>}</div>
+        <div className="page-view" hidden={page !== 'bluetooth'}>{visitedPages.has('bluetooth') && <BluetoothPage snapshot={bluetooth} onScan={scanBluetooth} onTogglePower={toggleBluetoothPower} onAction={bluetoothAction} busy={busy}/>}</div>
+        <div className="page-view" hidden={page !== 'audio'}>{visitedPages.has('audio') && <AudioPage snapshot={audio} sourceVolume={sourceVolume} sinkVolume={sinkVolume} setSourceVolume={setSourceVolume} setSinkVolume={setSinkVolume} onDefault={setDefaultAudio} onVolume={commitAudioVolume} onTest={playTestAudio} busy={busy}/>}</div>
+        <div className="page-view" hidden={page !== 'terminal'}>{visitedPages.has('terminal') && <TerminalPage key={sessionId} sessionId={sessionId} exited={terminalExited} sshReady={sshReady} target={selected} theme={theme} onConnect={connectTarget} onDisconnect={disconnectTerminal} onRisk={setDangerLine} onPaste={setPastePreview} onError={setError}/>}</div>
+        <div className="page-view" hidden={page !== 'logs'}>{visitedPages.has('logs') && <LogsPage logs={logs} onClear={() => setConfirm({ title: '清空本地诊断记录？', description: '只删除 RoboLink 本机界面中的操作记录，不会影响机器人。', run: async () => { setLogs([]); setConfirm(null) } })}/>}</div>
+        <footer className="footer-note"><ShieldCheck size={14}/>默认只读本机网卡 · SSH 使用独立 known_hosts · RoboLink v0.2.2 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
       </div>
     </main>
     {targetDialog && <TargetDialog value={targetDraft} setValue={setTargetDraft} onClose={() => setTargetDialog(false)} onSubmit={saveTarget} busy={busy}/>}
@@ -480,10 +481,10 @@ function BluetoothPage({ snapshot, onScan, onTogglePower, onAction, busy }: { sn
 
 function AudioPage({ snapshot, sourceVolume, sinkVolume, setSourceVolume, setSinkVolume, onDefault, onVolume, onTest, busy }: { snapshot: AudioSnapshot | null; sourceVolume: number; sinkVolume: number; setSourceVolume: (n: number) => void; setSinkVolume: (n: number) => void; onDefault: (kind: 'sink' | 'source', device: string) => void; onVolume: (kind: 'sink' | 'source', device: string, volume: number) => void; onTest: () => void; busy: boolean }) {
   if (!snapshot) return <div className="page-stack"><section className="panel detail-panel"><EmptyState text="连接机器人后读取音频服务器设备。"/></section></div>
-  if (!snapshot.available) return <div className="page-stack"><section className="panel detail-panel"><EmptyState text={snapshot.note ?? '机器人没有可用音频服务器。'}/></section></div>
   const currentSink = snapshot.sinks.find(d => d.isDefault)?.name ?? snapshot.sinks[0]?.name ?? ''
   const currentSource = snapshot.sources.find(d => d.isDefault)?.name ?? snapshot.sources[0]?.name ?? ''
-  return <div className="audio-grid">
+  return <div className="page-stack">
+    {snapshot.available ? <div className="audio-grid">
     <section className="panel audio-card">
       <div className="audio-title"><div className="heading-icon mic-bg"><Mic size={18}/></div><div><div className="section-kicker">INPUT · PULSEAUDIO / PIPEWIRE</div><h2>麦克风</h2></div></div>
       <div className="audio-device-display"><div className="audio-device-icon"><Mic size={23}/></div><div><strong>{currentSource || '无默认输入'}</strong><small>机器人默认输入设备</small></div></div>
@@ -502,7 +503,17 @@ function AudioPage({ snapshot, sourceVolume, sinkVolume, setSourceVolume, setSin
       <input className="volume-slider" type="range" min="0" max="150" value={sinkVolume} onChange={e => setSinkVolume(Number(e.target.value))} onPointerUp={() => currentSink && onVolume('sink', currentSink, sinkVolume)} onKeyUp={() => currentSink && onVolume('sink', currentSink, sinkVolume)} disabled={busy || !currentSink} aria-label="扬声器音量"/>
       <div className="audio-card-bottom"><span>测试音会在机器人扬声器播放</span><button className="button button-primary" onClick={onTest} disabled={busy || !currentSink}><Play size={14}/>播放测试音</button></div>
     </section>
-    <div className="audio-footnote"><ShieldCheck size={15}/>当前仅列出/切换默认设备与音量，不录音；音频服务器需在 SSH 用户可访问的会话中运行。滑块松开或键盘调整后应用设置。</div>
+    <div className="audio-footnote"><ShieldCheck size={15}/>PulseAudio/PipeWire 控件只负责切换默认设备与音量，不录音；音频服务器需在 SSH 用户可访问的会话中运行。</div>
+    </div> : <section className="panel detail-panel"><EmptyState text={snapshot.note ?? '机器人没有可用的 PulseAudio/PipeWire 控制接口。'}/></section>}
+    <section className="panel detail-panel alsa-panel">
+      <div className="panel-heading"><div className="heading-icon speaker-bg"><AudioLines size={18}/></div><div><div className="section-kicker">ROBOT HARDWARE · ALSA</div><h2>ALSA 识别到的设备</h2></div><span className="count-pill">{snapshot.alsaPlayback.length + snapshot.alsaCapture.length}</span></div>
+      <div className="subtle-callout"><Activity size={15}/><span>直接读取机器人内核提供的 /proc/asound/pcm，不依赖 PipeWire、PulseAudio 或本机音频服务。此处只枚举硬件端点；ALSA 项不能通过上方 pactl 控件切换或调节音量。</span></div>
+      <div className="alsa-device-list">
+        {snapshot.alsaPlayback.map(device => <div className="alsa-device-row" key={`playback-${device.name}`}><span className="audio-device-icon speaker-icon"><AudioLines size={17}/></span><div><strong>{device.name}</strong><small>{device.description}</small></div><span className="state-label">播放</span></div>)}
+        {snapshot.alsaCapture.map(device => <div className="alsa-device-row" key={`capture-${device.name}`}><span className="audio-device-icon"><Mic size={17}/></span><div><strong>{device.name}</strong><small>{device.description}</small></div><span className="state-label">采集</span></div>)}
+        {!snapshot.alsaPlayback.length && !snapshot.alsaCapture.length && <EmptyState text="未从 /proc/asound/pcm 识别到 ALSA 硬件端点；精简内核或未启用 ALSA 的机器人可能没有此文件。"/>}
+      </div>
+    </section>
   </div>
 }
 function notifyAudioNote() { window.alert('RoboLink 不读取或录制麦克风内容。输入设备切换通过机器人上的 pactl 完成；若服务不可访问，请检查机器人 PipeWire/PulseAudio 用户会话。') }
@@ -527,7 +538,7 @@ function TerminalPage({ sessionId, exited, sshReady, target, theme, onConnect, o
       const [{Terminal:TerminalClass},{FitAddon:FitAddonClass}]=await Promise.all([import('@xterm/xterm'),import('@xterm/addon-fit')])
       if(cancelled || !container.current) return
       const currentTheme=themeRef.current==='dark'?{background:'#080d13',foreground:'#d2dce6',cursor:'#69d7a2',selectionBackground:'#3f6454'}:{background:'#111923',foreground:'#e2e8ef',cursor:'#75d6a8',selectionBackground:'#456454'}
-      const x=new TerminalClass({cursorBlink:true,convertEol:true,scrollback:4000,fontSize:12,fontFamily:'DM Mono, ui-monospace, monospace',allowProposedApi:false,theme:currentTheme})
+      const x=new TerminalClass({cursorBlink:true,convertEol:true,scrollback:4000,fontSize:13,fontFamily:'"Ubuntu Mono", "Liberation Mono", "DejaVu Sans Mono", monospace',letterSpacing:-0.15,lineHeight:1.05,allowProposedApi:false,theme:currentTheme})
       const fit=new FitAddonClass(); x.loadAddon(fit); x.open(container.current); fit.fit(); term.current=x; fitAddon.current=fit
       void invoke('resize_terminal',{sessionId,cols:x.cols,rows:x.rows}).catch(()=>{})
       const send=async(data:string):Promise<void>=>{try{await invoke('send_terminal_input',{sessionId,data})}catch(e){onError(displayError(e))}}
@@ -547,11 +558,26 @@ function TerminalPage({ sessionId, exited, sshReady, target, theme, onConnect, o
         else bufferRef.current+=data
         void send(data)
       })
-      const resize=()=>{try{fit.fit();void invoke('resize_terminal',{sessionId,cols:x.cols,rows:x.rows}).catch(()=>{})}catch{}}
+      let resizeFrame=0
+      let lastCols=x.cols
+      let lastRows=x.rows
+      const resize=()=>{
+        if(resizeFrame) cancelAnimationFrame(resizeFrame)
+        resizeFrame=requestAnimationFrame(()=>{
+          resizeFrame=0
+          if(!container.current || !container.current.clientWidth || !container.current.clientHeight) return
+          try {
+            fit.fit()
+            if(x.cols===lastCols && x.rows===lastRows) return
+            lastCols=x.cols; lastRows=x.rows
+            void invoke('resize_terminal',{sessionId,cols:x.cols,rows:x.rows}).catch(()=>{})
+          } catch {}
+        })
+      }
       const observer=new ResizeObserver(resize); observer.observe(container.current)
       terminalWriterRef.current={sessionId,write:(data:string)=>x.write(data),confirmDangerous:async()=>{await pendingDanger.current?.();pendingDanger.current=null},cancelDangerous:async()=>{await send('\x15');x.write('\r\n[已取消高风险命令]\r\n');pendingDanger.current=null},confirmPaste:async()=>{await pendingPaste.current?.();pendingPaste.current=null},cancelPaste:async()=>{x.write('\r\n[已取消多行粘贴]\r\n');pendingPaste.current=null}}
       const queued=terminalOutputQueue.get(sessionId)??[]; queued.forEach(data=>x.write(data)); terminalOutputQueue.delete(sessionId)
-      cleanup=()=>{observer.disconnect();disposable.dispose();x.dispose();term.current=null;fitAddon.current=null;if(terminalWriterRef.current?.sessionId===sessionId)terminalWriterRef.current=null}
+      cleanup=()=>{observer.disconnect();if(resizeFrame) cancelAnimationFrame(resizeFrame);disposable.dispose();x.dispose();term.current=null;fitAddon.current=null;if(terminalWriterRef.current?.sessionId===sessionId)terminalWriterRef.current=null}
     }
     void initialize().catch(e=>{cleanup();if(!cancelled)onError(`加载 SSH 终端失败：${displayError(e)}`)})
     return ()=>{cancelled=true;cleanup()}

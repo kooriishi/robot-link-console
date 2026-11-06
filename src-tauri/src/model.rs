@@ -142,6 +142,8 @@ pub struct AudioSnapshot {
     pub available: bool,
     pub sinks: Vec<AudioDevice>,
     pub sources: Vec<AudioDevice>,
+    pub alsa_playback: Vec<AudioDevice>,
+    pub alsa_capture: Vec<AudioDevice>,
     pub default_sink_volume: Option<u8>,
     pub default_source_volume: Option<u8>,
     pub note: Option<String>,
