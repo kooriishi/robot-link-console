@@ -162,6 +162,8 @@ pub struct ServiceInfo {
     pub active: String,
     pub sub_state: String,
     pub enabled: String,
+    /// "system" or "user" (`systemctl --user`).
+    pub scope: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,6 +213,8 @@ pub struct BluetoothSnapshot {
     pub devices: Vec<BluetoothDevice>,
     /// Why the adapter could not be read or the scan failed, shown instead of silently empty data.
     pub note: Option<String>,
+    /// The problem looks like missing permissions; retrying with sudo may help.
+    pub needs_sudo: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -218,6 +222,7 @@ pub struct BluetoothSnapshot {
 pub struct WifiScanResult {
     pub networks: Vec<WifiNetwork>,
     pub warning: Option<String>,
+    pub needs_sudo: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

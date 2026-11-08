@@ -146,14 +146,15 @@ html[data-theme="light"] .scan-port-field input{background:#fff;border-color:#d2
 .preserve-lines{white-space:pre-wrap}
 .toast{position:fixed;z-index:70;right:22px;bottom:22px;display:flex;align-items:center;gap:8px;padding:12px 15px;border:1px solid #315441;border-radius:9px;background:#13241d;color:#b0e3c7;font-size:10px;box-shadow:0 9px 30px #0005}
 .spin-icon{animation:real-spin 1s linear infinite}@keyframes real-spin{to{transform:rotate(360deg)}}
-.real-terminal{display:flex;flex-direction:column;min-height:560px;overflow:hidden}
+/* Fixed height: a growing container made fit() add rows forever, so the page kept stretching. */
+.real-terminal{display:flex;flex-direction:column;height:calc(100vh - 200px);min-height:420px;overflow:hidden}
 .real-terminal .terminal-toolbar{min-height:56px;padding:0 15px}
 .terminal-tools{display:flex;align-items:center;gap:9px}
 .terminal-mode{display:inline-flex;align-items:center;gap:5px;color:#8ea0ad;font-size:9px}
 .terminal-safety{display:flex;align-items:center;gap:9px;padding:10px 14px;border-bottom:1px solid #29333d;background:#211d17;color:#d3b880;font-size:9px;line-height:1.55}
 .terminal-safety svg{flex:none;color:#e2b45e}
 .terminal-safety strong{color:#f0d292}
-.xterm-shell{flex:1;min-height:390px;padding:8px 10px;background:#080d13}
+.xterm-shell{flex:1;min-height:0;overflow:hidden;padding:8px 10px;background:#080d13}
 .terminal-disconnected{flex:1;min-height:360px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:25px;text-align:center;color:#9aa9b5}
 .terminal-disconnected>svg{color:#74c99d}.terminal-disconnected strong{color:#d8e3e9;font-size:14px}.terminal-disconnected p{max-width:440px;color:#81919d;font-size:10px;line-height:1.7}
 .terminal-bottom{display:flex;justify-content:space-between;gap:12px;padding:11px 15px;border-top:1px solid #24303a;color:#778794;font-size:8px}
@@ -209,7 +210,7 @@ html[data-theme="light"] .terminal-disconnected p{color:#71828f}
 html[data-theme="light"] .count-pill{background:#edf2f5;border-color:#dbe4e8;color:#677a87}
 
 @media(max-width:900px){.service-detail-row{grid-template-columns:29px minmax(145px,1fr) auto auto}.service-detail-row>.autostart{display:none}.audio-grid{grid-template-columns:1fr}}
-@media(max-width:680px){.target-summary{margin-bottom:18px}.detail-panel,.service-list-panel,.audio-card{padding:14px}.service-detail-row{grid-template-columns:28px minmax(120px,1fr) auto;gap:8px}.service-detail-row .state-label{grid-column:2}.service-action-set{grid-column:2/-1;margin-left:auto}.bluetooth-row{grid-template-columns:32px minmax(100px,1fr) auto;gap:8px}.bluetooth-row>.state-label{grid-column:2}.bluetooth-row>.button,.bluetooth-row>.icon-button{grid-column:3}.wifi-row.real-wifi-row{gap:7px}.wifi-row.real-wifi-row>.button{font-size:8px;padding:7px}.summary-note{display:none}.search-input{min-width:0;flex:1}.log-row{grid-template-columns:22px 78px minmax(0,1fr)}.log-category{display:none}.form-split{grid-template-columns:1fr 100px}.modal-card{padding:17px}.real-terminal{min-height:490px}.xterm-shell{min-height:310px}.terminal-safety{align-items:flex-start}.terminal-tools{gap:5px}.terminal-mode{font-size:8px}.terminal-status-note{white-space:normal;text-align:right}.audio-footnote{grid-column:auto}}
+@media(max-width:680px){.target-summary{margin-bottom:18px}.detail-panel,.service-list-panel,.audio-card{padding:14px}.service-detail-row{grid-template-columns:28px minmax(120px,1fr) auto;gap:8px}.service-detail-row .state-label{grid-column:2}.service-action-set{grid-column:2/-1;margin-left:auto}.bluetooth-row{grid-template-columns:32px minmax(100px,1fr) auto;gap:8px}.bluetooth-row>.state-label{grid-column:2}.bluetooth-row>.button,.bluetooth-row>.icon-button{grid-column:3}.wifi-row.real-wifi-row{gap:7px}.wifi-row.real-wifi-row>.button{font-size:8px;padding:7px}.summary-note{display:none}.search-input{min-width:0;flex:1}.log-row{grid-template-columns:22px 78px minmax(0,1fr)}.log-category{display:none}.form-split{grid-template-columns:1fr 100px}.modal-card{padding:17px}.real-terminal{min-height:380px}.terminal-safety{align-items:flex-start}.terminal-tools{gap:5px}.terminal-mode{font-size:8px}.terminal-status-note{white-space:normal;text-align:right}.audio-footnote{grid-column:auto}}
 @media(max-width:420px){.runtime-tag{font-size:8px;padding:5px 7px}.heading-actions{gap:6px}.heading-actions>.button{padding:7px}.target-summary small{font-size:7px}.bluetooth-row{grid-template-columns:30px minmax(78px,1fr) auto}.bluetooth-row .button{font-size:8px;padding:7px}.real-terminal .terminal-toolbar{padding:0 8px}.terminal-target strong{font-size:9px}.terminal-target small{font-size:8px}.terminal-tools .button{font-size:8px;padding:7px}}
 
 .direct-link-state{display:flex;align-items:flex-start;gap:10px;margin:13px 0;padding:12px;border:1px solid #5a4630;border-radius:8px;background:#211d16;color:#dbbd82;font-size:9px;line-height:1.6}
@@ -316,3 +317,11 @@ html[data-theme="light"] .dhcp-status-row small{color:#647d89}
 html[data-theme="light"] .interface-card{background:#f8fafb;border-color:#d5e1e7;color:#5c7481}html[data-theme="light"] .interface-card:hover{background:#eef5f7;border-color:#9ab5c1}html[data-theme="light"] .interface-card.selected{background:#eef8f2;border-color:#75ac8c;color:#427354}html[data-theme="light"] .interface-card-top{color:#344e5c}html[data-theme="light"] .interface-card>small{color:#6c828d}
 
 html[data-theme="light"] .discovered-row{border-bottom-color:#dce5e9}
+
+/* Long lists scroll inside their panel instead of stretching the whole page. */
+.service-list-panel{max-height:calc(100vh - 260px);overflow:auto}
+.logs-panel{max-height:calc(100vh - 260px);overflow:auto}
+.service-scope{display:inline-flex;gap:4px}
+.service-scope .button.active{border-color:var(--mint);color:var(--mint)}
+.form-field{display:block;margin:12px 0;color:#8697a5;font-size:9px}
+.sudo-backdrop{z-index:60}

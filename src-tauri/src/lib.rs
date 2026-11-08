@@ -41,6 +41,7 @@ pub fn run() {
             commands::scan_remote_wifi,
             commands::set_remote_wifi_radio,
             commands::start_wifi_connect,
+            commands::connect_remote_wifi,
             commands::get_bluetooth_snapshot,
             commands::scan_bluetooth,
             commands::set_bluetooth_power,
@@ -54,18 +55,6 @@ pub fn run() {
             commands::resize_terminal,
             commands::close_ssh_terminal
         ])
-        .build(tauri::generate_context!())
-        .expect("启动 RoboLink 桌面程序失败")
-        .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
-                let state = app.state::<AppState>();
-                let pending = state
-                    .load_network_addresses()
-                    .map(|items| items.iter().any(|item| !item.persistent))
-                    .unwrap_or(false);
-                if pending {
-                    let _ = commands::cleanup_temporary_addresses(&state);
-                }
-            }
-        });
+        .run(tauri::generate_context!())
+        .expect("启动 RoboLink 桌面程序失败");
 }

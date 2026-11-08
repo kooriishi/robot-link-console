@@ -1253,10 +1253,28 @@ pub fn get_remote_overview(
 pub fn list_services(
     state: State<'_, AppState>,
     target_id: String,
+    scope: Option<String>,
 ) -> Result<Vec<ServiceInfo>, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
-    let script = "systemctl list-units --type=service --all --no-legend --no-pager --plain --no-ask-password; printf '\\0'; systemctl list-unit-files --type=service --no-legend --no-pager --no-ask-password";
-    let output = ssh::remote_command(&state, &target, script)?;
+    let user = scope.as_deref() == Some("user");
+    let script = if user {
+        // An SSH login normally has the user's systemd manager; set the runtime dir explicitly for
+        // boards whose sshd does not export XDG_RUNTIME_DIR.
+        "export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}; systemctl --user list-units --type=service --all --no-legend --no-pager --plain; printf '\\0'; systemctl --user list-unit-files --type=service --no-legend --no-pager"
+    } else {
+        "systemctl list-units --type=service --all --no-legend --no-pager --plain --no-ask-password; printf '\\0'; systemctl list-unit-files --type=service --no-legend --no-pager --no-ask-password"
+    };
+    let output = ssh::remote_command(&state, &target, script).map_err(|e| {
+        if user {
+            format!(
+                "读取用户服务失败（systemctl --user 需要该用户的 systemd 会话）：{}",
+                e.trim_start_matches(ssh::SUDO_MARK)
+            )
+        } else {
+            e
+        }
+    })?;
+    let scope_name = if user { "user" } else { "system" };
     let (units, files) = output.split_once('\0').unwrap_or((&output, ""));
     let mut enabled = HashMap::new();
     for line in files.lines() {
@@ -1285,6 +1303,7 @@ pub fn list_services(
             active: fields[2].into(),
             sub_state: fields[3].into(),
             enabled: enabled.get(name).cloned().unwrap_or_else(|| "未知".into()),
+            scope: scope_name.into(),
         });
     }
     services.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1297,15 +1316,31 @@ pub fn service_action(
     target_id: String,
     service: String,
     action: String,
+    scope: Option<String>,
+    sudo_password: Option<String>,
 ) -> Result<String, String> {
     validate_service_name(&service)?;
     if !["start", "stop", "restart"].contains(&action.as_str()) {
         return Err("不支持的服务操作".into());
     }
     let target = ssh::lookup_target(&state, &target_id)?;
-    let script = format!("systemctl --no-ask-password {} {}", action, service);
-    ssh::remote_command(&state, &target, &script)?;
+    if scope.as_deref() == Some("user") {
+        let script = format!(
+            "export XDG_RUNTIME_DIR=${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}; systemctl --user {action} {service}"
+        );
+        ssh::remote_command(&state, &target, &script)?;
+    } else {
+        let script = format!("systemctl --no-ask-password {} {}", action, service);
+        ssh::remote_command_with(&state, &target, &script, sudo_options(&sudo_password))?;
+    }
     Ok(format!("{service} 已执行 {action}；请刷新状态确认结果"))
+}
+
+fn sudo_options(sudo_password: &Option<String>) -> ssh::RemoteOptions<'_> {
+    ssh::RemoteOptions {
+        sudo_password: sudo_password.as_deref().filter(|p| !p.is_empty()),
+        ..Default::default()
+    }
 }
 
 fn parse_nmcli(line: &str) -> Vec<String> {
@@ -1399,12 +1434,13 @@ pub fn get_remote_network(
 pub fn scan_remote_wifi(
     state: State<'_, AppState>,
     target_id: String,
+    sudo_password: Option<String>,
 ) -> Result<WifiScanResult, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
     // `list --rescan yes` fails as a whole when polkit refuses the scan (common for a non-root SSH
     // user), so request the rescan separately and still return NetworkManager's cached list.
     let script = "command -v nmcli >/dev/null 2>&1 || { echo '缺少 nmcli'; exit 127; }; R=$(LC_ALL=C nmcli device wifi rescan 2>&1); if [ $? -ne 0 ]; then printf 'RESCAN_ERR %s\n' \"$(printf '%s' \"$R\" | tr '\\n' ' ' | cut -c1-300)\"; else sleep 4; fi; printf 'APS\n'; nmcli --terse --escape yes --fields IN-USE,SSID,SIGNAL,SECURITY device wifi list --rescan no";
-    let output = ssh::remote_command(&state, &target, script)?;
+    let output = ssh::remote_command_with(&state, &target, script, sudo_options(&sudo_password))?;
     Ok(parse_wifi_scan(&output))
 }
 
@@ -1415,10 +1451,11 @@ fn parse_wifi_scan(output: &str) -> WifiScanResult {
         .find_map(|line| line.strip_prefix("RESCAN_ERR "))
         .map(str::trim)
         .filter(|e| !e.is_empty());
+    let needs_sudo = error.is_some_and(ssh::looks_like_permission_error);
     let warning = error.map(|e| {
         let lower = e.to_ascii_lowercase();
-        let hint = if lower.contains("not authorized") || lower.contains("permission") || lower.contains("insufficient") {
-            "机器人上的 SSH 用户没有让 NetworkManager 主动扫描的权限，可在终端执行 sudo nmcli device wifi rescan 后再刷新。"
+        let hint = if needs_sudo {
+            "机器人上的 SSH 用户没有让 NetworkManager 主动扫描的权限，输入 sudo 密码即可重新扫描。"
         } else if lower.contains("immediately") || lower.contains("not allowed") {
             "NetworkManager 刚扫描过或 Wi‑Fi 不可用，稍等几秒再试。"
         } else {
@@ -1429,6 +1466,7 @@ fn parse_wifi_scan(output: &str) -> WifiScanResult {
     WifiScanResult {
         networks: wifi_rows(aps),
         warning,
+        needs_sudo,
     }
 }
 
@@ -1437,11 +1475,40 @@ pub fn set_remote_wifi_radio(
     state: State<'_, AppState>,
     target_id: String,
     enabled: bool,
+    sudo_password: Option<String>,
 ) -> Result<(), String> {
     let target = ssh::lookup_target(&state, &target_id)?;
     let on_off = if enabled { "on" } else { "off" };
-    ssh::remote_command(&state, &target, &format!("nmcli radio wifi {on_off}"))?;
+    ssh::remote_command_with(
+        &state,
+        &target,
+        &format!("nmcli radio wifi {on_off}"),
+        sudo_options(&sudo_password),
+    )?;
     Ok(())
+}
+
+/// Connects the robot to Wi-Fi without a terminal: the Wi-Fi password goes over ssh's stdin (read by
+/// the remote shell), never into the local ssh argv or RoboLink's storage.
+#[tauri::command(async)]
+pub fn connect_remote_wifi(
+    state: State<'_, AppState>,
+    target_id: String,
+    ssid: String,
+    password: Option<String>,
+    sudo_password: Option<String>,
+) -> Result<String, String> {
+    validate_wifi_ssid(&ssid)?;
+    let target = ssh::lookup_target(&state, &target_id)?;
+    let script = format!(
+        "WP=''; while IFS= read -r L; do case \"$L\" in SECRET:*) WP=${{L#SECRET:}}; break;; esac; done; if [ -n \"$WP\" ]; then nmcli --wait 40 device wifi connect {ssid} password \"$WP\"; else nmcli --wait 40 device wifi connect {ssid}; fi",
+        ssid = ssh::shell_quote(&ssid)
+    );
+    let mut options = sudo_options(&sudo_password);
+    options.stdin_line = Some(password.as_deref().unwrap_or(""));
+    options.timeout_secs = Some(50);
+    let output = ssh::remote_command_with(&state, &target, &script, options)?;
+    Ok(output.trim().to_string())
 }
 
 #[tauri::command(async)]
@@ -1524,10 +1591,29 @@ fn parse_bt_info(info: &str) -> Vec<BluetoothDevice> {
     devices
 }
 
+/// bluetoothctl often exits 0 even when the D-Bus call failed; look at what it printed.
+fn bluetoothctl_result(output: &str) -> Result<(), String> {
+    let failure = output.lines().map(str::trim).find(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("failed")
+            || lower.contains("org.bluez.error")
+            || lower.contains("access denied")
+            || lower.contains("no default controller")
+            || lower.contains("not available")
+    });
+    match failure {
+        None => Ok(()),
+        Some(line) if ssh::looks_like_permission_error(line) => {
+            Err(format!("{}{line}", ssh::SUDO_MARK))
+        }
+        Some(line) => Err(format!("蓝牙操作失败：{line}。{}", bt_problem_hint(line))),
+    }
+}
+
 fn bt_problem_hint(text: &str) -> String {
     let lower = text.to_ascii_lowercase();
     if lower.contains("denied") || lower.contains("not authorized") {
-        "机器人上的 SSH 用户没有访问 BlueZ 的权限：把该用户加入 bluetooth 组（sudo usermod -aG bluetooth $USER 后重新登录），或在终端用 sudo bluetoothctl 操作。".into()
+        "机器人上的 SSH 用户没有访问 BlueZ 的权限：可输入 sudo 密码执行，或把该用户加入 bluetooth 组（sudo usermod -aG bluetooth $USER 后重新登录）。".into()
     } else if lower.contains("no default controller") {
         "机器人没有可用的蓝牙适配器：确认板子有蓝牙模块，并执行 sudo systemctl start bluetooth、rfkill unblock bluetooth。".into()
     } else if lower.contains("waiting to connect to bluetoothd") || lower.contains("not available")
@@ -1546,6 +1632,7 @@ fn parse_bluetooth_output(output: &str) -> BluetoothSnapshot {
             adapter: String::new(),
             devices: vec![],
             note: Some("机器人未安装 bluetoothctl（BlueZ）。".into()),
+            needs_sudo: false,
         };
     }
     let scan_errors = output
@@ -1566,6 +1653,8 @@ fn parse_bluetooth_output(output: &str) -> BluetoothSnapshot {
         .unwrap_or("")
         .to_string();
     let powered = show.lines().any(|l| l.trim() == "Powered: yes");
+    let needs_sudo =
+        ssh::looks_like_permission_error(show) || ssh::looks_like_permission_error(&scan_errors);
     let note = if adapter.is_empty() {
         let detail = show
             .lines()
@@ -1598,6 +1687,7 @@ fn parse_bluetooth_output(output: &str) -> BluetoothSnapshot {
         adapter,
         devices: parse_bt_info(info),
         note,
+        needs_sudo,
     }
 }
 
@@ -1605,12 +1695,15 @@ fn bluetooth_parts(
     state: &AppState,
     target: &Target,
     scan: bool,
+    sudo_password: &Option<String>,
 ) -> Result<BluetoothSnapshot, String> {
     let script = format!(
         "{BT_SCRIPT_HEAD}{}{BT_SCRIPT_TAIL}",
         if scan { BT_SCAN } else { "" }
     );
-    let output = ssh::remote_command(state, target, &script)?;
+    let mut options = sudo_options(sudo_password);
+    options.timeout_secs = Some(25);
+    let output = ssh::remote_command_with(state, target, &script, options)?;
     Ok(parse_bluetooth_output(&output))
 }
 
@@ -1620,16 +1713,17 @@ pub fn get_bluetooth_snapshot(
     target_id: String,
 ) -> Result<BluetoothSnapshot, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
-    bluetooth_parts(&state, &target, false)
+    bluetooth_parts(&state, &target, false, &None)
 }
 
 #[tauri::command(async)]
 pub fn scan_bluetooth(
     state: State<'_, AppState>,
     target_id: String,
+    sudo_password: Option<String>,
 ) -> Result<BluetoothSnapshot, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
-    bluetooth_parts(&state, &target, true)
+    bluetooth_parts(&state, &target, true, &sudo_password)
 }
 
 #[tauri::command(async)]
@@ -1637,10 +1731,17 @@ pub fn set_bluetooth_power(
     state: State<'_, AppState>,
     target_id: String,
     enabled: bool,
+    sudo_password: Option<String>,
 ) -> Result<(), String> {
     let target = ssh::lookup_target(&state, &target_id)?;
     let power = if enabled { "on" } else { "off" };
-    ssh::remote_command(&state, &target, &format!("bluetoothctl power {power}"))?;
+    let output = ssh::remote_command_with(
+        &state,
+        &target,
+        &format!("bluetoothctl power {power} 2>&1"),
+        sudo_options(&sudo_password),
+    )?;
+    bluetoothctl_result(&output)?;
     Ok(())
 }
 
@@ -1651,6 +1752,7 @@ pub fn bluetooth_action(
     target_id: String,
     address: String,
     action: String,
+    sudo_password: Option<String>,
 ) -> Result<Option<String>, String> {
     validate_mac(&address)?;
     let target = ssh::lookup_target(&state, &target_id)?;
@@ -1666,11 +1768,13 @@ pub fn bluetooth_action(
             ))),
         )?)),
         "connect" | "disconnect" | "remove" | "trust" => {
-            ssh::remote_command(
+            let output = ssh::remote_command_with(
                 &state,
                 &target,
-                &format!("bluetoothctl {} {}", action, ssh::shell_quote(&mac)),
+                &format!("bluetoothctl {} {} 2>&1", action, ssh::shell_quote(&mac)),
+                sudo_options(&sudo_password),
             )?;
+            bluetoothctl_result(&output)?;
             Ok(None)
         }
         _ => Err("不支持的蓝牙操作".into()),
@@ -1935,8 +2039,10 @@ mod tests {
             "RESCAN_ERR Error: Scanning not allowed: Not authorized to request a Wi-Fi scan.\nAPS\n:Guest:40:\n",
         );
         assert_eq!(denied.networks.len(), 1);
+        assert!(denied.needs_sudo);
         let w = denied.warning.unwrap();
-        assert!(w.contains("缓存") && w.contains("sudo nmcli device wifi rescan"));
+        assert!(w.contains("缓存") && w.contains("sudo 密码"));
+        assert!(!parse_wifi_scan("RESCAN_ERR Error: Scanning not allowed immediately following previous scan.\nAPS\n").needs_sudo);
     }
 
     #[test]
@@ -1961,6 +2067,28 @@ mod tests {
             "SCAN\nFailed to start discovery: org.bluez.Error.NotReady\nSHOW\nController AA:BB:CC:DD:EE:FF (public)\n\tPowered: yes\n\nINFO\n",
         );
         assert!(scan_failed.note.unwrap().contains("扫描未完成"));
+    }
+
+    #[test]
+    fn wifi_password_is_only_taken_from_the_marked_line() {
+        // Simulate the stdin RoboLink sends when sudo does not read its password line (NOPASSWD).
+        let script = "WP=''; while IFS= read -r L; do case \"$L\" in SECRET:*) WP=${L#SECRET:}; break;; esac; done; printf '%s' \"$WP\"";
+        let out = std::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(b"sudo-pass\nSECRET:wifi pass\n")?;
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "wifi pass");
     }
 
     #[test]

@@ -310,16 +310,91 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Prefix on errors that look like a permission problem the user can solve by entering the robot's
+/// sudo password; the UI strips it and opens the sudo dialog.
+pub const SUDO_MARK: &str = "[需要sudo] ";
+
+#[derive(Default)]
+pub struct RemoteOptions<'a> {
+    /// Run the script with `sudo -S`; the password is written to ssh's stdin, never to argv or disk.
+    pub sudo_password: Option<&'a str>,
+    /// One more line for the script's own stdin, sent as `SECRET:<value>`. Scripts must look for
+    /// that prefix: with a NOPASSWD sudo rule the sudo password line is not consumed by sudo.
+    pub stdin_line: Option<&'a str>,
+    /// Remote time limit in seconds (default 18).
+    pub timeout_secs: Option<u64>,
+}
+
+pub fn looks_like_permission_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "not authorized",
+        "notauthorized",
+        "access denied",
+        "accessdenied",
+        "interactive authentication required",
+        "insufficient privileges",
+        "permission denied",
+        "operation not permitted",
+        "must be root",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 pub fn remote_command(state: &AppState, target: &Target, script: &str) -> Result<String, String> {
+    remote_command_with(state, target, script, RemoteOptions::default())
+}
+
+pub fn remote_command_with(
+    state: &AppState,
+    target: &Target,
+    script: &str,
+    options: RemoteOptions,
+) -> Result<String, String> {
     ensure_pinned(state, target)?;
     if script.len() > 24_000 || script.contains('\0') {
         return Err("远端命令长度无效".into());
     }
+    let secrets_ok =
+        |v: Option<&str>| v.is_none_or(|v| v.len() <= 512 && !v.contains(['\n', '\r', '\0']));
+    if !secrets_ok(options.sudo_password) || !secrets_ok(options.stdin_line) {
+        return Err("密码不能包含换行，且长度不超过 512".into());
+    }
+    let seconds = options.timeout_secs.unwrap_or(18).clamp(5, 120);
     let mut cmd = Command::new("ssh");
     cmd.args(ssh_args(state, target, false, true));
     cmd.arg(ssh_destination(target));
-    cmd.arg(format!("timeout 18s sh -lc {}", shell_quote(script)));
-    let output = output_with_timeout(cmd, REMOTE_COMMAND_DEADLINE)?;
+    let mut input = String::new();
+    if let Some(password) = options.sudo_password {
+        cmd.arg(format!(
+            "timeout {seconds}s sudo -S -k -p '' sh -c {}",
+            shell_quote(script)
+        ));
+        input.push_str(password);
+        input.push('\n');
+    } else {
+        cmd.arg(format!("timeout {seconds}s sh -lc {}", shell_quote(script)));
+    }
+    if let Some(line) = options.stdin_line {
+        input.push_str("SECRET:");
+        input.push_str(line);
+        input.push('\n');
+    }
+    let deadline = std::time::Duration::from_secs(seconds + 7);
+    let output = output_with_timeout(cmd, deadline, input.as_bytes())?;
+    if options.sudo_password.is_some() && !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("incorrect password") || stderr.contains("Sorry, try again") {
+            return Err(format!("{SUDO_MARK}sudo 密码不正确，请重新输入。"));
+        }
+        if stderr.contains("not in the sudoers") || stderr.contains("not allowed to run sudo") {
+            return Err(format!(
+                "机器人用户 {} 没有 sudo 权限，无法提权执行。",
+                target.username
+            ));
+        }
+    }
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if !output.status.success() {
         let stderr = safe_stderr(&output.stderr);
@@ -331,6 +406,9 @@ pub fn remote_command(state: &AppState, target: &Target, script: &str) -> Result
         } else {
             stderr
         };
+        if options.sudo_password.is_none() && looks_like_permission_error(&detail) {
+            return Err(format!("{SUDO_MARK}{detail}"));
+        }
         return Err(if detail.is_empty() {
             format!("SSH 命令失败，退出码 {:?}", output.status.code())
         } else {
@@ -340,20 +418,31 @@ pub fn remote_command(state: &AppState, target: &Target, script: &str) -> Result
     Ok(stdout)
 }
 
-/// The remote side is limited by `timeout 18s`, but a half-dead link (cable pulled, address gone) can
-/// keep the local ssh client waiting for ServerAlive to give up (~45 s). Bound it locally as well.
-const REMOTE_COMMAND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(25);
+// The remote side is limited by `timeout`, but a half-dead link (cable pulled, address gone) can keep
+// the local ssh client waiting for ServerAlive to give up (~45 s), so remote_command_with also bounds
+// it locally (remote limit + 7 s).
 
 fn output_with_timeout(
     mut cmd: Command,
     deadline: std::time::Duration,
+    input: &[u8],
 ) -> Result<std::process::Output, String> {
     let mut child = cmd
-        .stdin(Stdio::null())
+        .stdin(if input.is_empty() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("无法运行 OpenSSH：{e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let data = input.to_vec();
+        thread::spawn(move || {
+            let _ = stdin.write_all(&data);
+        });
+    }
     let mut stdout = child.stdout.take().ok_or("无法读取 OpenSSH 输出")?;
     let mut stderr = child.stderr.take().ok_or("无法读取 OpenSSH 输出")?;
     let out_reader = thread::spawn(move || {
@@ -595,12 +684,41 @@ fn unreachable_hint(host: &str, port: u16) -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
-    unreachable_hint_from_route(ip, port, &route, |dev| {
+    let neighbor = Command::new("ip")
+        .args(["-4", "neigh", "show", &ip.to_string()])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let hint = unreachable_hint_from_route(ip, port, &route, |dev| {
         std::path::Path::new("/sys/class/net")
             .join(dev)
             .join("wireless")
             .exists()
-    })
+    });
+    match neighbor_hint(ip, &route, &neighbor) {
+        Some(extra) => extra,
+        None => hint,
+    }
+}
+
+/// When the route is fine but the board never answered ARP, the board is not at that address
+/// any more (rebooted with another IP, DHCP lease gone) rather than SSH being blocked.
+fn neighbor_hint(ip: std::net::Ipv4Addr, route: &str, neighbor: &str) -> Option<String> {
+    let words = route.split_whitespace().collect::<Vec<_>>();
+    if words.is_empty() || words.contains(&"via") {
+        return None;
+    }
+    let state = neighbor.split_whitespace().last().unwrap_or("");
+    if state != "FAILED" && state != "INCOMPLETE" {
+        return None;
+    }
+    let dev = words
+        .windows(2)
+        .find(|w| w[0] == "dev")
+        .map(|w| w[1])
+        .unwrap_or("直连网卡");
+    Some(format!("{ip} 经 {dev} 没有任何 ARP 应答：网线另一端现在没有这个地址。开发板可能重启后换了 IP（例如 DHCP 租约到期、直连 DHCP 已停止），或网线 / USB 网卡链路断开。请到“网络与 Wi‑Fi”页重新扫描，用扫描到的新地址连接。"))
 }
 
 fn unreachable_hint_from_route(
@@ -674,6 +792,34 @@ mod tests {
         );
         assert!(wired.contains("端口 2222") && wired.contains("enp3s0"));
         assert!(unreachable_hint_from_route(ip, 22, "", |_| false).contains("没有去往"));
+    }
+
+    #[test]
+    fn missing_arp_reply_is_reported_as_address_gone() {
+        let ip = "192.168.77.126".parse().unwrap();
+        let route = "192.168.77.126 dev enx00e04c3071f5 src 192.168.77.1 uid 1000";
+        let gone = neighbor_hint(ip, route, "192.168.77.126 dev enx00e04c3071f5 FAILED").unwrap();
+        assert!(gone.contains("没有任何 ARP 应答") && gone.contains("enx00e04c3071f5"));
+        assert!(neighbor_hint(
+            ip,
+            route,
+            "192.168.77.126 dev enx00e04c3071f5 lladdr 00:11:22:33:44:55 REACHABLE"
+        )
+        .is_none());
+        assert!(neighbor_hint(ip, "192.168.77.126 via 10.0.0.1 dev wlp2s0", "x FAILED").is_none());
+    }
+
+    #[test]
+    fn sudo_errors_are_detected() {
+        assert!(looks_like_permission_error(
+            "Error: org.freedesktop.NetworkManager.wifi.scan request failed: not authorized."
+        ));
+        assert!(looks_like_permission_error(
+            "Failed to start bluetooth.service: Interactive authentication required."
+        ));
+        assert!(!looks_like_permission_error(
+            "Error: No network with SSID 'x' found."
+        ));
     }
 
     #[test]
