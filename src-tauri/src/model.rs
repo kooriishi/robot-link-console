@@ -209,6 +209,15 @@ pub struct BluetoothSnapshot {
     pub powered: bool,
     pub adapter: String,
     pub devices: Vec<BluetoothDevice>,
+    /// Why the adapter could not be read or the scan failed, shown instead of silently empty data.
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WifiScanResult {
+    pub networks: Vec<WifiNetwork>,
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

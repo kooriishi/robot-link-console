@@ -1061,6 +1061,12 @@ pub fn remove_owned_network_address(
 pub fn cleanup_session_network_addresses(
     state: State<'_, AppState>,
 ) -> Result<Vec<OwnedNetworkAddress>, String> {
+    cleanup_temporary_addresses(&state)
+}
+
+/// Removes the non-persistent RoboLink addresses. Called when the app exits, not when an SSH session
+/// ends: a dropped session must keep the direct-link address so the user can reconnect straight away.
+pub fn cleanup_temporary_addresses(state: &AppState) -> Result<Vec<OwnedNetworkAddress>, String> {
     let mut owned = state.load_network_addresses()?;
     let session_items = owned
         .iter()
@@ -1393,11 +1399,37 @@ pub fn get_remote_network(
 pub fn scan_remote_wifi(
     state: State<'_, AppState>,
     target_id: String,
-) -> Result<Vec<WifiNetwork>, String> {
+) -> Result<WifiScanResult, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
-    let script = "command -v nmcli >/dev/null 2>&1 || { echo '缺少 nmcli'; exit 127; }; nmcli --terse --escape yes --fields IN-USE,SSID,SIGNAL,SECURITY device wifi list --rescan yes";
+    // `list --rescan yes` fails as a whole when polkit refuses the scan (common for a non-root SSH
+    // user), so request the rescan separately and still return NetworkManager's cached list.
+    let script = "command -v nmcli >/dev/null 2>&1 || { echo '缺少 nmcli'; exit 127; }; R=$(LC_ALL=C nmcli device wifi rescan 2>&1); if [ $? -ne 0 ]; then printf 'RESCAN_ERR %s\n' \"$(printf '%s' \"$R\" | tr '\\n' ' ' | cut -c1-300)\"; else sleep 4; fi; printf 'APS\n'; nmcli --terse --escape yes --fields IN-USE,SSID,SIGNAL,SECURITY device wifi list --rescan no";
     let output = ssh::remote_command(&state, &target, script)?;
-    Ok(wifi_rows(&output))
+    Ok(parse_wifi_scan(&output))
+}
+
+fn parse_wifi_scan(output: &str) -> WifiScanResult {
+    let (head, aps) = output.split_once("APS\n").unwrap_or(("", output));
+    let error = head
+        .lines()
+        .find_map(|line| line.strip_prefix("RESCAN_ERR "))
+        .map(str::trim)
+        .filter(|e| !e.is_empty());
+    let warning = error.map(|e| {
+        let lower = e.to_ascii_lowercase();
+        let hint = if lower.contains("not authorized") || lower.contains("permission") || lower.contains("insufficient") {
+            "机器人上的 SSH 用户没有让 NetworkManager 主动扫描的权限，可在终端执行 sudo nmcli device wifi rescan 后再刷新。"
+        } else if lower.contains("immediately") || lower.contains("not allowed") {
+            "NetworkManager 刚扫描过或 Wi‑Fi 不可用，稍等几秒再试。"
+        } else {
+            "可到终端执行 nmcli device wifi rescan 查看详情。"
+        };
+        format!("重新扫描未执行（{e}），下面是缓存的结果。{hint}")
+    });
+    WifiScanResult {
+        networks: wifi_rows(aps),
+        warning,
+    }
 }
 
 #[tauri::command(async)]
@@ -1421,57 +1453,152 @@ pub fn start_wifi_connect(
 ) -> Result<String, String> {
     validate_wifi_ssid(&ssid)?;
     let target = ssh::lookup_target(&state, &target_id)?;
-    let command = format!(
+    let command = with_sudo_retry(&format!(
         "nmcli --ask device wifi connect {}",
         ssh::shell_quote(&ssid)
-    );
+    ));
     ssh::start_terminal(&app, &state, &target, Some(&command))
 }
 
-fn parse_bt_devices(
-    all: &str,
-    paired: &str,
-    state: &AppState,
-    target: &Target,
-) -> Result<Vec<BluetoothDevice>, String> {
-    let mut names = HashMap::new();
-    for line in all.lines() {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() >= 3 && fields[0] == "Device" && validate_mac(fields[1]).is_ok() {
-            names.insert(fields[1].to_ascii_uppercase(), fields[2..].join(" "));
-        }
-    }
-    let paired_set: HashSet<String> = paired
-        .lines()
-        .filter_map(|line| {
-            let f: Vec<_> = line.split_whitespace().collect();
-            if f.len() >= 2 && f[0] == "Device" {
-                Some(f[1].to_ascii_uppercase())
-            } else {
-                None
-            }
-        })
-        .collect();
+/// Runs an interactive command in the robot terminal; if it fails, offers (does not force) a retry
+/// with sudo, since NetworkManager/BlueZ often refuse a non-root SSH user. The sudo password is typed
+/// in the terminal and never passes through RoboLink.
+fn with_sudo_retry(command: &str) -> String {
+    format!(
+        "{command}; rc=$?; if [ $rc -ne 0 ] && command -v sudo >/dev/null 2>&1; then printf '\\n命令失败（退出码 %s）。如果上面提示权限不足（Not authorized / Insufficient privileges / Access denied），按回车用 sudo 重试；按 Ctrl+C 结束。\\n' \"$rc\"; read _ && sudo {command}; fi"
+    )
+}
+
+const BT_SCRIPT_HEAD: &str =
+    "command -v bluetoothctl >/dev/null 2>&1 || { echo 'UNSUPPORTED'; exit 0; }; export LC_ALL=C; ";
+// One SSH round trip: errors are kept (not sent to /dev/null) so permission problems are visible, and
+// `info` is read for every device in the same call instead of one SSH command per device.
+const BT_SCRIPT_TAIL: &str = "printf 'SHOW\\n'; bluetoothctl show 2>&1; printf '\\nINFO\\n'; bluetoothctl devices 2>/dev/null | awk '$1==\"Device\"{print $2}' | head -30 | while read -r m; do printf '@@DEV %s\\n' \"$m\"; bluetoothctl info \"$m\" 2>/dev/null; done";
+const BT_SCAN: &str = "S=$(bluetoothctl --timeout 6 scan on 2>&1); printf 'SCAN\\n%s\\n' \"$S\" | grep -i -E 'fail|error|denied|not available|not ready' | head -3; ";
+
+fn parse_bt_info(info: &str) -> Vec<BluetoothDevice> {
     let mut devices = Vec::new();
-    for (mac, name) in names {
-        let info = ssh::remote_command(
-            state,
-            target,
-            &format!("bluetoothctl info {}", ssh::shell_quote(&mac)),
-        )
-        .unwrap_or_default();
-        let connected = info.lines().any(|l| l.trim() == "Connected: yes");
-        let trusted = info.lines().any(|l| l.trim() == "Trusted: yes");
+    for block in info.split("@@DEV ").skip(1) {
+        let mut lines = block.lines();
+        let mac = lines.next().unwrap_or("").trim().to_ascii_uppercase();
+        if validate_mac(&mac).is_err() {
+            continue;
+        }
+        let mut name = String::new();
+        let (mut paired, mut connected, mut trusted) = (false, false, false);
+        for line in lines {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("Name: ") {
+                name = v.trim().to_string();
+            } else if name.is_empty() {
+                if let Some(v) = line.strip_prefix("Alias: ") {
+                    name = v.trim().to_string();
+                }
+            }
+            match line {
+                "Paired: yes" => paired = true,
+                "Connected: yes" => connected = true,
+                "Trusted: yes" => trusted = true,
+                _ => {}
+            }
+        }
+        if name.is_empty() {
+            name = mac.clone();
+        }
         devices.push(BluetoothDevice {
-            address: mac.clone(),
+            address: mac,
             name,
-            paired: paired_set.contains(&mac),
+            paired,
             connected,
             trusted,
         });
     }
-    devices.sort_by_key(|device| device.name.to_lowercase());
-    Ok(devices)
+    devices.sort_by_key(|device| {
+        (
+            !device.connected,
+            !device.paired,
+            device.name.to_lowercase(),
+        )
+    });
+    devices.dedup_by(|a, b| a.address == b.address);
+    devices
+}
+
+fn bt_problem_hint(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("denied") || lower.contains("not authorized") {
+        "机器人上的 SSH 用户没有访问 BlueZ 的权限：把该用户加入 bluetooth 组（sudo usermod -aG bluetooth $USER 后重新登录），或在终端用 sudo bluetoothctl 操作。".into()
+    } else if lower.contains("no default controller") {
+        "机器人没有可用的蓝牙适配器：确认板子有蓝牙模块，并执行 sudo systemctl start bluetooth、rfkill unblock bluetooth。".into()
+    } else if lower.contains("waiting to connect to bluetoothd") || lower.contains("not available")
+    {
+        "bluetoothd 没有运行：在终端执行 sudo systemctl start bluetooth。".into()
+    } else {
+        "可在终端执行 bluetoothctl show 查看详情。".into()
+    }
+}
+
+fn parse_bluetooth_output(output: &str) -> BluetoothSnapshot {
+    if output.lines().any(|l| l.trim() == "UNSUPPORTED") {
+        return BluetoothSnapshot {
+            available: false,
+            powered: false,
+            adapter: String::new(),
+            devices: vec![],
+            note: Some("机器人未安装 bluetoothctl（BlueZ）。".into()),
+        };
+    }
+    let scan_errors = output
+        .split_once("SCAN\n")
+        .map(|(_, r)| r.split_once("SHOW\n").map(|(a, _)| a).unwrap_or(r))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let show = output
+        .split_once("SHOW\n")
+        .map(|(_, r)| r.split_once("\nINFO\n").map(|(a, _)| a).unwrap_or(r))
+        .unwrap_or("");
+    let info = output.split_once("\nINFO\n").map(|(_, r)| r).unwrap_or("");
+    let adapter = show
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Controller "))
+        .and_then(|x| x.split_whitespace().next())
+        .unwrap_or("")
+        .to_string();
+    let powered = show.lines().any(|l| l.trim() == "Powered: yes");
+    let note = if adapter.is_empty() {
+        let detail = show
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let detail = if detail.is_empty() {
+            "bluetoothctl show 没有输出".to_string()
+        } else {
+            detail
+        };
+        Some(format!(
+            "无法读取蓝牙适配器（{detail}）。{}",
+            bt_problem_hint(&detail)
+        ))
+    } else if !scan_errors.is_empty() {
+        Some(format!(
+            "扫描未完成（{}）。{}",
+            scan_errors.replace('\n', " "),
+            bt_problem_hint(&scan_errors)
+        ))
+    } else {
+        None
+    };
+    BluetoothSnapshot {
+        available: !adapter.is_empty(),
+        powered,
+        adapter,
+        devices: parse_bt_info(info),
+        note,
+    }
 }
 
 fn bluetooth_parts(
@@ -1479,45 +1606,12 @@ fn bluetooth_parts(
     target: &Target,
     scan: bool,
 ) -> Result<BluetoothSnapshot, String> {
-    let script = if scan {
-        "command -v bluetoothctl >/dev/null 2>&1 || { echo 'UNSUPPORTED'; exit 0; }; bluetoothctl --timeout 8 scan on >/dev/null 2>&1 || true; printf 'SHOW\\n'; bluetoothctl show 2>/dev/null || true; printf '\\nALL\\n'; bluetoothctl devices 2>/dev/null || true; printf '\\nPAIRED\\n'; bluetoothctl devices Paired 2>/dev/null || true"
-    } else {
-        "command -v bluetoothctl >/dev/null 2>&1 || { echo 'UNSUPPORTED'; exit 0; }; printf 'SHOW\\n'; bluetoothctl show 2>/dev/null || true; printf '\\nALL\\n'; bluetoothctl devices 2>/dev/null || true; printf '\\nPAIRED\\n'; bluetoothctl devices Paired 2>/dev/null || true"
-    };
-    let output = ssh::remote_command(state, target, script)?;
-    if output.contains("UNSUPPORTED") {
-        return Ok(BluetoothSnapshot {
-            available: false,
-            powered: false,
-            adapter: String::new(),
-            devices: vec![],
-        });
-    }
-    let show = output
-        .split_once("SHOW\n")
-        .map(|(_, r)| r.split_once("\nALL\n").map(|(a, _)| a).unwrap_or(r))
-        .unwrap_or("");
-    let all = output
-        .split_once("\nALL\n")
-        .map(|(_, r)| r.split_once("\nPAIRED\n").map(|(a, _)| a).unwrap_or(r))
-        .unwrap_or("");
-    let paired = output
-        .split_once("\nPAIRED\n")
-        .map(|(_, r)| r)
-        .unwrap_or("");
-    let powered = show.lines().any(|l| l.trim() == "Powered: yes");
-    let adapter = show
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("Controller "))
-        .and_then(|x| x.split_whitespace().next())
-        .unwrap_or("")
-        .to_string();
-    Ok(BluetoothSnapshot {
-        available: true,
-        powered,
-        adapter,
-        devices: parse_bt_devices(all, paired, state, target)?,
-    })
+    let script = format!(
+        "{BT_SCRIPT_HEAD}{}{BT_SCRIPT_TAIL}",
+        if scan { BT_SCAN } else { "" }
+    );
+    let output = ssh::remote_command(state, target, &script)?;
+    Ok(parse_bluetooth_output(&output))
 }
 
 #[tauri::command(async)]
@@ -1566,7 +1660,10 @@ pub fn bluetooth_action(
             &app,
             &state,
             &target,
-            Some(&format!("bluetoothctl pair {}", ssh::shell_quote(&mac))),
+            Some(&with_sudo_retry(&format!(
+                "bluetoothctl pair {}",
+                ssh::shell_quote(&mac)
+            ))),
         )?)),
         "connect" | "disconnect" | "remove" | "trust" => {
             ssh::remote_command(
@@ -1829,6 +1926,50 @@ pub fn close_ssh_terminal(state: State<'_, AppState>, session_id: String) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wifi_scan_keeps_cached_rows_when_rescan_is_refused() {
+        let ok = parse_wifi_scan("APS\n*:Lab\\:Robot:80:WPA2\n:Guest:40:\n");
+        assert_eq!(ok.networks.len(), 2);
+        assert!(ok.warning.is_none());
+        let denied = parse_wifi_scan(
+            "RESCAN_ERR Error: Scanning not allowed: Not authorized to request a Wi-Fi scan.\nAPS\n:Guest:40:\n",
+        );
+        assert_eq!(denied.networks.len(), 1);
+        let w = denied.warning.unwrap();
+        assert!(w.contains("缓存") && w.contains("sudo nmcli device wifi rescan"));
+    }
+
+    #[test]
+    fn bluetooth_output_reports_permission_problems_instead_of_powered_off() {
+        let denied = parse_bluetooth_output(
+            "SHOW\nAccess denied: org.freedesktop.DBus.Error.AccessDenied\n\nINFO\n",
+        );
+        assert!(!denied.available);
+        assert!(denied.note.unwrap().contains("bluetooth 组"));
+        let none = parse_bluetooth_output("SHOW\nNo default controller available\n\nINFO\n");
+        assert!(none.note.unwrap().contains("没有可用的蓝牙适配器"));
+        let ok = parse_bluetooth_output(
+            "SCAN\n\nSHOW\nController AA:BB:CC:DD:EE:FF (public)\n\tPowered: yes\n\nINFO\n@@DEV 11:22:33:44:55:66\nDevice 11:22:33:44:55:66 (public)\n\tName: Speaker\n\tPaired: yes\n\tConnected: yes\n@@DEV 77:88:99:AA:BB:CC\nDevice 77:88:99:AA:BB:CC\n\tAlias: 77-88\n\tPaired: no\n",
+        );
+        assert!(ok.available && ok.powered && ok.note.is_none());
+        assert_eq!(ok.adapter, "AA:BB:CC:DD:EE:FF");
+        assert_eq!(ok.devices.len(), 2);
+        assert_eq!(ok.devices[0].name, "Speaker");
+        assert!(ok.devices[0].paired && ok.devices[0].connected);
+        assert!(!ok.devices[1].paired);
+        let scan_failed = parse_bluetooth_output(
+            "SCAN\nFailed to start discovery: org.bluez.Error.NotReady\nSHOW\nController AA:BB:CC:DD:EE:FF (public)\n\tPowered: yes\n\nINFO\n",
+        );
+        assert!(scan_failed.note.unwrap().contains("扫描未完成"));
+    }
+
+    #[test]
+    fn sudo_retry_wraps_interactive_command_once() {
+        let s = with_sudo_retry("nmcli --ask device wifi connect 'Lab'");
+        assert!(s.starts_with("nmcli --ask device wifi connect 'Lab'; rc=$?"));
+        assert!(s.contains("read _ && sudo nmcli --ask device wifi connect 'Lab'; fi"));
+    }
+
     #[test]
     fn nmcli_escaped_fields_parse_without_splitting_ssid_colons() {
         let fields = parse_nmcli("*:Lab\\:Robot:80:WPA2");

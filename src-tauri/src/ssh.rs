@@ -319,10 +319,13 @@ pub fn remote_command(state: &AppState, target: &Target, script: &str) -> Result
     cmd.args(ssh_args(state, target, false, true));
     cmd.arg(ssh_destination(target));
     cmd.arg(format!("timeout 18s sh -lc {}", shell_quote(script)));
-    let output = cmd.output().map_err(|e| format!("无法运行 OpenSSH：{e}"))?;
+    let output = output_with_timeout(cmd, REMOTE_COMMAND_DEADLINE)?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if !output.status.success() {
         let stderr = safe_stderr(&output.stderr);
+        if output.status.code() == Some(255) && stderr.contains("Permission denied") {
+            return Err("SSH 登录会话已结束（后台命令不会再次询问密码）。请到“终端”页点击连接并完成登录后再试。".into());
+        }
         let detail = if stderr.is_empty() {
             stdout.trim().to_string()
         } else {
@@ -335,6 +338,54 @@ pub fn remote_command(state: &AppState, target: &Target, script: &str) -> Result
         });
     }
     Ok(stdout)
+}
+
+/// The remote side is limited by `timeout 18s`, but a half-dead link (cable pulled, address gone) can
+/// keep the local ssh client waiting for ServerAlive to give up (~45 s). Bound it locally as well.
+const REMOTE_COMMAND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(25);
+
+fn output_with_timeout(
+    mut cmd: Command,
+    deadline: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("无法运行 OpenSSH：{e}"))?;
+    let mut stdout = child.stdout.take().ok_or("无法读取 OpenSSH 输出")?;
+    let mut stderr = child.stderr.take().ok_or("无法读取 OpenSSH 输出")?;
+    let out_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        if started.elapsed() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "机器人在 {} 秒内没有响应，SSH 链路可能已经断开。请检查网线，或到“终端”页重新连接。",
+                deadline.as_secs()
+            ));
+        }
+        thread::sleep(std::time::Duration::from_millis(50));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out_reader.join().unwrap_or_default(),
+        stderr: err_reader.join().unwrap_or_default(),
+    })
 }
 
 pub fn start_terminal(

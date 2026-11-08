@@ -54,6 +54,18 @@ pub fn run() {
             commands::resize_terminal,
             commands::close_ssh_terminal
         ])
-        .run(tauri::generate_context!())
-        .expect("启动 RoboLink 桌面程序失败");
+        .build(tauri::generate_context!())
+        .expect("启动 RoboLink 桌面程序失败")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                let state = app.state::<AppState>();
+                let pending = state
+                    .load_network_addresses()
+                    .map(|items| items.iter().any(|item| !item.persistent))
+                    .unwrap_or(false);
+                if pending {
+                    let _ = commands::cleanup_temporary_addresses(&state);
+                }
+            }
+        });
 }
