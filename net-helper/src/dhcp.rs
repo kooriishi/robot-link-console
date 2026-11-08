@@ -345,29 +345,28 @@ fn start(interface: &str, cidr: &str, uid: u32) -> Result<DhcpStatus, String> {
     }
 
     let cidr_arg = format!("{local}/{prefix}");
-    let add = super::ip_command(&["address", "add", &cidr_arg, "dev", interface]);
-    match add {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            record.address_added = false;
-            let cleanup = cleanup_record(&mut record, &state_path)
-                .err()
-                .into_iter()
-                .collect();
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(append_cleanup(
-                format!("添加临时 DHCP 本机地址失败：{detail}"),
-                cleanup,
-            ));
+    // On an interface NetworkManager manages, a raw `ip address add` is flushed whenever NM
+    // reactivates the port, which silently cut the board off; use RoboLink's in-memory NM profile.
+    let added = if super::nm_manages(interface) {
+        super::nm_add_address(interface, &cidr_arg)
+            .map_err(|e| format!("添加临时 DHCP 本机地址失败：{e}"))
+    } else {
+        match super::ip_command(&["address", "add", &cidr_arg, "dev", interface]) {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => Err(format!(
+                "添加临时 DHCP 本机地址失败：{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(error) => Err(error),
         }
-        Err(error) => {
-            record.address_added = false;
-            let cleanup = cleanup_record(&mut record, &state_path)
-                .err()
-                .into_iter()
-                .collect();
-            return Err(append_cleanup(error, cleanup));
-        }
+    };
+    if let Err(detail) = added {
+        record.address_added = false;
+        let cleanup = cleanup_record(&mut record, &state_path)
+            .err()
+            .into_iter()
+            .collect();
+        return Err(append_cleanup(detail, cleanup));
     }
 
     let log = match OpenOptions::new()
@@ -782,6 +781,9 @@ fn remove_file_if_exists(path: &Path) -> Result<(), String> {
 
 fn remove_owned_address(record: &DhcpRecord) -> Result<(), String> {
     let (address, prefix) = parse_private_dhcp_cidr(&record.cidr)?;
+    if super::nm_remove_address(&record.interface, &format!("{address}/{prefix}"))? {
+        return Ok(());
+    }
     let current = super::all_ipv4_addresses()?;
     let exact = current
         .iter()

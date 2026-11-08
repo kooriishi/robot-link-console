@@ -1061,6 +1061,12 @@ pub fn remove_owned_network_address(
 pub fn cleanup_session_network_addresses(
     state: State<'_, AppState>,
 ) -> Result<Vec<OwnedNetworkAddress>, String> {
+    cleanup_temporary_addresses(&state)
+}
+
+/// Removes the non-persistent RoboLink addresses. Called when the app exits, not when an SSH session
+/// ends: a dropped session must keep the direct-link address so the user can reconnect straight away.
+pub fn cleanup_temporary_addresses(state: &AppState) -> Result<Vec<OwnedNetworkAddress>, String> {
     let mut owned = state.load_network_addresses()?;
     let session_items = owned
         .iter()
@@ -1247,10 +1253,28 @@ pub fn get_remote_overview(
 pub fn list_services(
     state: State<'_, AppState>,
     target_id: String,
+    scope: Option<String>,
 ) -> Result<Vec<ServiceInfo>, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
-    let script = "systemctl list-units --type=service --all --no-legend --no-pager --plain --no-ask-password; printf '\\0'; systemctl list-unit-files --type=service --no-legend --no-pager --no-ask-password";
-    let output = ssh::remote_command(&state, &target, script)?;
+    let user = scope.as_deref() == Some("user");
+    let script = if user {
+        // An SSH login normally has the user's systemd manager; set the runtime dir explicitly for
+        // boards whose sshd does not export XDG_RUNTIME_DIR.
+        "export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}; systemctl --user list-units --type=service --all --no-legend --no-pager --plain; printf '\\0'; systemctl --user list-unit-files --type=service --no-legend --no-pager"
+    } else {
+        "systemctl list-units --type=service --all --no-legend --no-pager --plain --no-ask-password; printf '\\0'; systemctl list-unit-files --type=service --no-legend --no-pager --no-ask-password"
+    };
+    let output = ssh::remote_command(&state, &target, script).map_err(|e| {
+        if user {
+            format!(
+                "读取用户服务失败（systemctl --user 需要该用户的 systemd 会话）：{}",
+                e.trim_start_matches(ssh::SUDO_MARK)
+            )
+        } else {
+            e
+        }
+    })?;
+    let scope_name = if user { "user" } else { "system" };
     let (units, files) = output.split_once('\0').unwrap_or((&output, ""));
     let mut enabled = HashMap::new();
     for line in files.lines() {
@@ -1279,6 +1303,7 @@ pub fn list_services(
             active: fields[2].into(),
             sub_state: fields[3].into(),
             enabled: enabled.get(name).cloned().unwrap_or_else(|| "未知".into()),
+            scope: scope_name.into(),
         });
     }
     services.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1291,15 +1316,31 @@ pub fn service_action(
     target_id: String,
     service: String,
     action: String,
+    scope: Option<String>,
+    sudo_password: Option<String>,
 ) -> Result<String, String> {
     validate_service_name(&service)?;
     if !["start", "stop", "restart"].contains(&action.as_str()) {
         return Err("不支持的服务操作".into());
     }
     let target = ssh::lookup_target(&state, &target_id)?;
-    let script = format!("systemctl --no-ask-password {} {}", action, service);
-    ssh::remote_command(&state, &target, &script)?;
+    if scope.as_deref() == Some("user") {
+        let script = format!(
+            "export XDG_RUNTIME_DIR=${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}; systemctl --user {action} {service}"
+        );
+        ssh::remote_command(&state, &target, &script)?;
+    } else {
+        let script = format!("systemctl --no-ask-password {} {}", action, service);
+        ssh::remote_command_with(&state, &target, &script, sudo_options(&sudo_password))?;
+    }
     Ok(format!("{service} 已执行 {action}；请刷新状态确认结果"))
+}
+
+fn sudo_options(sudo_password: &Option<String>) -> ssh::RemoteOptions<'_> {
+    ssh::RemoteOptions {
+        sudo_password: sudo_password.as_deref().filter(|p| !p.is_empty()),
+        ..Default::default()
+    }
 }
 
 fn parse_nmcli(line: &str) -> Vec<String> {
@@ -1393,11 +1434,40 @@ pub fn get_remote_network(
 pub fn scan_remote_wifi(
     state: State<'_, AppState>,
     target_id: String,
-) -> Result<Vec<WifiNetwork>, String> {
+    sudo_password: Option<String>,
+) -> Result<WifiScanResult, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
-    let script = "command -v nmcli >/dev/null 2>&1 || { echo '缺少 nmcli'; exit 127; }; nmcli --terse --escape yes --fields IN-USE,SSID,SIGNAL,SECURITY device wifi list --rescan yes";
-    let output = ssh::remote_command(&state, &target, script)?;
-    Ok(wifi_rows(&output))
+    // `list --rescan yes` fails as a whole when polkit refuses the scan (common for a non-root SSH
+    // user), so request the rescan separately and still return NetworkManager's cached list.
+    let script = "command -v nmcli >/dev/null 2>&1 || { echo '缺少 nmcli'; exit 127; }; R=$(LC_ALL=C nmcli device wifi rescan 2>&1); if [ $? -ne 0 ]; then printf 'RESCAN_ERR %s\n' \"$(printf '%s' \"$R\" | tr '\\n' ' ' | cut -c1-300)\"; else sleep 4; fi; printf 'APS\n'; nmcli --terse --escape yes --fields IN-USE,SSID,SIGNAL,SECURITY device wifi list --rescan no";
+    let output = ssh::remote_command_with(&state, &target, script, sudo_options(&sudo_password))?;
+    Ok(parse_wifi_scan(&output))
+}
+
+fn parse_wifi_scan(output: &str) -> WifiScanResult {
+    let (head, aps) = output.split_once("APS\n").unwrap_or(("", output));
+    let error = head
+        .lines()
+        .find_map(|line| line.strip_prefix("RESCAN_ERR "))
+        .map(str::trim)
+        .filter(|e| !e.is_empty());
+    let needs_sudo = error.is_some_and(ssh::looks_like_permission_error);
+    let warning = error.map(|e| {
+        let lower = e.to_ascii_lowercase();
+        let hint = if needs_sudo {
+            "机器人上的 SSH 用户没有让 NetworkManager 主动扫描的权限，输入 sudo 密码即可重新扫描。"
+        } else if lower.contains("immediately") || lower.contains("not allowed") {
+            "NetworkManager 刚扫描过或 Wi‑Fi 不可用，稍等几秒再试。"
+        } else {
+            "可到终端执行 nmcli device wifi rescan 查看详情。"
+        };
+        format!("重新扫描未执行（{e}），下面是缓存的结果。{hint}")
+    });
+    WifiScanResult {
+        networks: wifi_rows(aps),
+        warning,
+        needs_sudo,
+    }
 }
 
 #[tauri::command(async)]
@@ -1405,11 +1475,40 @@ pub fn set_remote_wifi_radio(
     state: State<'_, AppState>,
     target_id: String,
     enabled: bool,
+    sudo_password: Option<String>,
 ) -> Result<(), String> {
     let target = ssh::lookup_target(&state, &target_id)?;
     let on_off = if enabled { "on" } else { "off" };
-    ssh::remote_command(&state, &target, &format!("nmcli radio wifi {on_off}"))?;
+    ssh::remote_command_with(
+        &state,
+        &target,
+        &format!("nmcli radio wifi {on_off}"),
+        sudo_options(&sudo_password),
+    )?;
     Ok(())
+}
+
+/// Connects the robot to Wi-Fi without a terminal: the Wi-Fi password goes over ssh's stdin (read by
+/// the remote shell), never into the local ssh argv or RoboLink's storage.
+#[tauri::command(async)]
+pub fn connect_remote_wifi(
+    state: State<'_, AppState>,
+    target_id: String,
+    ssid: String,
+    password: Option<String>,
+    sudo_password: Option<String>,
+) -> Result<String, String> {
+    validate_wifi_ssid(&ssid)?;
+    let target = ssh::lookup_target(&state, &target_id)?;
+    let script = format!(
+        "WP=''; while IFS= read -r L; do case \"$L\" in SECRET:*) WP=${{L#SECRET:}}; break;; esac; done; if [ -n \"$WP\" ]; then nmcli --wait 40 device wifi connect {ssid} password \"$WP\"; else nmcli --wait 40 device wifi connect {ssid}; fi",
+        ssid = ssh::shell_quote(&ssid)
+    );
+    let mut options = sudo_options(&sudo_password);
+    options.stdin_line = Some(password.as_deref().unwrap_or(""));
+    options.timeout_secs = Some(50);
+    let output = ssh::remote_command_with(&state, &target, &script, options)?;
+    Ok(output.trim().to_string())
 }
 
 #[tauri::command(async)]
@@ -1421,103 +1520,191 @@ pub fn start_wifi_connect(
 ) -> Result<String, String> {
     validate_wifi_ssid(&ssid)?;
     let target = ssh::lookup_target(&state, &target_id)?;
-    let command = format!(
+    let command = with_sudo_retry(&format!(
         "nmcli --ask device wifi connect {}",
         ssh::shell_quote(&ssid)
-    );
+    ));
     ssh::start_terminal(&app, &state, &target, Some(&command))
 }
 
-fn parse_bt_devices(
-    all: &str,
-    paired: &str,
-    state: &AppState,
-    target: &Target,
-) -> Result<Vec<BluetoothDevice>, String> {
-    let mut names = HashMap::new();
-    for line in all.lines() {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() >= 3 && fields[0] == "Device" && validate_mac(fields[1]).is_ok() {
-            names.insert(fields[1].to_ascii_uppercase(), fields[2..].join(" "));
-        }
-    }
-    let paired_set: HashSet<String> = paired
-        .lines()
-        .filter_map(|line| {
-            let f: Vec<_> = line.split_whitespace().collect();
-            if f.len() >= 2 && f[0] == "Device" {
-                Some(f[1].to_ascii_uppercase())
-            } else {
-                None
-            }
-        })
-        .collect();
+/// Runs an interactive command in the robot terminal; if it fails, offers (does not force) a retry
+/// with sudo, since NetworkManager/BlueZ often refuse a non-root SSH user. The sudo password is typed
+/// in the terminal and never passes through RoboLink.
+fn with_sudo_retry(command: &str) -> String {
+    format!(
+        "{command}; rc=$?; if [ $rc -ne 0 ] && command -v sudo >/dev/null 2>&1; then printf '\\n命令失败（退出码 %s）。如果上面提示权限不足（Not authorized / Insufficient privileges / Access denied），按回车用 sudo 重试；按 Ctrl+C 结束。\\n' \"$rc\"; read _ && sudo {command}; fi"
+    )
+}
+
+const BT_SCRIPT_HEAD: &str =
+    "command -v bluetoothctl >/dev/null 2>&1 || { echo 'UNSUPPORTED'; exit 0; }; export LC_ALL=C; ";
+// One SSH round trip: errors are kept (not sent to /dev/null) so permission problems are visible, and
+// `info` is read for every device in the same call instead of one SSH command per device.
+const BT_SCRIPT_TAIL: &str = "printf 'SHOW\\n'; bluetoothctl show 2>&1; printf '\\nINFO\\n'; bluetoothctl devices 2>/dev/null | awk '$1==\"Device\"{print $2}' | head -30 | while read -r m; do printf '@@DEV %s\\n' \"$m\"; bluetoothctl info \"$m\" 2>/dev/null; done";
+const BT_SCAN: &str = "S=$(bluetoothctl --timeout 6 scan on 2>&1); printf 'SCAN\\n%s\\n' \"$S\" | grep -i -E 'fail|error|denied|not available|not ready' | head -3; ";
+
+fn parse_bt_info(info: &str) -> Vec<BluetoothDevice> {
     let mut devices = Vec::new();
-    for (mac, name) in names {
-        let info = ssh::remote_command(
-            state,
-            target,
-            &format!("bluetoothctl info {}", ssh::shell_quote(&mac)),
-        )
-        .unwrap_or_default();
-        let connected = info.lines().any(|l| l.trim() == "Connected: yes");
-        let trusted = info.lines().any(|l| l.trim() == "Trusted: yes");
+    for block in info.split("@@DEV ").skip(1) {
+        let mut lines = block.lines();
+        let mac = lines.next().unwrap_or("").trim().to_ascii_uppercase();
+        if validate_mac(&mac).is_err() {
+            continue;
+        }
+        let mut name = String::new();
+        let (mut paired, mut connected, mut trusted) = (false, false, false);
+        for line in lines {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("Name: ") {
+                name = v.trim().to_string();
+            } else if name.is_empty() {
+                if let Some(v) = line.strip_prefix("Alias: ") {
+                    name = v.trim().to_string();
+                }
+            }
+            match line {
+                "Paired: yes" => paired = true,
+                "Connected: yes" => connected = true,
+                "Trusted: yes" => trusted = true,
+                _ => {}
+            }
+        }
+        if name.is_empty() {
+            name = mac.clone();
+        }
         devices.push(BluetoothDevice {
-            address: mac.clone(),
+            address: mac,
             name,
-            paired: paired_set.contains(&mac),
+            paired,
             connected,
             trusted,
         });
     }
-    devices.sort_by_key(|device| device.name.to_lowercase());
-    Ok(devices)
+    devices.sort_by_key(|device| {
+        (
+            !device.connected,
+            !device.paired,
+            device.name.to_lowercase(),
+        )
+    });
+    devices.dedup_by(|a, b| a.address == b.address);
+    devices
 }
 
-fn bluetooth_parts(
-    state: &AppState,
-    target: &Target,
-    scan: bool,
-) -> Result<BluetoothSnapshot, String> {
-    let script = if scan {
-        "command -v bluetoothctl >/dev/null 2>&1 || { echo 'UNSUPPORTED'; exit 0; }; bluetoothctl --timeout 8 scan on >/dev/null 2>&1 || true; printf 'SHOW\\n'; bluetoothctl show 2>/dev/null || true; printf '\\nALL\\n'; bluetoothctl devices 2>/dev/null || true; printf '\\nPAIRED\\n'; bluetoothctl devices Paired 2>/dev/null || true"
+/// bluetoothctl often exits 0 even when the D-Bus call failed; look at what it printed.
+fn bluetoothctl_result(output: &str) -> Result<(), String> {
+    let failure = output.lines().map(str::trim).find(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("failed")
+            || lower.contains("org.bluez.error")
+            || lower.contains("access denied")
+            || lower.contains("no default controller")
+            || lower.contains("not available")
+    });
+    match failure {
+        None => Ok(()),
+        Some(line) if ssh::looks_like_permission_error(line) => {
+            Err(format!("{}{line}", ssh::SUDO_MARK))
+        }
+        Some(line) => Err(format!("蓝牙操作失败：{line}。{}", bt_problem_hint(line))),
+    }
+}
+
+fn bt_problem_hint(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("denied") || lower.contains("not authorized") {
+        "机器人上的 SSH 用户没有访问 BlueZ 的权限：可输入 sudo 密码执行，或把该用户加入 bluetooth 组（sudo usermod -aG bluetooth $USER 后重新登录）。".into()
+    } else if lower.contains("no default controller") {
+        "机器人没有可用的蓝牙适配器：确认板子有蓝牙模块，并执行 sudo systemctl start bluetooth、rfkill unblock bluetooth。".into()
+    } else if lower.contains("waiting to connect to bluetoothd") || lower.contains("not available")
+    {
+        "bluetoothd 没有运行：在终端执行 sudo systemctl start bluetooth。".into()
     } else {
-        "command -v bluetoothctl >/dev/null 2>&1 || { echo 'UNSUPPORTED'; exit 0; }; printf 'SHOW\\n'; bluetoothctl show 2>/dev/null || true; printf '\\nALL\\n'; bluetoothctl devices 2>/dev/null || true; printf '\\nPAIRED\\n'; bluetoothctl devices Paired 2>/dev/null || true"
-    };
-    let output = ssh::remote_command(state, target, script)?;
-    if output.contains("UNSUPPORTED") {
-        return Ok(BluetoothSnapshot {
+        "可在终端执行 bluetoothctl show 查看详情。".into()
+    }
+}
+
+fn parse_bluetooth_output(output: &str) -> BluetoothSnapshot {
+    if output.lines().any(|l| l.trim() == "UNSUPPORTED") {
+        return BluetoothSnapshot {
             available: false,
             powered: false,
             adapter: String::new(),
             devices: vec![],
-        });
+            note: Some("机器人未安装 bluetoothctl（BlueZ）。".into()),
+            needs_sudo: false,
+        };
     }
+    let scan_errors = output
+        .split_once("SCAN\n")
+        .map(|(_, r)| r.split_once("SHOW\n").map(|(a, _)| a).unwrap_or(r))
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let show = output
         .split_once("SHOW\n")
-        .map(|(_, r)| r.split_once("\nALL\n").map(|(a, _)| a).unwrap_or(r))
+        .map(|(_, r)| r.split_once("\nINFO\n").map(|(a, _)| a).unwrap_or(r))
         .unwrap_or("");
-    let all = output
-        .split_once("\nALL\n")
-        .map(|(_, r)| r.split_once("\nPAIRED\n").map(|(a, _)| a).unwrap_or(r))
-        .unwrap_or("");
-    let paired = output
-        .split_once("\nPAIRED\n")
-        .map(|(_, r)| r)
-        .unwrap_or("");
-    let powered = show.lines().any(|l| l.trim() == "Powered: yes");
+    let info = output.split_once("\nINFO\n").map(|(_, r)| r).unwrap_or("");
     let adapter = show
         .lines()
         .find_map(|l| l.trim().strip_prefix("Controller "))
         .and_then(|x| x.split_whitespace().next())
         .unwrap_or("")
         .to_string();
-    Ok(BluetoothSnapshot {
-        available: true,
+    let powered = show.lines().any(|l| l.trim() == "Powered: yes");
+    let needs_sudo =
+        ssh::looks_like_permission_error(show) || ssh::looks_like_permission_error(&scan_errors);
+    let note = if adapter.is_empty() {
+        let detail = show
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let detail = if detail.is_empty() {
+            "bluetoothctl show 没有输出".to_string()
+        } else {
+            detail
+        };
+        Some(format!(
+            "无法读取蓝牙适配器（{detail}）。{}",
+            bt_problem_hint(&detail)
+        ))
+    } else if !scan_errors.is_empty() {
+        Some(format!(
+            "扫描未完成（{}）。{}",
+            scan_errors.replace('\n', " "),
+            bt_problem_hint(&scan_errors)
+        ))
+    } else {
+        None
+    };
+    BluetoothSnapshot {
+        available: !adapter.is_empty(),
         powered,
         adapter,
-        devices: parse_bt_devices(all, paired, state, target)?,
-    })
+        devices: parse_bt_info(info),
+        note,
+        needs_sudo,
+    }
+}
+
+fn bluetooth_parts(
+    state: &AppState,
+    target: &Target,
+    scan: bool,
+    sudo_password: &Option<String>,
+) -> Result<BluetoothSnapshot, String> {
+    let script = format!(
+        "{BT_SCRIPT_HEAD}{}{BT_SCRIPT_TAIL}",
+        if scan { BT_SCAN } else { "" }
+    );
+    let mut options = sudo_options(sudo_password);
+    options.timeout_secs = Some(25);
+    let output = ssh::remote_command_with(state, target, &script, options)?;
+    Ok(parse_bluetooth_output(&output))
 }
 
 #[tauri::command(async)]
@@ -1526,16 +1713,17 @@ pub fn get_bluetooth_snapshot(
     target_id: String,
 ) -> Result<BluetoothSnapshot, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
-    bluetooth_parts(&state, &target, false)
+    bluetooth_parts(&state, &target, false, &None)
 }
 
 #[tauri::command(async)]
 pub fn scan_bluetooth(
     state: State<'_, AppState>,
     target_id: String,
+    sudo_password: Option<String>,
 ) -> Result<BluetoothSnapshot, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
-    bluetooth_parts(&state, &target, true)
+    bluetooth_parts(&state, &target, true, &sudo_password)
 }
 
 #[tauri::command(async)]
@@ -1543,10 +1731,17 @@ pub fn set_bluetooth_power(
     state: State<'_, AppState>,
     target_id: String,
     enabled: bool,
+    sudo_password: Option<String>,
 ) -> Result<(), String> {
     let target = ssh::lookup_target(&state, &target_id)?;
     let power = if enabled { "on" } else { "off" };
-    ssh::remote_command(&state, &target, &format!("bluetoothctl power {power}"))?;
+    let output = ssh::remote_command_with(
+        &state,
+        &target,
+        &format!("bluetoothctl power {power} 2>&1"),
+        sudo_options(&sudo_password),
+    )?;
+    bluetoothctl_result(&output)?;
     Ok(())
 }
 
@@ -1557,6 +1752,7 @@ pub fn bluetooth_action(
     target_id: String,
     address: String,
     action: String,
+    sudo_password: Option<String>,
 ) -> Result<Option<String>, String> {
     validate_mac(&address)?;
     let target = ssh::lookup_target(&state, &target_id)?;
@@ -1566,38 +1762,128 @@ pub fn bluetooth_action(
             &app,
             &state,
             &target,
-            Some(&format!("bluetoothctl pair {}", ssh::shell_quote(&mac))),
+            Some(&with_sudo_retry(&format!(
+                "bluetoothctl pair {}",
+                ssh::shell_quote(&mac)
+            ))),
         )?)),
         "connect" | "disconnect" | "remove" | "trust" => {
-            ssh::remote_command(
+            let output = ssh::remote_command_with(
                 &state,
                 &target,
-                &format!("bluetoothctl {} {}", action, ssh::shell_quote(&mac)),
+                &format!("bluetoothctl {} {} 2>&1", action, ssh::shell_quote(&mac)),
+                sudo_options(&sudo_password),
             )?;
+            bluetoothctl_result(&output)?;
             Ok(None)
         }
         _ => Err("不支持的蓝牙操作".into()),
     }
 }
 
+/// Parses `pactl list sinks|sources` the way GNOME/Ubuntu Settings presents them: one entry per
+/// available port, labelled "<port description> - <card description>" (e.g. "Headphones - USB Audio"),
+/// falling back to the sink/source Description when it has no ports. Monitor sources are skipped.
 fn parse_pactl_devices(text: &str, default: &str) -> Vec<AudioDevice> {
-    text.lines()
-        .filter_map(|line| {
-            let fields: Vec<_> = line.split('\t').collect();
-            if fields.len() < 2 {
-                return None;
+    let mut devices = Vec::new();
+    let blocks = text
+        .split('\n')
+        .fold(Vec::<Vec<&str>>::new(), |mut acc, line| {
+            if line.starts_with("Sink #") || line.starts_with("Source #") {
+                acc.push(Vec::new());
+            } else if let Some(block) = acc.last_mut() {
+                block.push(line);
             }
-            let name = fields[1].trim();
-            if name.is_empty() {
-                return None;
+            acc
+        });
+    for block in blocks {
+        let field = |key: &str| {
+            block
+                .iter()
+                .find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()))
+                .unwrap_or_default()
+        };
+        let property = |key: &str| {
+            block
+                .iter()
+                .find_map(|l| {
+                    let (k, v) = l.trim().split_once(" = ")?;
+                    (k == key).then(|| v.trim().trim_matches('"').to_string())
+                })
+                .unwrap_or_default()
+        };
+        let name = field("Name:");
+        if name.is_empty() || name.ends_with(".monitor") || property("device.class") == "monitor" {
+            continue;
+        }
+        let description = field("Description:");
+        let card = property("device.description");
+        let card = if card.is_empty() {
+            description.clone()
+        } else {
+            card
+        };
+        let active = field("Active Port:");
+        // Port lines sit between "Ports:" and the next top-level field, indented by two tabs.
+        let mut ports = Vec::new();
+        let mut in_ports = false;
+        for line in &block {
+            if line.trim_start() == "Ports:" {
+                in_ports = true;
+                continue;
             }
-            Some(AudioDevice {
-                name: name.into(),
-                description: name.replace('_', " "),
+            if in_ports {
+                if !line.starts_with("\t\t") {
+                    break;
+                }
+                let entry = line.trim();
+                let Some((port, rest)) = entry.split_once(": ") else {
+                    continue;
+                };
+                if port.contains(' ') && !port.starts_with('[') {
+                    continue; // a property line of the previous port, not a port
+                }
+                // The trailing "(type: …, priority: …, availability)" is metadata; labels may contain "(" too.
+                let label = rest
+                    .rfind(" (")
+                    .filter(|i| rest[*i..].contains("priority"))
+                    .map_or(rest, |i| &rest[..i])
+                    .trim()
+                    .to_string();
+                let unavailable =
+                    rest.contains("not available") && !rest.contains("availability unknown");
+                if !unavailable || port == active {
+                    ports.push((port.to_string(), label));
+                }
+            }
+        }
+        if ports.is_empty() {
+            devices.push(AudioDevice {
                 is_default: name == default,
-            })
-        })
-        .collect()
+                description: if description.is_empty() {
+                    name.replace('_', " ")
+                } else {
+                    description
+                },
+                name,
+                port: None,
+            });
+            continue;
+        }
+        for (port, label) in ports {
+            devices.push(AudioDevice {
+                is_default: name == default && port == active,
+                description: if card.is_empty() {
+                    label
+                } else {
+                    format!("{label} - {card}")
+                },
+                name: name.clone(),
+                port: Some(port),
+            });
+        }
+    }
+    devices
 }
 
 fn parse_alsa_devices(text: &str, direction: &str) -> Vec<AudioDevice> {
@@ -1628,6 +1914,7 @@ fn parse_alsa_devices(text: &str, direction: &str) -> Vec<AudioDevice> {
                 name,
                 description: description.to_string(),
                 is_default: false,
+                port: None,
             })
         })
         .collect()
@@ -1646,8 +1933,8 @@ if command -v pactl >/dev/null 2>&1; then
   printf '\nSOURCE_DEFAULT='; pactl get-default-source 2>/dev/null || true
   printf '\nSINK_VOLUME='; pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null | grep -oE '[0-9]+%' | head -n 1 | tr -d '%' || true
   printf '\nSOURCE_VOLUME='; pactl get-source-volume @DEFAULT_SOURCE@ 2>/dev/null | grep -oE '[0-9]+%' | head -n 1 | tr -d '%' || true
-  printf '\nSINKS\n'; pactl list short sinks 2>/dev/null || true
-  printf '\nSOURCES\n'; pactl list short sources 2>/dev/null || true
+  printf '\nSINKS\n'; LC_ALL=C pactl list sinks 2>/dev/null || true
+  printf '\nSOURCES\n'; LC_ALL=C pactl list sources 2>/dev/null || true
 else
   printf 'PULSE_AVAILABLE=0\n'
 fi
@@ -1719,7 +2006,13 @@ pub fn set_audio_default(
     target_id: String,
     kind: String,
     device: String,
+    port: Option<String>,
 ) -> Result<(), String> {
+    if let Some(port) = &port {
+        if port.is_empty() || port.len() > 256 || port.chars().any(char::is_control) {
+            return Err("音频端口标识无效".into());
+        }
+    }
     if !["sink", "source"].contains(&kind.as_str()) {
         return Err("音频类型无效".into());
     }
@@ -1740,7 +2033,14 @@ pub fn set_audio_default(
     ssh::remote_command(
         &state,
         &target,
-        &format!("pactl set-default-{kind} {}", ssh::shell_quote(&device)),
+        &match &port {
+            Some(port) => format!(
+                "pactl set-default-{kind} {d} && pactl set-{kind}-port {d} {p}",
+                d = ssh::shell_quote(&device),
+                p = ssh::shell_quote(port)
+            ),
+            None => format!("pactl set-default-{kind} {}", ssh::shell_quote(&device)),
+        },
     )?;
     Ok(())
 }
@@ -1829,6 +2129,96 @@ pub fn close_ssh_terminal(state: State<'_, AppState>, session_id: String) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wifi_scan_keeps_cached_rows_when_rescan_is_refused() {
+        let ok = parse_wifi_scan("APS\n*:Lab\\:Robot:80:WPA2\n:Guest:40:\n");
+        assert_eq!(ok.networks.len(), 2);
+        assert!(ok.warning.is_none());
+        let denied = parse_wifi_scan(
+            "RESCAN_ERR Error: Scanning not allowed: Not authorized to request a Wi-Fi scan.\nAPS\n:Guest:40:\n",
+        );
+        assert_eq!(denied.networks.len(), 1);
+        assert!(denied.needs_sudo);
+        let w = denied.warning.unwrap();
+        assert!(w.contains("缓存") && w.contains("sudo 密码"));
+        assert!(!parse_wifi_scan("RESCAN_ERR Error: Scanning not allowed immediately following previous scan.\nAPS\n").needs_sudo);
+    }
+
+    #[test]
+    fn bluetooth_output_reports_permission_problems_instead_of_powered_off() {
+        let denied = parse_bluetooth_output(
+            "SHOW\nAccess denied: org.freedesktop.DBus.Error.AccessDenied\n\nINFO\n",
+        );
+        assert!(!denied.available);
+        assert!(denied.note.unwrap().contains("bluetooth 组"));
+        let none = parse_bluetooth_output("SHOW\nNo default controller available\n\nINFO\n");
+        assert!(none.note.unwrap().contains("没有可用的蓝牙适配器"));
+        let ok = parse_bluetooth_output(
+            "SCAN\n\nSHOW\nController AA:BB:CC:DD:EE:FF (public)\n\tPowered: yes\n\nINFO\n@@DEV 11:22:33:44:55:66\nDevice 11:22:33:44:55:66 (public)\n\tName: Speaker\n\tPaired: yes\n\tConnected: yes\n@@DEV 77:88:99:AA:BB:CC\nDevice 77:88:99:AA:BB:CC\n\tAlias: 77-88\n\tPaired: no\n",
+        );
+        assert!(ok.available && ok.powered && ok.note.is_none());
+        assert_eq!(ok.adapter, "AA:BB:CC:DD:EE:FF");
+        assert_eq!(ok.devices.len(), 2);
+        assert_eq!(ok.devices[0].name, "Speaker");
+        assert!(ok.devices[0].paired && ok.devices[0].connected);
+        assert!(!ok.devices[1].paired);
+        let scan_failed = parse_bluetooth_output(
+            "SCAN\nFailed to start discovery: org.bluez.Error.NotReady\nSHOW\nController AA:BB:CC:DD:EE:FF (public)\n\tPowered: yes\n\nINFO\n",
+        );
+        assert!(scan_failed.note.unwrap().contains("扫描未完成"));
+    }
+
+    #[test]
+    fn wifi_password_is_only_taken_from_the_marked_line() {
+        // Simulate the stdin RoboLink sends when sudo does not read its password line (NOPASSWD).
+        let script = "WP=''; while IFS= read -r L; do case \"$L\" in SECRET:*) WP=${L#SECRET:}; break;; esac; done; printf '%s' \"$WP\"";
+        let out = std::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(b"sudo-pass\nSECRET:wifi pass\n")?;
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "wifi pass");
+    }
+
+    #[test]
+    fn pactl_devices_are_labelled_like_system_settings() {
+        let sinks = "Sink #47\n\tState: SUSPENDED\n\tName: alsa_output.usb-Generic_USB_Audio-00.analog-stereo\n\tDescription: USB Audio Analog Stereo\n\tProperties:\n\t\tdevice.description = \"USB Audio\"\n\t\tdevice.class = \"sound\"\n\tPorts:\n\t\tanalog-output-headphones: Headphones (type: Headphones, priority: 9900, availability unknown)\n\t\tiec958-stereo-output: Digital Output (S/PDIF) (type: SPDIF, priority: 0, availability unknown)\n\t\tanalog-output-lineout: Line Out (type: Line, priority: 9000, not available)\n\tActive Port: analog-output-headphones\n\tFormats:\n\t\tpcm\nSink #48\n\tName: bluez_output.AA_BB.1\n\tDescription: MAXHUB BM31 BT1\n\tProperties:\n\t\tdevice.description = \"MAXHUB BM31 BT1\"\n\tPorts:\n\t\theadphone-output: 耳机 (type: Headphones, priority: 0, available)\n\tActive Port: headphone-output\n";
+        let devices = parse_pactl_devices(sinks, "bluez_output.AA_BB.1");
+        let labels: Vec<_> = devices.iter().map(|d| d.description.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Headphones - USB Audio",
+                "Digital Output (S/PDIF) - USB Audio",
+                "耳机 - MAXHUB BM31 BT1"
+            ]
+        );
+        assert!(devices[2].is_default && !devices[0].is_default);
+        assert_eq!(devices[1].port.as_deref(), Some("iec958-stereo-output"));
+        let sources = "Source #1\n\tName: alsa_output.x.monitor\n\tDescription: Monitor of X\n\tProperties:\n\t\tdevice.class = \"monitor\"\nSource #2\n\tName: alsa_input.y\n\tDescription: Built-in Audio Analog Stereo\n";
+        let inputs = parse_pactl_devices(sources, "alsa_input.y");
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].description, "Built-in Audio Analog Stereo");
+        assert!(inputs[0].is_default);
+    }
+
+    #[test]
+    fn sudo_retry_wraps_interactive_command_once() {
+        let s = with_sudo_retry("nmcli --ask device wifi connect 'Lab'");
+        assert!(s.starts_with("nmcli --ask device wifi connect 'Lab'; rc=$?"));
+        assert!(s.contains("read _ && sudo nmcli --ask device wifi connect 'Lab'; fi"));
+    }
+
     #[test]
     fn nmcli_escaped_fields_parse_without_splitting_ssid_colons() {
         let fields = parse_nmcli("*:Lab\\:Robot:80:WPA2");

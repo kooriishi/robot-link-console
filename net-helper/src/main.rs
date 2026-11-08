@@ -1541,11 +1541,7 @@ fn add_address(interface: &str, cidr: &str, peer_text: &str) -> Result<(), Strin
     let cidr_arg = format!("{local}/{prefix}");
     let via_nm = nm_manages(interface);
     if via_nm {
-        let mut addresses = nm_profile_addresses(interface).unwrap_or_default();
-        if !addresses.contains(&cidr_arg) {
-            addresses.push(cidr_arg.clone());
-        }
-        nm_apply_profile(interface, &addresses)?;
+        nm_add_address(interface, &cidr_arg)?;
     } else {
         let output = ip_command(&["address", "add", &cidr_arg, "dev", interface])?;
         if !output.status.success() {
@@ -1713,32 +1709,52 @@ fn nm_apply_profile(interface: &str, addresses: &[String]) -> Result<(), String>
     Ok(())
 }
 
+/// Adds an address to RoboLink's in-memory NetworkManager profile for this interface (creating and
+/// activating it if needed). Prints nothing, so DHCP commands can keep stdout for JSON.
+fn nm_add_address(interface: &str, cidr: &str) -> Result<(), String> {
+    let mut addresses = nm_profile_addresses(interface).unwrap_or_default();
+    if !addresses.iter().any(|item| item == cidr) {
+        addresses.push(cidr.to_string());
+    }
+    nm_apply_profile(interface, &addresses)
+}
+
+/// Removes an address from RoboLink's NM profile; Ok(false) when the profile does not hold it.
+fn nm_remove_address(interface: &str, cidr: &str) -> Result<bool, String> {
+    let Some(addresses) = nm_profile_addresses(interface) else {
+        return Ok(false);
+    };
+    if !addresses.iter().any(|item| item == cidr) {
+        return Ok(false);
+    }
+    let remaining = addresses
+        .into_iter()
+        .filter(|item| item != cidr)
+        .collect::<Vec<_>>();
+    if remaining.is_empty() {
+        let out = nmcli(&["connection", "delete", &nm_profile_name(interface)])?;
+        if !out.status.success() {
+            return Err(format!(
+                "删除 NetworkManager 临时连接失败：{}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    } else {
+        nm_apply_profile(interface, &remaining)?;
+    }
+    Ok(true)
+}
+
 fn remove_address(interface: &str, cidr: &str) -> Result<(), String> {
     validate_ifname(interface)?;
     let (address, prefix) = parse_cidr(cidr)?;
     let cidr_text = format!("{address}/{prefix}");
-    if let Some(addresses) = nm_profile_addresses(interface) {
-        if addresses.contains(&cidr_text) {
-            let remaining = addresses
-                .into_iter()
-                .filter(|item| *item != cidr_text)
-                .collect::<Vec<_>>();
-            let name = nm_profile_name(interface);
-            if remaining.is_empty() {
-                let out = nmcli(&["connection", "delete", &name])?;
-                if !out.status.success() {
-                    return Err(format!(
-                        "删除 NetworkManager 临时连接失败：{}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ));
-                }
-                println!("已删除 NetworkManager 临时连接“{name}”（{cidr_text}）；该网口将恢复原来的连接，其他网络未修改。\n");
-            } else {
-                nm_apply_profile(interface, &remaining)?;
-                println!("已从 NetworkManager 临时连接“{name}”移除 {cidr_text}；其他地址和默认路由未修改。\n");
-            }
-            return Ok(());
-        }
+    if nm_remove_address(interface, &cidr_text)? {
+        println!(
+            "已从 NetworkManager 临时连接“{}”移除 {cidr_text}；其他网络未修改。\n",
+            nm_profile_name(interface)
+        );
+        return Ok(());
     }
     let current = all_ipv4_addresses()?;
     let exact = current
