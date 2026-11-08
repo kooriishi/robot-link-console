@@ -2604,7 +2604,7 @@ dependencies = [
 
 [[package]]
 name = "robot-link-console"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "dirs 6.0.0",
  "futures-util",

@@ -390,11 +390,15 @@ for AUTH in guess none; do
       echo "OK PORT=$PORT PID=$PID"; exit 0
     fi
     sleep 0.5
+    # x11vnc already gave up (e.g. no permission for the X cookie): don't wait out the loop.
+    [ "$i" -ge 2 ] && ! pgrep -f "rfbport $PORT" >/dev/null 2>&1 && break
   done
   rm -f "$PF"
 done
 echo ERR=START
-tail -n 6 "$LOG" 2>/dev/null
+echo "UID=$(id -u)"
+# Keep the lines that explain why (auth/display/root), not just the generic help at the end.
+{{ grep -iE 'auth|xopendisplay|display|root|permission|refused|error|fail' "$LOG" | tail -n 6; tail -n 2 "$LOG"; }} 2>/dev/null
 exit 6"#
     )
 }
@@ -425,11 +429,21 @@ fn start_failure(output: &str) -> String {
     }
     let log = output
         .lines()
-        .filter(|l| !l.starts_with("ERR="))
+        .filter(|l| !l.starts_with("ERR=") && !l.starts_with("UID="))
         .collect::<Vec<_>>()
         .join(" ");
     let lower = log.to_ascii_lowercase();
-    if lower.contains("xopendisplay") || lower.contains("authorization") || lower.contains("-auth")
+    let as_root = output.lines().any(|l| l.trim() == "UID=0");
+    // Without sudo, any failure to open the display is almost always the desktop's X cookie being
+    // readable only by root (display manager) or by the desktop's own user; retry with sudo then.
+    if !as_root
+        && (lower.contains("xopendisplay")
+            || lower.contains("authorization")
+            || lower.contains("-auth")
+            || lower.contains("as root")
+            || lower.contains("read permission")
+            || lower.contains("no protocol specified")
+            || lower.contains("unable to open"))
     {
         return format!(
             "{}x11vnc 无法打开开发板桌面（没有读取桌面授权的权限）：{}",
@@ -782,6 +796,16 @@ mod tests {
         assert!(parse_start("OK PORT=22 PID=1\n").is_err());
         let err = parse_start("ERR=START\n08/11 XOpenDisplay(\":0\") failed.\n").unwrap_err();
         assert!(err.starts_with(ssh::SUDO_MARK));
+        // The exact message from an RDK board: the display manager's cookie is root-only.
+        let root_only = "ERR=START\nUID=1000\nOnly root will have read permission for the file, and so x11vnc must be run as root (or copy it).\n";
+        assert!(parse_start(root_only)
+            .unwrap_err()
+            .starts_with(ssh::SUDO_MARK));
+        // Already running under sudo: report the error instead of asking for the password again.
+        let as_root = "ERR=START\nUID=0\nXOpenDisplay(\":0\") failed.\n";
+        assert!(!parse_start(as_root)
+            .unwrap_err()
+            .starts_with(ssh::SUDO_MARK));
         assert!(parse_start("ERR=NO_X11VNC\n")
             .unwrap_err()
             .contains("没有安装 x11vnc"));
