@@ -33,7 +33,8 @@ type RemoteNetwork = { supported: boolean; wifiEnabled: boolean; devices: Networ
 type BluetoothDevice = { address: string; name: string; paired: boolean; connected: boolean; trusted: boolean }
 type BluetoothSnapshot = { available: boolean; powered: boolean; adapter: string; devices: BluetoothDevice[]; note?: string | null; needsSudo?: boolean }
 type WifiScanResult = { networks: WifiNetwork[]; warning?: string | null; needsSudo?: boolean }
-type AudioDevice = { name: string; description: string; isDefault: boolean }
+type AudioDevice = { name: string; description: string; isDefault: boolean; port?: string | null }
+const audioKey = (d: AudioDevice) => `${d.name}#${d.port ?? ''}`
 type AudioSnapshot = { available: boolean; sinks: AudioDevice[]; sources: AudioDevice[]; alsaPlayback: AudioDevice[]; alsaCapture: AudioDevice[]; defaultSinkVolume?: number; defaultSourceVolume?: number; note?: string }
 type AppLog = { at: string; text: string; tone: 'ok' | 'warn' | 'info' }
 type Confirm = { title: string; description: string; danger?: boolean; run: () => Promise<void> }
@@ -540,9 +541,11 @@ export default function RealApp() {
       log(`蓝牙设备 ${device.name}：${action}`); setRefreshCount(n => n + 1)
     })
   }
-  const setDefaultAudio = async (kind: 'sink' | 'source', device: string) => {
-    if (!selected) return
-    await withBusy(async () => { await invoke('set_audio_default', { targetId: selected.id, kind, device }); log(`已设置机器人音频${kind === 'sink' ? '输出' : '输入'}：${device}`, 'ok'); setRefreshCount(n => n + 1) })
+  const setDefaultAudio = async (kind: 'sink' | 'source', key: string) => {
+    const [device, port] = [key.slice(0, key.lastIndexOf('#')), key.slice(key.lastIndexOf('#') + 1)]
+    if (!selected || !device) return
+    const label = (kind === 'sink' ? audio?.sinks : audio?.sources)?.find(d => audioKey(d) === key)?.description ?? device
+    await withBusy(async () => { await invoke('set_audio_default', { targetId: selected.id, kind, device, port: port || null }); log(`已设置机器人音频${kind === 'sink' ? '输出' : '输入'}：${label}`, 'ok'); setRefreshCount(n => n + 1) })
   }
   const commitAudioVolume = async (kind: 'sink' | 'source', device: string, volume: number) => {
     if (!selected) return
@@ -654,7 +657,7 @@ function NetworkPage({ hostInfo, interfaces, selectedInterface, setSelectedInter
 function InfoRow({ label, value }: { label: string; value: string }) { return <div className="info-row"><span>{label}</span><strong>{value}</strong></div> }
 
 function ServicesPage({ services, query, setQuery, onAction, busy, scope, setScope, loading }: { services: Service[]; query: string; setQuery: (v: string) => void; onAction: (s: Service, a: 'start'|'stop'|'restart') => void; busy: boolean; scope: ServiceScope; setScope: (s: ServiceScope) => void; loading: boolean }) {
-  return <div className="page-stack"><div className="summary-strip"><span className="summary-dot ok"/><strong>{services.filter(s => s.active === 'active').length} 个运行中</strong><span className="summary-separator"/><span className="summary-dot warn"/><strong>{services.filter(s => s.active !== 'active').length} 个非运行状态</strong><span className="service-scope"><button className={`button button-subtle ${scope === 'system' ? 'active' : ''}`} onClick={() => setScope('system')} disabled={loading && scope !== 'system'}>系统服务</button><button className={`button button-subtle ${scope === 'user' ? 'active' : ''}`} onClick={() => setScope('user')} disabled={loading && scope !== 'user'}>用户服务 --user</button></span><span className="summary-note">{scope === 'user' ? 'systemctl --user' : 'systemctl'} · 真实设备</span></div><section className="panel service-list-panel"><div className="list-toolbar"><div className="search-input"><Search size={15}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="筛选服务…" aria-label="筛选服务"/></div><span className="small-muted">{services.length} 个服务</span></div>{!services.length ? <EmptyState text="没有服务数据。请先核验 SSH 主机指纹，并确认机器人运行 systemd。"/> : services.map(service => <div className="service-detail-row" key={service.name}><div className={`service-icon ${service.active === 'active' ? 'is-running' : 'is-stopped'}`}><Zap size={16}/></div><div className="service-detail-copy"><strong>{service.name}</strong><small>{service.description}</small></div><span className={`state-label ${service.active === 'active' ? 'state-ok' : 'state-down'}`}><i/>{service.active} · {service.subState}</span><span className={`autostart ${service.enabled === 'enabled' ? 'enabled' : ''}`}>{service.enabled}</span><div className="service-action-set">{service.active === 'active' ? <button className="button button-subtle" onClick={() => onAction(service,'stop')} disabled={busy}><Power size={14}/>停止</button> : <button className="button button-subtle" onClick={() => onAction(service,'start')} disabled={busy}><Play size={14}/>启动</button>}<button className="button button-subtle" onClick={() => onAction(service,'restart')} disabled={busy}><RefreshCw size={14}/>重启</button></div></div>)}</section><div className="subtle-callout"><AlertTriangle size={16}/><span>系统服务操作先以当前 SSH 用户执行；权限不足时会弹窗请你输入机器人的 sudo 密码（只保存在内存中，断开 SSH 即清除）。用户服务（--user）无需 sudo。</span></div></div>
+  return <div className="page-stack"><div className="summary-strip"><span className="summary-dot ok"/><strong>{services.filter(s => s.active === 'active').length} 个运行中</strong><span className="summary-separator"/><span className="summary-dot warn"/><strong>{services.filter(s => s.active !== 'active').length} 个非运行状态</strong><span className="service-scope"><button className={`button button-subtle ${scope === 'system' ? 'active' : ''}`} onClick={() => setScope('system')} disabled={loading && scope !== 'system'}>系统服务</button><button className={`button button-subtle ${scope === 'user' ? 'active' : ''}`} onClick={() => setScope('user')} disabled={loading && scope !== 'user'}>用户服务</button></span><span className="summary-note">{scope === 'user' ? 'systemctl --user' : 'systemctl'} · 真实设备</span></div><section className="panel service-list-panel"><div className="list-toolbar"><div className="search-input"><Search size={15}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="筛选服务…" aria-label="筛选服务"/></div><span className="small-muted">{services.length} 个服务</span></div>{!services.length ? <EmptyState text="没有服务数据。请先核验 SSH 主机指纹，并确认机器人运行 systemd。"/> : services.map(service => <div className="service-detail-row" key={service.name}><div className={`service-icon ${service.active === 'active' ? 'is-running' : 'is-stopped'}`}><Zap size={16}/></div><div className="service-detail-copy"><strong>{service.name}</strong><small>{service.description}</small></div><span className={`state-label ${service.active === 'active' ? 'state-ok' : 'state-down'}`}><i/>{service.active} · {service.subState}</span><span className={`autostart ${service.enabled === 'enabled' ? 'enabled' : ''}`}>{service.enabled}</span><div className="service-action-set">{service.active === 'active' ? <button className="button button-subtle" onClick={() => onAction(service,'stop')} disabled={busy}><Power size={14}/>停止</button> : <button className="button button-subtle" onClick={() => onAction(service,'start')} disabled={busy}><Play size={14}/>启动</button>}<button className="button button-subtle" onClick={() => onAction(service,'restart')} disabled={busy}><RefreshCw size={14}/>重启</button></div></div>)}</section><div className="subtle-callout"><AlertTriangle size={16}/><span>系统服务操作先以当前 SSH 用户执行；权限不足时会弹窗请你输入机器人的 sudo 密码（只保存在内存中，断开 SSH 即清除）。用户服务（--user）无需 sudo。</span></div></div>
 }
 
 function BluetoothPage({ snapshot, onScan, onTogglePower, onAction, busy, scanning }: { snapshot: BluetoothSnapshot | null; onScan: () => void; onTogglePower: (enabled: boolean) => void; onAction: (device: BluetoothDevice, action: string) => void; busy: boolean; scanning: boolean }) {
@@ -681,24 +684,27 @@ function BluetoothPage({ snapshot, onScan, onTogglePower, onAction, busy, scanni
 
 function AudioPage({ snapshot, sourceVolume, sinkVolume, setSourceVolume, setSinkVolume, onDefault, onVolume, onTest, busy }: { snapshot: AudioSnapshot | null; sourceVolume: number; sinkVolume: number; setSourceVolume: (n: number) => void; setSinkVolume: (n: number) => void; onDefault: (kind: 'sink' | 'source', device: string) => void; onVolume: (kind: 'sink' | 'source', device: string, volume: number) => void; onTest: () => void; busy: boolean }) {
   if (!snapshot) return <div className="page-stack"><section className="panel detail-panel"><EmptyState text="连接机器人后读取音频服务器设备。"/></section></div>
-  const currentSink = snapshot.sinks.find(d => d.isDefault)?.name ?? snapshot.sinks[0]?.name ?? ''
-  const currentSource = snapshot.sources.find(d => d.isDefault)?.name ?? snapshot.sources[0]?.name ?? ''
+  const sinkEntry = snapshot.sinks.find(d => d.isDefault) ?? snapshot.sinks[0]
+  const sourceEntry = snapshot.sources.find(d => d.isDefault) ?? snapshot.sources[0]
+  // Volume is per sink/source; the selector is per port, labelled like the system settings.
+  const currentSink = sinkEntry?.name ?? ''
+  const currentSource = sourceEntry?.name ?? ''
   return <div className="page-stack">
     {snapshot.available ? <div className="audio-grid">
     <section className="panel audio-card">
       <div className="audio-title"><div className="heading-icon mic-bg"><Mic size={18}/></div><div><div className="section-kicker">INPUT · PULSEAUDIO / PIPEWIRE</div><h2>麦克风</h2></div></div>
-      <div className="audio-device-display"><div className="audio-device-icon"><Mic size={23}/></div><div><strong>{currentSource || '无默认输入'}</strong><small>机器人默认输入设备</small></div></div>
+      <div className="audio-device-display"><div className="audio-device-icon"><Mic size={23}/></div><div><strong>{sourceEntry?.description || '无默认输入'}</strong><small>机器人默认输入设备</small></div></div>
       <label className="field-label">输入设备</label>
-      <select value={currentSource} onChange={e => onDefault('source', e.target.value)} disabled={busy}><option value="">选择输入设备</option>{snapshot.sources.map(d => <option value={d.name} key={d.name}>{d.description}{d.isDefault ? ' · 当前默认' : ''}</option>)}</select>
+      <select value={sourceEntry ? audioKey(sourceEntry) : ''} onChange={e => onDefault('source', e.target.value)} disabled={busy}><option value="">选择输入设备</option>{snapshot.sources.map(d => <option value={audioKey(d)} key={audioKey(d)}>{d.description}{d.isDefault ? ' · 当前默认' : ''}</option>)}</select>
       <div className="volume-label"><span>输入增益</span><strong>{sourceVolume}%</strong></div>
       <input className="volume-slider" type="range" min="0" max="150" value={sourceVolume} onChange={e => setSourceVolume(Number(e.target.value))} onPointerUp={() => currentSource && onVolume('source', currentSource, sourceVolume)} onKeyUp={() => currentSource && onVolume('source', currentSource, sourceVolume)} disabled={busy || !currentSource} aria-label="麦克风输入增益"/>
       <div className="audio-card-bottom"><span>通过 pactl 控制 · 不采集音频</span><button className="button button-subtle" onClick={() => notifyAudioNote()}><Activity size={14}/>输入说明</button></div>
     </section>
     <section className="panel audio-card">
       <div className="audio-title"><div className="heading-icon speaker-bg"><AudioLines size={18}/></div><div><div className="section-kicker">OUTPUT · PULSEAUDIO / PIPEWIRE</div><h2>扬声器</h2></div></div>
-      <div className="audio-device-display"><div className="audio-device-icon speaker-icon"><Headphones size={23}/></div><div><strong>{currentSink || '无默认输出'}</strong><small>机器人默认输出设备</small></div></div>
+      <div className="audio-device-display"><div className="audio-device-icon speaker-icon"><Headphones size={23}/></div><div><strong>{sinkEntry?.description || '无默认输出'}</strong><small>机器人默认输出设备</small></div></div>
       <label className="field-label">输出设备</label>
-      <select value={currentSink} onChange={e => onDefault('sink', e.target.value)} disabled={busy}><option value="">选择输出设备</option>{snapshot.sinks.map(d => <option value={d.name} key={d.name}>{d.description}{d.isDefault ? ' · 当前默认' : ''}</option>)}</select>
+      <select value={sinkEntry ? audioKey(sinkEntry) : ''} onChange={e => onDefault('sink', e.target.value)} disabled={busy}><option value="">选择输出设备</option>{snapshot.sinks.map(d => <option value={audioKey(d)} key={audioKey(d)}>{d.description}{d.isDefault ? ' · 当前默认' : ''}</option>)}</select>
       <div className="volume-label"><span>输出音量</span><strong>{sinkVolume}%</strong></div>
       <input className="volume-slider" type="range" min="0" max="150" value={sinkVolume} onChange={e => setSinkVolume(Number(e.target.value))} onPointerUp={() => currentSink && onVolume('sink', currentSink, sinkVolume)} onKeyUp={() => currentSink && onVolume('sink', currentSink, sinkVolume)} disabled={busy || !currentSink} aria-label="扬声器音量"/>
       <div className="audio-card-bottom"><span>测试音会在机器人扬声器播放</span><button className="button button-primary" onClick={onTest} disabled={busy || !currentSink}><Play size={14}/>播放测试音</button></div>

@@ -231,6 +231,8 @@ pub struct AudioDevice {
     pub name: String,
     pub description: String,
     pub is_default: bool,
+    /// PulseAudio/PipeWire port of this sink/source; the system settings list one entry per port.
+    pub port: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -1781,24 +1781,109 @@ pub fn bluetooth_action(
     }
 }
 
+/// Parses `pactl list sinks|sources` the way GNOME/Ubuntu Settings presents them: one entry per
+/// available port, labelled "<port description> - <card description>" (e.g. "Headphones - USB Audio"),
+/// falling back to the sink/source Description when it has no ports. Monitor sources are skipped.
 fn parse_pactl_devices(text: &str, default: &str) -> Vec<AudioDevice> {
-    text.lines()
-        .filter_map(|line| {
-            let fields: Vec<_> = line.split('\t').collect();
-            if fields.len() < 2 {
-                return None;
+    let mut devices = Vec::new();
+    let blocks = text
+        .split('\n')
+        .fold(Vec::<Vec<&str>>::new(), |mut acc, line| {
+            if line.starts_with("Sink #") || line.starts_with("Source #") {
+                acc.push(Vec::new());
+            } else if let Some(block) = acc.last_mut() {
+                block.push(line);
             }
-            let name = fields[1].trim();
-            if name.is_empty() {
-                return None;
+            acc
+        });
+    for block in blocks {
+        let field = |key: &str| {
+            block
+                .iter()
+                .find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()))
+                .unwrap_or_default()
+        };
+        let property = |key: &str| {
+            block
+                .iter()
+                .find_map(|l| {
+                    let (k, v) = l.trim().split_once(" = ")?;
+                    (k == key).then(|| v.trim().trim_matches('"').to_string())
+                })
+                .unwrap_or_default()
+        };
+        let name = field("Name:");
+        if name.is_empty() || name.ends_with(".monitor") || property("device.class") == "monitor" {
+            continue;
+        }
+        let description = field("Description:");
+        let card = property("device.description");
+        let card = if card.is_empty() {
+            description.clone()
+        } else {
+            card
+        };
+        let active = field("Active Port:");
+        // Port lines sit between "Ports:" and the next top-level field, indented by two tabs.
+        let mut ports = Vec::new();
+        let mut in_ports = false;
+        for line in &block {
+            if line.trim_start() == "Ports:" {
+                in_ports = true;
+                continue;
             }
-            Some(AudioDevice {
-                name: name.into(),
-                description: name.replace('_', " "),
+            if in_ports {
+                if !line.starts_with("\t\t") {
+                    break;
+                }
+                let entry = line.trim();
+                let Some((port, rest)) = entry.split_once(": ") else {
+                    continue;
+                };
+                if port.contains(' ') && !port.starts_with('[') {
+                    continue; // a property line of the previous port, not a port
+                }
+                // The trailing "(type: …, priority: …, availability)" is metadata; labels may contain "(" too.
+                let label = rest
+                    .rfind(" (")
+                    .filter(|i| rest[*i..].contains("priority"))
+                    .map_or(rest, |i| &rest[..i])
+                    .trim()
+                    .to_string();
+                let unavailable =
+                    rest.contains("not available") && !rest.contains("availability unknown");
+                if !unavailable || port == active {
+                    ports.push((port.to_string(), label));
+                }
+            }
+        }
+        if ports.is_empty() {
+            devices.push(AudioDevice {
                 is_default: name == default,
-            })
-        })
-        .collect()
+                description: if description.is_empty() {
+                    name.replace('_', " ")
+                } else {
+                    description
+                },
+                name,
+                port: None,
+            });
+            continue;
+        }
+        for (port, label) in ports {
+            devices.push(AudioDevice {
+                is_default: name == default && port == active,
+                description: if card.is_empty() {
+                    label
+                } else {
+                    format!("{label} - {card}")
+                },
+                name: name.clone(),
+                port: Some(port),
+            });
+        }
+    }
+    devices
 }
 
 fn parse_alsa_devices(text: &str, direction: &str) -> Vec<AudioDevice> {
@@ -1829,6 +1914,7 @@ fn parse_alsa_devices(text: &str, direction: &str) -> Vec<AudioDevice> {
                 name,
                 description: description.to_string(),
                 is_default: false,
+                port: None,
             })
         })
         .collect()
@@ -1847,8 +1933,8 @@ if command -v pactl >/dev/null 2>&1; then
   printf '\nSOURCE_DEFAULT='; pactl get-default-source 2>/dev/null || true
   printf '\nSINK_VOLUME='; pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null | grep -oE '[0-9]+%' | head -n 1 | tr -d '%' || true
   printf '\nSOURCE_VOLUME='; pactl get-source-volume @DEFAULT_SOURCE@ 2>/dev/null | grep -oE '[0-9]+%' | head -n 1 | tr -d '%' || true
-  printf '\nSINKS\n'; pactl list short sinks 2>/dev/null || true
-  printf '\nSOURCES\n'; pactl list short sources 2>/dev/null || true
+  printf '\nSINKS\n'; LC_ALL=C pactl list sinks 2>/dev/null || true
+  printf '\nSOURCES\n'; LC_ALL=C pactl list sources 2>/dev/null || true
 else
   printf 'PULSE_AVAILABLE=0\n'
 fi
@@ -1920,7 +2006,13 @@ pub fn set_audio_default(
     target_id: String,
     kind: String,
     device: String,
+    port: Option<String>,
 ) -> Result<(), String> {
+    if let Some(port) = &port {
+        if port.is_empty() || port.len() > 256 || port.chars().any(char::is_control) {
+            return Err("音频端口标识无效".into());
+        }
+    }
     if !["sink", "source"].contains(&kind.as_str()) {
         return Err("音频类型无效".into());
     }
@@ -1941,7 +2033,14 @@ pub fn set_audio_default(
     ssh::remote_command(
         &state,
         &target,
-        &format!("pactl set-default-{kind} {}", ssh::shell_quote(&device)),
+        &match &port {
+            Some(port) => format!(
+                "pactl set-default-{kind} {d} && pactl set-{kind}-port {d} {p}",
+                d = ssh::shell_quote(&device),
+                p = ssh::shell_quote(port)
+            ),
+            None => format!("pactl set-default-{kind} {}", ssh::shell_quote(&device)),
+        },
     )?;
     Ok(())
 }
@@ -2089,6 +2188,28 @@ mod tests {
             })
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "wifi pass");
+    }
+
+    #[test]
+    fn pactl_devices_are_labelled_like_system_settings() {
+        let sinks = "Sink #47\n\tState: SUSPENDED\n\tName: alsa_output.usb-Generic_USB_Audio-00.analog-stereo\n\tDescription: USB Audio Analog Stereo\n\tProperties:\n\t\tdevice.description = \"USB Audio\"\n\t\tdevice.class = \"sound\"\n\tPorts:\n\t\tanalog-output-headphones: Headphones (type: Headphones, priority: 9900, availability unknown)\n\t\tiec958-stereo-output: Digital Output (S/PDIF) (type: SPDIF, priority: 0, availability unknown)\n\t\tanalog-output-lineout: Line Out (type: Line, priority: 9000, not available)\n\tActive Port: analog-output-headphones\n\tFormats:\n\t\tpcm\nSink #48\n\tName: bluez_output.AA_BB.1\n\tDescription: MAXHUB BM31 BT1\n\tProperties:\n\t\tdevice.description = \"MAXHUB BM31 BT1\"\n\tPorts:\n\t\theadphone-output: 耳机 (type: Headphones, priority: 0, available)\n\tActive Port: headphone-output\n";
+        let devices = parse_pactl_devices(sinks, "bluez_output.AA_BB.1");
+        let labels: Vec<_> = devices.iter().map(|d| d.description.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Headphones - USB Audio",
+                "Digital Output (S/PDIF) - USB Audio",
+                "耳机 - MAXHUB BM31 BT1"
+            ]
+        );
+        assert!(devices[2].is_default && !devices[0].is_default);
+        assert_eq!(devices[1].port.as_deref(), Some("iec958-stereo-output"));
+        let sources = "Source #1\n\tName: alsa_output.x.monitor\n\tDescription: Monitor of X\n\tProperties:\n\t\tdevice.class = \"monitor\"\nSource #2\n\tName: alsa_input.y\n\tDescription: Built-in Audio Analog Stereo\n";
+        let inputs = parse_pactl_devices(sources, "alsa_input.y");
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].description, "Built-in Audio Analog Stereo");
+        assert!(inputs[0].is_default);
     }
 
     #[test]

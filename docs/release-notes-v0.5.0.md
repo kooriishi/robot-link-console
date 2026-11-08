@@ -29,3 +29,8 @@ package.json、tauri.conf.json、桌面程序与网络助手 Cargo 版本统一�
 ## v0.5.2
 
 - 修复：桌面显示点“全屏”会卡死甚至闪退。原因是网页全屏接口（Element.requestFullscreen）在 Tauri 的 WebKitGTK 里会卡住。现在改为让 RoboLink 窗口本身全屏，桌面画面铺满整个窗口；工具栏仍然可见，用“退出全屏”按钮、F11 或 Ctrl+Alt+Enter 切换。这两个快捷键由 RoboLink 截获，不会发给开发板。
+
+## v0.5.3
+
+- 音频设备页：输入、输出设备的名称和 Ubuntu 设置里一致，格式为“端口 - 声卡”，例如“Headphones - USB Audio”“耳机 - MAXHUB BM31 BT1”。同一声卡的每个可用端口单独列出，选择时会同时切换默认设备和端口。不显示 Monitor 类型的输入源。
+- 系统服务页：按钮“用户服务 --user”改为“用户服务”。
