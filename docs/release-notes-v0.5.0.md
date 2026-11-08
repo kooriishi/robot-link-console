@@ -25,3 +25,7 @@ package.json、tauri.conf.json、桌面程序与网络助手 Cargo 版本统一�
 
 - 修复：桌面的 X 授权文件只有 root 能读时（显示管理器以 root 运行，如 RDK 板），x11vnc 报 “Only root will have read permission…”，之前没有识别出来，所以没弹 sudo 密码框。现在会识别出这类错误，弹出 sudo 密码框，然后以 root 启动 x11vnc。如果已经在 sudo 下运行仍然失败，就直接报错，不会反复要密码。
 - x11vnc 启动失败时会马上返回，不再空等；错误信息只保留和授权、显示相关的日志行。
+
+## v0.5.2
+
+- 修复：桌面显示点“全屏”会卡死甚至闪退。原因是网页全屏接口（Element.requestFullscreen）在 Tauri 的 WebKitGTK 里会卡住。现在改为让 RoboLink 窗口本身全屏，桌面画面铺满整个窗口；工具栏仍然可见，用“退出全屏”按钮、F11 或 Ctrl+Alt+Enter 切换。这两个快捷键由 RoboLink 截获，不会发给开发板。

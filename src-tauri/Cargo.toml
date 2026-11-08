@@ -1,6 +1,6 @@
 [package]
 name = "robot-link-console"
-version = "0.5.1"
+version = "0.5.2"
 description = "Linux desktop console for headless robot debugging over direct Ethernet and SSH"
 authors = ["RoboLink contributors"]
 edition = "2021"

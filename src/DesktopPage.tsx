@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import {
   AlertTriangle, Check, ClipboardPaste, Download, Eye, Keyboard, LoaderCircle, Maximize2,
   Minimize2, Monitor, MonitorOff, Power, RefreshCw, ScanLine, X,
@@ -39,6 +40,8 @@ export function DesktopPage({ target, sshReady, active, runPrivileged, sudoPassw
   const [scale, setScale] = useState(true)
   const [viewOnly, setViewOnly] = useState(false)
   const [fullscreen, setFullscreen] = useState(false)
+  const fullscreenRef = useRef(false)
+  useEffect(() => { fullscreenRef.current = fullscreen }, [fullscreen])
   const screenRef = useRef<HTMLDivElement>(null)
   const frameRef = useRef<HTMLDivElement>(null)
   const rfbRef = useRef<RFBType | null>(null)
@@ -67,13 +70,26 @@ export function DesktopPage({ target, sshReady, active, runPrivileged, sudoPassw
 
   useEffect(() => { setCheck(null); setError(''); setPhase('idle'); return () => { void disconnect() } }, [target?.id])
   useEffect(() => { if (!sshReady && rfbRef.current) void disconnect('SSH 已断开') }, [sshReady])
-  useEffect(() => () => { rfbRef.current?.disconnect(); if (startedRef.current) void invoke('stop_remote_desktop', { sudoPassword: sudoPassword() || null }).catch(() => {}) }, [])
+  useEffect(() => () => { if (fullscreenRef.current) void getCurrentWindow().setFullscreen(false).catch(() => {}); rfbRef.current?.disconnect(); if (startedRef.current) void invoke('stop_remote_desktop', { sudoPassword: sudoPassword() || null }).catch(() => {}) }, [])
   useEffect(() => { if (rfbRef.current) rfbRef.current.scaleViewport = scale }, [scale])
   useEffect(() => { if (rfbRef.current) rfbRef.current.viewOnly = viewOnly }, [viewOnly])
+  // The DOM Fullscreen API hangs/crashes WebKitGTK inside Tauri; instead make the window fullscreen and
+  // pin the desktop frame over the whole page with CSS. F11 or Ctrl+Alt+Enter toggles it (captured
+  // before noVNC, so the key is not sent to the board).
+  const setWindowFullscreen = async (on: boolean) => {
+    setFullscreen(on)
+    try { await getCurrentWindow().setFullscreen(on) } catch (e) { if (on) setError(`窗口全屏失败，已改为铺满窗口：${errorText(e)}`) }
+    window.setTimeout(() => rfbRef.current?.focus(), 150)
+  }
   useEffect(() => {
-    const onChange = () => setFullscreen(document.fullscreenElement === frameRef.current)
-    document.addEventListener('fullscreenchange', onChange)
-    return () => document.removeEventListener('fullscreenchange', onChange)
+    const onKey = (event: KeyboardEvent) => {
+      const toggle = event.key === 'F11' || (event.ctrlKey && event.altKey && event.key === 'Enter')
+      if (!toggle || !rfbRef.current) return
+      event.preventDefault(); event.stopPropagation()
+      void setWindowFullscreen(!fullscreenRef.current)
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
   }, [])
 
   const install = async () => {
@@ -130,15 +146,11 @@ export function DesktopPage({ target, sshReady, active, runPrivileged, sudoPassw
       onLog(reason ? `桌面已断开：${reason}` : '已断开开发板桌面', reason ? 'warn' : 'info')
     }
     if (screenRef.current) screenRef.current.innerHTML = ''
-    if (document.fullscreenElement) void document.exitFullscreen().catch(() => {})
+    if (fullscreenRef.current) void setWindowFullscreen(false)
     setPhase('idle')
   }
 
-  const toggleFullscreen = () => {
-    if (document.fullscreenElement) void document.exitFullscreen().catch(() => {})
-    else void frameRef.current?.requestFullscreen().catch(e => setError(`无法进入全屏：${errorText(e)}`))
-    window.setTimeout(() => rfbRef.current?.focus(), 200)
-  }
+  const toggleFullscreen = () => { void setWindowFullscreen(!fullscreenRef.current) }
 
   const pasteClipboard = async () => {
     try { const text = await navigator.clipboard.readText(); if (text) { rfbRef.current?.clipboardPasteFrom(text); onLog('已把本机剪贴板发送到开发板') } }
@@ -187,7 +199,7 @@ export function DesktopPage({ target, sshReady, active, runPrivileged, sudoPassw
           <button className={`button button-subtle ${viewOnly ? 'active' : ''}`} onClick={() => setViewOnly(v => !v)} title="仅查看时不发送键鼠"><Eye size={14}/>仅查看</button>
           <button className="button button-subtle" onClick={() => void pasteClipboard()} disabled={!connected || viewOnly} title="把本机剪贴板文本发给开发板"><ClipboardPaste size={14}/>粘贴</button>
           <button className="button button-subtle" onClick={() => { rfbRef.current?.sendCtrlAltDel(); rfbRef.current?.focus() }} disabled={!connected || viewOnly}><Keyboard size={14}/>Ctrl+Alt+Del</button>
-          <button className="button button-subtle" onClick={toggleFullscreen} disabled={!connected}>{fullscreen ? <Minimize2 size={14}/> : <Maximize2 size={14}/>}{fullscreen ? '退出全屏' : '全屏'}</button>
+          <button className="button button-subtle" onClick={toggleFullscreen} disabled={!connected}>{fullscreen ? <Minimize2 size={14}/> : <Maximize2 size={14}/>}{fullscreen ? '退出全屏 (F11)' : '全屏'}</button>
           <button className="button button-danger" onClick={() => void disconnect()}><Power size={14}/>断开</button>
         </div>
       </div>

@@ -343,7 +343,7 @@ html[data-theme="light"] .discovered-row{border-bottom-color:#dce5e9}
 .desktop-check-copy strong{font-size:10px}.desktop-check-copy small{color:#8796a3;font-size:9px;line-height:1.55}
 .desktop-frame{position:relative;display:flex;flex-direction:column;height:calc(100vh - 230px);min-height:380px;border:1px solid #26323f;border-radius:9px;background:#05080c;overflow:hidden}
 .desktop-frame.is-hidden{display:none}
-.desktop-frame.is-fullscreen{height:100vh;border-radius:0;border:0}
+.desktop-frame.is-fullscreen{position:fixed;inset:0;z-index:80;height:auto;min-height:0;border-radius:0;border:0}
 .desktop-toolbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;border-bottom:1px solid #1f2a35;background:#0d141c}
 .desktop-title{display:flex;align-items:center;gap:7px;color:#c2ced6;font-size:10px}
 .desktop-tools{display:flex;flex-wrap:wrap;gap:6px}
