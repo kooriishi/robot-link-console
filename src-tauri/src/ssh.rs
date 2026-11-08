@@ -42,7 +42,7 @@ fn ssh_host(target: &Target) -> String {
     }
 }
 
-fn ssh_destination(target: &Target) -> String {
+pub(crate) fn ssh_destination(target: &Target) -> String {
     format!("{}@{}", target.username, ssh_host(target))
 }
 
@@ -246,7 +246,7 @@ pub fn connection_ready(state: &AppState, target: &Target) -> Result<bool, Strin
     Ok(output.status.success())
 }
 
-fn ssh_args(state: &AppState, target: &Target, tty: bool, batch: bool) -> Vec<String> {
+pub(crate) fn ssh_args(state: &AppState, target: &Target, tty: bool, batch: bool) -> Vec<String> {
     let socket = state
         .config_dir
         .join(format!("cm-{}", safe_socket_key(target)));
@@ -361,7 +361,7 @@ pub fn remote_command_with(
     if !secrets_ok(options.sudo_password) || !secrets_ok(options.stdin_line) {
         return Err("密码不能包含换行，且长度不超过 512".into());
     }
-    let seconds = options.timeout_secs.unwrap_or(18).clamp(5, 120);
+    let seconds = options.timeout_secs.unwrap_or(18).clamp(5, 600);
     let mut cmd = Command::new("ssh");
     cmd.args(ssh_args(state, target, false, true));
     cmd.arg(ssh_destination(target));
@@ -748,7 +748,7 @@ fn unreachable_hint_from_route(
     format!("{ip}:{port} 经 {dev} 在 5 秒内没有响应。请确认开发板 SSH 服务已启动、端口 {port} 正确，且防火墙未拦截。")
 }
 
-fn safe_stderr(input: &[u8]) -> String {
+pub(crate) fn safe_stderr(input: &[u8]) -> String {
     let mut s = String::from_utf8_lossy(input).trim().to_string();
     s = s
         .chars()

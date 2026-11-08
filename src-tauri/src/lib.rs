@@ -1,4 +1,5 @@
 mod commands;
+mod desktop;
 mod model;
 mod ssh;
 mod state;
@@ -53,7 +54,11 @@ pub fn run() {
             commands::open_ssh_terminal,
             commands::send_terminal_input,
             commands::resize_terminal,
-            commands::close_ssh_terminal
+            commands::close_ssh_terminal,
+            desktop::check_remote_desktop,
+            desktop::install_remote_desktop,
+            desktop::start_remote_desktop,
+            desktop::stop_remote_desktop
         ])
         .run(tauri::generate_context!())
         .expect("启动 RoboLink 桌面程序失败");

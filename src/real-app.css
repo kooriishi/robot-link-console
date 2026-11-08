@@ -325,3 +325,29 @@ html[data-theme="light"] .discovered-row{border-bottom-color:#dce5e9}
 .service-scope .button.active{border-color:var(--mint);color:var(--mint)}
 .form-field{display:block;margin:12px 0;color:#8697a5;font-size:9px}
 .sudo-backdrop{z-index:60}
+/* fit() measures the host's parent; keeping padding off the host stops the last row from being clipped
+   (with border-box sizing the parent's height included its padding). */
+.xterm-host{width:100%;height:100%;overflow:hidden}
+/* Remote desktop */
+.desktop-error{display:flex;align-items:center;gap:9px;padding:10px 12px;border:1px solid #5a3033;border-radius:8px;background:#2a1719;color:#f0b8b8;font-size:10px}
+.desktop-error span{flex:1}
+.desktop-actions,.desktop-start{display:flex;flex-wrap:wrap;align-items:flex-end;gap:9px;margin-top:14px}
+.desktop-checks{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
+.desktop-check-group{display:flex;flex-direction:column;gap:7px}
+.desktop-check{display:flex;align-items:center;gap:10px;padding:9px 10px;border:1px solid #24313d;border-radius:8px}
+.desktop-check-icon{display:grid;place-items:center;width:24px;height:24px;flex:none;border-radius:50%}
+.desktop-check.ok .desktop-check-icon{color:#69d7a2;background:#14261f}
+.desktop-check.warn .desktop-check-icon{color:#e2b764;background:#241e15}
+.desktop-check.fail .desktop-check-icon{color:#f08a8a;background:#2a1719}
+.desktop-check-copy{display:flex;flex:1;min-width:0;flex-direction:column;gap:3px}
+.desktop-check-copy strong{font-size:10px}.desktop-check-copy small{color:#8796a3;font-size:9px;line-height:1.55}
+.desktop-frame{position:relative;display:flex;flex-direction:column;height:calc(100vh - 230px);min-height:380px;border:1px solid #26323f;border-radius:9px;background:#05080c;overflow:hidden}
+.desktop-frame.is-hidden{display:none}
+.desktop-frame.is-fullscreen{height:100vh;border-radius:0;border:0}
+.desktop-toolbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;border-bottom:1px solid #1f2a35;background:#0d141c}
+.desktop-title{display:flex;align-items:center;gap:7px;color:#c2ced6;font-size:10px}
+.desktop-tools{display:flex;flex-wrap:wrap;gap:6px}
+.desktop-tools .button.active{border-color:var(--mint);color:var(--mint)}
+.desktop-screen{flex:1;min-height:0;overflow:auto;background:#000}
+.desktop-overlay{position:absolute;inset:44px 0 0;display:flex;align-items:center;justify-content:center;gap:10px;color:#9fb0bd;font-size:11px;background:#05080ccc}
+.desktop-hint{display:flex;align-items:center;gap:6px}

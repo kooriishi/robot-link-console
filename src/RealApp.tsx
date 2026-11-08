@@ -5,15 +5,16 @@ import type { Terminal as XTerminal } from '@xterm/xterm'
 import type { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import './real-app.css'
+import { DesktopPage } from './DesktopPage'
 import {
   Activity, AlertTriangle, ArrowUpRight, AudioLines, Bluetooth, Cable, Check,
   ChevronRight, CircleHelp, Clock3, Cpu, FileClock, Gauge, HardDrive,
   Headphones, LayoutDashboard, ListChecks, LoaderCircle, LockKeyhole, Menu,
-  Mic, Moon, Network, Play, Power, RefreshCw, Search, Server,
+  Mic, Monitor, Moon, Network, Play, Power, RefreshCw, Search, Server,
   ShieldCheck, Signal, SquareTerminal, Sun, Terminal, Trash2, Wifi, X, Zap,
 } from 'lucide-react'
 
-type Page = 'overview' | 'network' | 'services' | 'bluetooth' | 'audio' | 'terminal' | 'logs'
+type Page = 'overview' | 'network' | 'services' | 'bluetooth' | 'audio' | 'terminal' | 'desktop' | 'logs'
 type Target = { id: string; name: string; host: string; port: number; username: string }
 type HostInterface = { name: string; kind: string; mac?: string; ipv4: string[]; carrier: boolean; state: string; mtu?: number }
 type HostInfo = { hostname: string; os: string; interfaces: HostInterface[] }
@@ -45,6 +46,7 @@ const nav: { id: Page; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'bluetooth', label: '蓝牙设备', icon: Bluetooth },
   { id: 'audio', label: '音频设备', icon: AudioLines },
   { id: 'terminal', label: '终端', icon: SquareTerminal },
+  { id: 'desktop', label: '桌面显示', icon: Monitor },
   { id: 'logs', label: '诊断记录', icon: FileClock },
 ]
 const pageInfo: Record<Page, { title: string; subtitle: string }> = {
@@ -54,6 +56,7 @@ const pageInfo: Record<Page, { title: string; subtitle: string }> = {
   bluetooth: { title: '蓝牙设备', subtitle: '查看机器人 BlueZ 适配器并扫描、配对和连接设备。' },
   audio: { title: '音频设备', subtitle: '读取 PulseAudio/PipeWire 控件和 ALSA 硬件设备；ALSA 项仅用于识别。' },
   terminal: { title: '终端', subtitle: '交互式 SSH PTY；主机、用户和危险命令提示始终可见。' },
+  desktop: { title: '桌面显示', subtitle: '把接了屏幕的开发板桌面搬到这里，用本机键盘鼠标操作。' },
   logs: { title: '诊断记录', subtitle: '本地记录本次会话的应用操作；不会记录密码或终端输入。' },
 }
 const DANGEROUS = /(^|[^A-Za-z0-9_])(sudo|su|reboot|shutdown|poweroff|halt|rm|mkfs|dd|fdisk|parted|wipefs|systemctl\s+(stop|restart|disable|mask)|nmcli\s+(radio\s+wifi\s+off|connection\s+(down|delete))|ip\s+(addr|route|link)|iptables|nft|chmod\s+-R|chown\s+-R)(\s|$)/i
@@ -579,6 +582,7 @@ export default function RealApp() {
         <div className="page-view" hidden={page !== 'services'}>{visitedPages.has('services') && <ServicesPage services={visibleServices} query={serviceQuery} setQuery={setServiceQuery} onAction={doServiceAction} busy={busy} scope={serviceScope} setScope={scope => { setServices([]); setServiceScope(scope) }} loading={pageLoading}/>}</div>
         <div className="page-view" hidden={page !== 'bluetooth'}>{visitedPages.has('bluetooth') && <BluetoothPage snapshot={bluetooth} onScan={scanBluetooth} onTogglePower={toggleBluetoothPower} onAction={bluetoothAction} busy={busy} scanning={scanning === 'bluetooth'}/>}</div>
         <div className="page-view" hidden={page !== 'audio'}>{visitedPages.has('audio') && <AudioPage snapshot={audio} sourceVolume={sourceVolume} sinkVolume={sinkVolume} setSourceVolume={setSourceVolume} setSinkVolume={setSinkVolume} onDefault={setDefaultAudio} onVolume={commitAudioVolume} onTest={playTestAudio} busy={busy}/>}</div>
+        <div className="page-view" hidden={page !== 'desktop'}>{visitedPages.has('desktop') && <DesktopPage target={selected} sshReady={sshReady} active={page === 'desktop'} runPrivileged={runPrivileged} sudoPassword={() => sudoPasswordRef.current} onLog={log} onGoTerminal={() => navPage('terminal')}/>}</div>
         <div className="page-view" hidden={page !== 'terminal'}>{visitedPages.has('terminal') && <TerminalPage key={sessionId} sessionId={sessionId} exited={terminalExited} sshReady={sshReady} target={selected} theme={theme} onConnect={connectTarget} onDisconnect={disconnectTerminal} onRisk={setDangerLine} onPaste={setPastePreview} onError={setError}/>}</div>
         <div className="page-view" hidden={page !== 'logs'}>{visitedPages.has('logs') && <LogsPage logs={logs} onClear={() => setConfirm({ title: '清空本地诊断记录？', description: '只删除 RoboLink 本机界面中的操作记录，不会影响机器人。', run: async () => { setLogs([]); setConfirm(null) } })}/>}</div>
         <footer className="footer-note"><ShieldCheck size={14}/>本机地址仅按需临时添加 · SSH 使用独立 known_hosts · RoboLink v0.4.0 测试候选 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
@@ -781,7 +785,7 @@ function TerminalPage({ sessionId, exited, sshReady, target, theme, onConnect, o
     void initialize().catch(e=>{cleanup();if(!cancelled)onError(`加载 SSH 终端失败：${displayError(e)}`)})
     return ()=>{cancelled=true;cleanup()}
   },[sessionId])
-  return <div className="terminal-page real-terminal"><div className="terminal-toolbar"><div className="terminal-target"><span className={`terminal-dot ${exited?'offline':''}`}/><span><strong>{target?.host ?? '未选择目标'}</strong><small>{target ? `${target.username} · SSH ${target.port}` : 'SSH PTY'}</small></span><LockKeyhole size={14}/></div><div className="terminal-tools"><span className="terminal-mode"><LockKeyhole size={13}/>{!sessionId ? '未连接' : exited ? '会话结束' : sshReady ? 'SSH 已认证' : '等待 SSH 认证'}</span>{sessionId && <button className="button button-subtle" onClick={()=>{term.current?.clear();term.current?.focus()}} title="清除终端屏幕和回滚内容（不影响远端）"><Trash2 size={14}/>清屏</button>}{sessionId && <button className="button button-subtle" onClick={onDisconnect}>断开 SSH</button>}{!sessionId && <button className="button button-primary" onClick={onConnect}>连接 SSH</button>}</div></div><div className="terminal-safety"><AlertTriangle size={15}/><span>这是机器人上的真实 Shell。输入命令会立即发往 <strong>{target?.username}@{target?.host}</strong>；高风险回车与多行粘贴需要确认。远端输出按不可信文本处理。</span></div>{sessionId ? <div className="xterm-shell" ref={container} aria-label="SSH 终端"/> : <div className="terminal-disconnected"><Terminal size={24}/><strong>尚未建立 SSH 会话</strong><p>先核验 SSH 主机指纹，再启动交互式终端。密码认证提示会在终端内交互，不会存入 RoboLink。</p><button className="button button-primary" onClick={onConnect}>连接并打开终端</button></div>}<div className="terminal-bottom"><div><span className={`terminal-bottom-dot ${sessionId&&!exited?'':'offline'}`}/>目标 <strong>{target?.host ?? '—'}</strong><span className="dot-divider">·</span>用户 <strong>{target?.username ?? '—'}</strong><span className="dot-divider">·</span>不自动提权</div><span className="terminal-status-note">SSH 使用应用独立指纹文件</span></div></div>
+  return <div className="terminal-page real-terminal"><div className="terminal-toolbar"><div className="terminal-target"><span className={`terminal-dot ${exited?'offline':''}`}/><span><strong>{target?.host ?? '未选择目标'}</strong><small>{target ? `${target.username} · SSH ${target.port}` : 'SSH PTY'}</small></span><LockKeyhole size={14}/></div><div className="terminal-tools"><span className="terminal-mode"><LockKeyhole size={13}/>{!sessionId ? '未连接' : exited ? '会话结束' : sshReady ? 'SSH 已认证' : '等待 SSH 认证'}</span>{sessionId && <button className="button button-subtle" onClick={()=>{term.current?.clear();term.current?.focus()}} title="清除终端屏幕和回滚内容（不影响远端）"><Trash2 size={14}/>清屏</button>}{sessionId && <button className="button button-subtle" onClick={onDisconnect}>断开 SSH</button>}{!sessionId && <button className="button button-primary" onClick={onConnect}>连接 SSH</button>}</div></div><div className="terminal-safety"><AlertTriangle size={15}/><span>这是机器人上的真实 Shell。输入命令会立即发往 <strong>{target?.username}@{target?.host}</strong>；高风险回车与多行粘贴需要确认。远端输出按不可信文本处理。</span></div>{sessionId ? <div className="xterm-shell"><div className="xterm-host" ref={container} aria-label="SSH 终端"/></div> : <div className="terminal-disconnected"><Terminal size={24}/><strong>尚未建立 SSH 会话</strong><p>先核验 SSH 主机指纹，再启动交互式终端。密码认证提示会在终端内交互，不会存入 RoboLink。</p><button className="button button-primary" onClick={onConnect}>连接并打开终端</button></div>}<div className="terminal-bottom"><div><span className={`terminal-bottom-dot ${sessionId&&!exited?'':'offline'}`}/>目标 <strong>{target?.host ?? '—'}</strong><span className="dot-divider">·</span>用户 <strong>{target?.username ?? '—'}</strong><span className="dot-divider">·</span>不自动提权</div><span className="terminal-status-note">SSH 使用应用独立指纹文件</span></div></div>
 }
 
 function LogsPage({ logs, onClear }: { logs: AppLog[]; onClear:()=>void }) { return <div className="page-stack"><div className="logs-toolbar list-toolbar"><span className="small-muted">{logs.length} 条本地事件 · 终端输入与密码不记录</span><button className="button button-subtle" onClick={onClear}><Trash2 size={14}/>清空</button></div><section className="panel logs-panel">{logs.length ? logs.map((l,i)=><div className="log-row" key={`${l.at}-${i}`}><span className={`log-tone ${l.tone}`}>{l.tone==='warn'?<AlertTriangle size={14}/>:l.tone==='ok'?<Check size={14}/>:<Activity size={14}/>}</span><span className="log-time">{l.at}</span><span className="log-message">{l.text}</span><span className={`log-category ${l.tone}`}>{l.tone==='warn'?'注意':l.tone==='ok'?'完成':'系统'}</span></div>) : <EmptyState text="尚无本地操作记录。"/>}</section><div className="subtle-callout"><LockKeyhole size={16}/><span>诊断日志仅记操作事件，不采集终端输入、SSH 密码、Wi-Fi 密码或麦克风内容。</span></div></div> }

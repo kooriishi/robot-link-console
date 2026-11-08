@@ -1,6 +1,6 @@
 [package]
 name = "robot-link-console"
-version = "0.4.4"
+version = "0.5.0"
 description = "Linux desktop console for headless robot debugging over direct Ethernet and SSH"
 authors = ["RoboLink contributors"]
 edition = "2021"
@@ -21,3 +21,6 @@ regex = "1"
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 socket2 = "0.6"
+tokio = { version = "1.54.1", features = ["net", "process", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
