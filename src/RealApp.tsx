@@ -73,6 +73,8 @@ const errorHeading = (message: string) => {
   return '操作未完成'
 }
 const formatMemory = (kb?: number) => kb ? `${(kb / 1024 / 1024).toFixed(1)} GB` : '—'
+// Apple-style terminal palette: near-black #1d1d1f in both app themes so ANSI colours stay readable; Sky Link Blue cursor.
+const terminalTheme = (_theme: 'dark' | 'light') => ({ background: '#1d1d1f', foreground: '#f5f5f7', cursor: '#2997ff', cursorAccent: '#1d1d1f', selectionBackground: '#2997ff55' })
 const terminalWriterRef: { current: { sessionId: string; write: (data: string) => void; confirmDangerous: () => Promise<void>; cancelDangerous: () => Promise<void>; confirmPaste: () => Promise<void>; cancelPaste: () => Promise<void> } | null } = { current: null }
 const activeTerminalRef = { current: '' }
 const openingTerminalRef = { current: false }
@@ -733,7 +735,7 @@ function TerminalPage({ sessionId, exited, sshReady, target, theme, onConnect, o
   const pendingPaste = useRef<(() => Promise<void>)|null>(null)
   useEffect(()=>{
     themeRef.current = theme
-    if(term.current) term.current.options.theme=theme==='dark'?{background:'#080d13',foreground:'#d2dce6',cursor:'#69d7a2',selectionBackground:'#3f6454'}:{background:'#111923',foreground:'#e2e8ef',cursor:'#75d6a8',selectionBackground:'#456454'}
+    if(term.current) term.current.options.theme=terminalTheme(theme)
   },[theme])
   useEffect(()=>{
     if(!sessionId || !container.current) return
@@ -742,7 +744,7 @@ function TerminalPage({ sessionId, exited, sshReady, target, theme, onConnect, o
     const initialize=async()=>{
       const [{Terminal:TerminalClass},{FitAddon:FitAddonClass}]=await Promise.all([import('@xterm/xterm'),import('@xterm/addon-fit')])
       if(cancelled || !container.current) return
-      const currentTheme=themeRef.current==='dark'?{background:'#080d13',foreground:'#d2dce6',cursor:'#69d7a2',selectionBackground:'#3f6454'}:{background:'#111923',foreground:'#e2e8ef',cursor:'#75d6a8',selectionBackground:'#456454'}
+      const currentTheme=terminalTheme(themeRef.current)
       const x=new TerminalClass({cursorBlink:true,convertEol:true,scrollback:4000,fontSize:13,fontFamily:'"Ubuntu Mono", "Liberation Mono", "DejaVu Sans Mono", monospace',letterSpacing:-0.15,lineHeight:1.05,allowProposedApi:false,theme:currentTheme})
       const fit=new FitAddonClass(); x.loadAddon(fit); x.open(container.current); fit.fit(); term.current=x; fitAddon.current=fit
       void invoke('resize_terminal',{sessionId,cols:x.cols,rows:x.rows}).catch(()=>{})
