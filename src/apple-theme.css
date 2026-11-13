@@ -806,7 +806,40 @@ html[data-theme] .toast svg { color: var(--a-green); }
 
 html[data-theme] .mobile-scrim { background: var(--a-overlay); }
 
+/* ---------- Layout & simplification (round 2) ---------- */
+/* Sidebar stays put at one window height; only the right side scrolls. */
+@media (min-width: 681px) {
+  html[data-theme] .sidebar { position: sticky; top: 0; height: 100vh; min-height: 0; overflow-y: auto; }
+}
+/* Overview: both columns share one height and their last cards stretch, so top and bottom edges line up. */
+html[data-theme] .dashboard-grid { align-items: stretch; }
+html[data-theme] .main-column > .service-panel,
+html[data-theme] .right-column > .quick-panel { flex: 1; }
+html[data-theme] .metric-grid { align-items: stretch; }
+html[data-theme] .metric-card { display: flex; flex-direction: column; align-items: flex-start; }
+html[data-theme] .metric-detail { min-height: 15px; }
+html[data-theme] .network-warning { align-items: center; }
+html[data-theme] .network-warning > div:nth-child(2) { flex: 1; min-width: 0; }
+html[data-theme] .network-warning code { font-family: var(--a-mono); font-size: 11px; }
+/* Fewer labels: English kickers, captions and repeated notes are hidden; headings carry the meaning. */
+html[data-theme] .eyebrow,
+html[data-theme] .section-kicker,
+html[data-theme] .brand-caption,
+html[data-theme] .link-speed,
+html[data-theme] .health-time,
+html[data-theme] .safety-note,
+html[data-theme] .footer-note { display: none; }
+html[data-theme] .page-heading h1 { margin-top: 0; }
+html[data-theme] .panel-heading h2,
+html[data-theme] .audio-title h2,
+html[data-theme] .detail-panel h2,
+html[data-theme] .modal-title h2 { margin-top: 0; }
+html[data-theme] .content-wrap { padding-bottom: 36px; }
+
 /* ---------- Responsive mirrors (the base rules above outrank the original media rules) ---------- */
+@media (max-width: 1180px) {
+  html[data-theme] .metric-card { display: grid; align-items: center; }
+}
 @media (max-width: 680px) {
   html[data-theme] .topbar { height: 52px; padding: 0 15px; padding-right: 64px; }
   html[data-theme] .theme-toggle { right: 12px; top: 10px; width: 32px; padding: 0; justify-content: center; }
