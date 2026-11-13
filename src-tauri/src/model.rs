@@ -207,6 +207,10 @@ pub struct BluetoothDevice {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BluetoothSnapshot {
+    /// bluetoothctl exists on the robot. `available` only says an adapter was found, so the UI can
+    /// still offer "power on / start bluetoothd" when the adapter is off or blocked.
+    #[serde(default)]
+    pub installed: bool,
     pub available: bool,
     pub powered: bool,
     pub adapter: String,

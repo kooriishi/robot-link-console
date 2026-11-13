@@ -280,7 +280,11 @@ fn is_rfc1918(address: Ipv4Addr) -> bool {
 fn build_dnsmasq_config(interface: &str, local: Ipv4Addr, id: &str) -> String {
     let [a, b, c, _] = local.octets();
     format!(
-        "# robolink-id={id}\nport=0\ninterface={interface}\nbind-interfaces\ndhcp-range={a}.{b}.{c}.10,{a}.{b}.{c}.200,255.255.255.0,1h\ndhcp-option=3\ndhcp-option=6\nleasefile-ro\nlog-dhcp\nlog-facility=-\nuser=nobody\n"
+        // dhcp-authoritative: the board may still hold a lease from another network and ask for that
+        // old address. Without this dnsmasq silently ignores the INIT-REBOOT request, so the board
+        // never gets an address even though the server is running. dhcp-broadcast: a client without
+        // an address cannot always receive a unicast reply on this point-to-point link.
+        "# robolink-id={id}\nport=0\ninterface={interface}\nbind-interfaces\ndhcp-authoritative\ndhcp-broadcast\ndhcp-range={a}.{b}.{c}.10,{a}.{b}.{c}.200,255.255.255.0,1h\ndhcp-option=3\ndhcp-option=6\nleasefile-ro\nlog-dhcp\nlog-facility=-\nuser=nobody\n"
     )
 }
 
@@ -581,7 +585,11 @@ fn validate_record_config(record: &DhcpRecord) -> Result<(), String> {
     file.read_to_string(&mut contents)
         .map_err(|error| format!("无法读取 DHCP 专属配置：{error}"))?;
     let (address, _) = parse_private_dhcp_cidr(&record.cidr)?;
-    if contents != build_dnsmasq_config(&record.interface, address, &record.id) {
+    let expected = build_dnsmasq_config(&record.interface, address, &record.id);
+    // Accept a record created by the previous release (without authoritative/broadcast) so an
+    // in-flight DHCP server can still be inspected and cleaned up after upgrading.
+    let legacy = expected.replacen("dhcp-authoritative\ndhcp-broadcast\n", "", 1);
+    if contents != expected && contents != legacy {
         return Err("DHCP 专属配置与所有权记录/UUID 不匹配；拒绝恢复进程身份".into());
     }
     Ok(())

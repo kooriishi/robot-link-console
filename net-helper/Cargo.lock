@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "robolink-net-helper"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "libc",
  "serde",

@@ -67,8 +67,9 @@ struct ScannedKey {
 fn scan_keys(target: &Target) -> Result<Vec<ScannedKey>, String> {
     let output = Command::new("ssh-keyscan")
         .args([
+            // 5 s was too tight for a board that is still booting or busy right after discovery.
             "-T",
-            "5",
+            "8",
             "-p",
             &target.port.to_string(),
             "-t",
@@ -675,7 +676,7 @@ pub fn close_terminal(state: &AppState, session_id: &str) -> Result<(), String> 
 /// ssh-keyscan prints nothing on timeout; explain the most likely reason instead of an empty error.
 fn unreachable_hint(host: &str, port: u16) -> String {
     let Ok(ip) = host.parse::<std::net::Ipv4Addr>() else {
-        return format!("{host}:{port} 在 5 秒内没有响应。请检查网线、目标 IP、SSH 服务及端口。");
+        return format!("{host}:{port} 在 8 秒内没有响应。请检查网线、目标 IP、SSH 服务及端口。");
     };
     let route = Command::new("ip")
         .args(["-4", "route", "get", &ip.to_string()])
@@ -745,7 +746,7 @@ fn unreachable_hint_from_route(
     if !dev.is_empty() && is_wireless(&dev) {
         return format!("去往 {ip} 的流量会走无线网卡 {dev}，而不是直连网线。{fix}");
     }
-    format!("{ip}:{port} 经 {dev} 在 5 秒内没有响应。请确认开发板 SSH 服务已启动、端口 {port} 正确，且防火墙未拦截。")
+    format!("{ip}:{port} 经 {dev} 在 8 秒内没有响应。请确认开发板 SSH 服务已启动、端口 {port} 正确，且防火墙未拦截。")
 }
 
 pub(crate) fn safe_stderr(input: &[u8]) -> String {

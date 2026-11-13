@@ -126,6 +126,21 @@ fn physical_ethernet(name: &str, require_link: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// An interface can have carrier while being administratively down (common after the cable is
+/// plugged into a port that has no IPv4 configuration yet). A DOWN interface silently drops both
+/// ARP probes and replies, which made discovery look broken. The helper runs as root, so bring it up
+/// without touching addresses or routes.
+fn ensure_link_up(name: &str) -> Result<(), String> {
+    let output = ip_command(&["link", "set", "dev", name, "up"])?;
+    if !output.status.success() {
+        return Err(format!(
+            "无法启用网卡 {name}：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 fn interface_has_carrier(name: &str) -> Result<bool, String> {
     let path = std::path::Path::new("/sys/class/net")
         .join(name)
@@ -238,6 +253,7 @@ struct DhcpCandidate {
 
 fn arp_socket(interface: &str) -> Result<OwnedFd, String> {
     physical_ethernet(interface, false)?;
+    ensure_link_up(interface)?;
     let name = CString::new(interface).map_err(|_| "网卡名称无效")?;
     let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
     if index == 0 {
@@ -358,7 +374,21 @@ fn discover(
             warnings.push(format!("{e}；已跳过该网卡。"));
             continue;
         }
-        match interface_has_carrier(interface) {
+        if let Err(e) = ensure_link_up(interface) {
+            warnings.push(format!("{e}；仍尝试继续发现。"));
+        }
+        // Carrier can take a moment to settle right after `ip link set up` or a cable plug.
+        let mut carrier = interface_has_carrier(interface);
+        for _ in 0..10 {
+            match &carrier {
+                Ok(true) | Err(_) => break,
+                Ok(false) => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    carrier = interface_has_carrier(interface);
+                }
+            }
+        }
+        match carrier {
             Ok(true) => {}
             Ok(false) => {
                 skipped.push(interface.clone());
@@ -400,6 +430,7 @@ fn discover(
     // Spread the sweep over ~60% of the listening window, 2k–40k frames per second overall.
     let sweep_rate_per_ms = (sweep_total as f64 / (seconds as f64 * 600.0)).clamp(2.0, 40.0);
     let mut sweep_sent = 0_usize;
+    let mut sweep_passes = 0_u8;
     let mut candidates = HashMap::<(String, String, String), ArpCandidate>::new();
     let mut dhcp_without_address = std::collections::HashSet::new();
     let mut buffer = [0_u8; 4096];
@@ -412,6 +443,19 @@ fn discover(
                 revents: 0,
             })
             .collect::<Vec<_>>();
+        // One probe per address is easily lost (the board may be slow to bring its interface up,
+        // or the frame may be dropped while it is busy booting). Repeat the sweep once when there
+        // is still time budget; the order starts with the interface's own subnet and the common
+        // board subnets, which are the most likely targets.
+        if !sweeps.is_empty()
+            && sweep_passes == 0
+            && sweeps.iter().all(|p| p.next >= p.targets.len())
+        {
+            for plan in sweeps.iter_mut() {
+                plan.next = 0;
+            }
+            sweep_passes = 1;
+        }
         let sweeping = sweeps.iter().any(|p| p.next < p.targets.len());
         if sweeping {
             let budget = (started.elapsed().as_secs_f64() * 1000.0 * sweep_rate_per_ms) as usize;

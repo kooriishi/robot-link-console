@@ -517,6 +517,36 @@ fn route_details(address: &str, interface: &str) -> Option<String> {
     Some(source.unwrap_or_default())
 }
 
+/// Interface the kernel actually uses for this address. Unlike `ip route get ... oif`, this shows
+/// when a candidate would leave through Wi-Fi or another NIC, which is the usual reason a discovered
+/// board still cannot be reached over the direct cable.
+fn route_interface(address: &str) -> Option<String> {
+    let ip = address
+        .split('%')
+        .next()
+        .unwrap_or(address)
+        .parse::<IpAddr>()
+        .ok()?;
+    let output = Command::new("ip")
+        .args([
+            if ip.is_ipv4() { "-4" } else { "-6" },
+            "route",
+            "get",
+            &ip.to_string(),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    words
+        .windows(2)
+        .find(|w| w[0] == "dev")
+        .map(|w| w[1].to_string())
+}
+
 fn addresses_for_interface(interface: &str) -> Vec<IpAddr> {
     let Ok(output) = Command::new("ip")
         .args(["-json", "address", "show", "dev", interface])
@@ -919,6 +949,26 @@ pub fn discover_direct_devices(
         .collect();
     report.skipped_interfaces.sort();
     report.skipped_interfaces.dedup();
+    // A candidate can be discovered on the cable while the kernel still routes its traffic through
+    // another NIC (typically Wi-Fi on the same 192.168.x.0/24). Say so explicitly; otherwise the
+    // candidate looks fine but SSH/keyscan times out.
+    let mut wrong_route = Vec::new();
+    for host in report
+        .hosts
+        .iter()
+        .filter(|h| !h.route_ready && !h.address.contains(':'))
+    {
+        if let Some(dev) = route_interface(&host.address) {
+            if dev != host.interface && !wrong_route.iter().any(|(_, d)| d == &dev) {
+                wrong_route.push((host.address.clone(), dev));
+            }
+        }
+    }
+    for (address, dev) in wrong_route {
+        report.warnings.push(format!(
+            "候选 {address} 的流量目前会经 {dev}，不是扫描到它的直连网卡；请在该候选上“配置本机 IP 后添加”，让直连网卡拥有同网段地址后再连接。"
+        ));
+    }
     Ok(report)
 }
 
@@ -1470,26 +1520,70 @@ fn parse_wifi_scan(output: &str) -> WifiScanResult {
     }
 }
 
+/// Turns NetworkManager's Wi-Fi radio on/off. A board usually has two independent switches:
+/// NetworkManager's WirelessEnabled and the rfkill soft block; also, nmcli cannot do anything when
+/// NetworkManager itself is stopped. All three are handled and the resulting state is verified,
+/// instead of returning success as soon as nmcli exits 0.
 #[tauri::command(async)]
 pub fn set_remote_wifi_radio(
     state: State<'_, AppState>,
     target_id: String,
     enabled: bool,
     sudo_password: Option<String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
     let on_off = if enabled { "on" } else { "off" };
-    ssh::remote_command_with(
-        &state,
-        &target,
-        &format!("nmcli radio wifi {on_off}"),
-        sudo_options(&sudo_password),
-    )?;
-    Ok(())
+    let expected = if enabled { "enabled" } else { "disabled" };
+    let script = format!(
+        "export LC_ALL=C; command -v nmcli >/dev/null 2>&1 || {{ echo '机器人缺少 nmcli/NetworkManager'; exit 127; }}; \
+         if [ {enabled} = true ]; then rfkill unblock wifi >/dev/null 2>&1 || true; fi; \
+         if ! nmcli -t general status >/dev/null 2>&1; then \
+           systemctl start NetworkManager >/dev/null 2>&1 || true; \
+           i=0; while [ $i -lt 8 ] && ! nmcli -t general status >/dev/null 2>&1; do sleep 1; i=$((i+1)); done; \
+         fi; \
+         OUT=$(nmcli radio wifi {on_off} 2>&1); rc=$?; printf '%s\\n' \"$OUT\"; \
+         if [ $rc -eq 0 ]; then \
+           i=0; state=''; \
+           while [ $i -lt 5 ]; do state=$(nmcli -t radio wifi 2>/dev/null || true); \
+             [ \"$state\" = {expected} ] && break; sleep 1; i=$((i+1)); done; \
+           if [ \"$state\" != {expected} ]; then \
+             echo \"Wi-Fi 无线状态仍为 ${{state:-未知}}（期望 {expected}）\"; \
+             command -v rfkill >/dev/null 2>&1 && rfkill list wifi 2>&1 | head -6; rc=1; \
+           elif [ {enabled} = true ]; then \
+             i=0; DS=''; \
+             while [ $i -lt 5 ]; do \
+               DS=$(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | awk -F: '$2==\"wifi\"{{print $3; exit}}'); \
+               case \"$DS\" in unavailable|'') sleep 1; i=$((i+1));; *) break;; esac; \
+             done; \
+             case \"$DS\" in \
+               unavailable|unmanaged) echo \"Wi-Fi 设备状态为 $DS（无线已开启但设备不可用）\"; \
+                 command -v rfkill >/dev/null 2>&1 && rfkill list wifi 2>&1 | head -6; rc=1;; \
+             esac; \
+           fi; \
+         fi; exit $rc"
+    );
+    let result = ssh::remote_command_with(&state, &target, &script, sudo_options(&sudo_password));
+    match result {
+        Ok(output) => Ok(output.trim().to_string()),
+        Err(error) => {
+            let needs_root = sudo_password.as_deref().is_none_or(str::is_empty);
+            // Starting NetworkManager and `rfkill unblock` both need root. The verification failures
+            // below are therefore also worth one sudo retry when the first attempt ran unprivileged.
+            let may_need_root = error.contains("NetworkManager is not running")
+                || error.contains("无线状态仍为")
+                || error.contains("设备状态为");
+            if needs_root && may_need_root {
+                return Err(format!("{}{}", ssh::SUDO_MARK, error));
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Connects the robot to Wi-Fi without a terminal: the Wi-Fi password goes over ssh's stdin (read by
-/// the remote shell), never into the local ssh argv or RoboLink's storage.
+/// the remote shell), never into the local ssh argv or RoboLink's storage. A rescan is done first so
+/// a network that was not in NetworkManager's cache is not reported as missing; saved profiles are
+/// also tried when no password was supplied.
 #[tauri::command(async)]
 pub fn connect_remote_wifi(
     state: State<'_, AppState>,
@@ -1501,12 +1595,33 @@ pub fn connect_remote_wifi(
     validate_wifi_ssid(&ssid)?;
     let target = ssh::lookup_target(&state, &target_id)?;
     let script = format!(
-        "WP=''; while IFS= read -r L; do case \"$L\" in SECRET:*) WP=${{L#SECRET:}}; break;; esac; done; if [ -n \"$WP\" ]; then nmcli --wait 40 device wifi connect {ssid} password \"$WP\"; else nmcli --wait 40 device wifi connect {ssid}; fi",
+        "export LC_ALL=C; command -v nmcli >/dev/null 2>&1 || {{ echo '机器人缺少 nmcli/NetworkManager'; exit 127; }}; \
+         WP=''; while IFS= read -r L; do case \"$L\" in SECRET:*) WP=${{L#SECRET:}}; break;; esac; done; \
+         if ! nmcli -t general status >/dev/null 2>&1; then \
+           systemctl start NetworkManager >/dev/null 2>&1 || true; \
+           i=0; while [ $i -lt 8 ] && ! nmcli -t general status >/dev/null 2>&1; do sleep 1; i=$((i+1)); done; \
+         fi; \
+         rfkill unblock wifi >/dev/null 2>&1 || true; \
+         nmcli radio wifi on >/dev/null 2>&1 || true; \
+         nmcli device wifi rescan >/dev/null 2>&1 || true; sleep 3; \
+         if [ -n \"$WP\" ]; then \
+           OUT=$(nmcli --wait 45 device wifi connect {ssid} password \"$WP\" 2>&1); rc=$?; \
+         else \
+           OUT=$(nmcli --wait 45 device wifi connect {ssid} 2>&1); rc=$?; \
+           if [ $rc -ne 0 ]; then \
+             OUT2=$(nmcli --wait 45 connection up id {ssid} 2>&1); rc=$?; OUT=\"$OUT $OUT2\"; \
+           fi; \
+         fi; \
+         if [ $rc -eq 0 ]; then \
+           DEV=$(nmcli -t -f DEVICE,TYPE device status 2>/dev/null | awk -F: '$2==\"wifi\"{{print $1; exit}}'); \
+           STATE=''; [ -n \"$DEV\" ] && STATE=$(nmcli -t -f GENERAL.STATE,IP4.ADDRESS device show \"$DEV\" 2>/dev/null | head -2 | tr '\\n' ' '); \
+           printf '%s %s\\n' \"$OUT\" \"$STATE\"; \
+         else printf '%s\\n' \"$OUT\"; fi; exit $rc",
         ssid = ssh::shell_quote(&ssid)
     );
     let mut options = sudo_options(&sudo_password);
     options.stdin_line = Some(password.as_deref().unwrap_or(""));
-    options.timeout_secs = Some(50);
+    options.timeout_secs = Some(100);
     let output = ssh::remote_command_with(&state, &target, &script, options)?;
     Ok(output.trim().to_string())
 }
@@ -1616,6 +1731,8 @@ fn bt_problem_hint(text: &str) -> String {
         "机器人上的 SSH 用户没有访问 BlueZ 的权限：可输入 sudo 密码执行，或把该用户加入 bluetooth 组（sudo usermod -aG bluetooth $USER 后重新登录）。".into()
     } else if lower.contains("no default controller") {
         "机器人没有可用的蓝牙适配器：确认板子有蓝牙模块，并执行 sudo systemctl start bluetooth、rfkill unblock bluetooth。".into()
+    } else if lower.contains("blocked") {
+        "蓝牙适配器被 rfkill 软/硬阻塞：先执行 sudo rfkill unblock bluetooth；硬阻塞还需要拨动板子上的无线开关。".into()
     } else if lower.contains("waiting to connect to bluetoothd") || lower.contains("not available")
     {
         "bluetoothd 没有运行：在终端执行 sudo systemctl start bluetooth。".into()
@@ -1627,6 +1744,7 @@ fn bt_problem_hint(text: &str) -> String {
 fn parse_bluetooth_output(output: &str) -> BluetoothSnapshot {
     if output.lines().any(|l| l.trim() == "UNSUPPORTED") {
         return BluetoothSnapshot {
+            installed: false,
             available: false,
             powered: false,
             adapter: String::new(),
@@ -1682,6 +1800,7 @@ fn parse_bluetooth_output(output: &str) -> BluetoothSnapshot {
         None
     };
     BluetoothSnapshot {
+        installed: true,
         available: !adapter.is_empty(),
         powered,
         adapter,
@@ -1703,7 +1822,26 @@ fn bluetooth_parts(
     );
     let mut options = sudo_options(sudo_password);
     options.timeout_secs = Some(25);
-    let output = ssh::remote_command_with(state, target, &script, options)?;
+    let output = match ssh::remote_command_with(state, target, &script, options) {
+        Ok(output) => output,
+        Err(error) if error.contains("Waiting to connect to bluetoothd") => {
+            // bluetoothctl blocks on D-Bus when bluetoothd is stopped. Don't hide the page: the
+            // "power on" action is exactly what can start the service from the UI.
+            return Ok(BluetoothSnapshot {
+                installed: true,
+                available: false,
+                powered: false,
+                adapter: String::new(),
+                devices: vec![],
+                note: Some(
+                    "蓝牙服务 bluetoothd 没有运行；可点击“开启蓝牙”尝试启动 bluetooth.service。"
+                        .into(),
+                ),
+                needs_sudo: true,
+            });
+        }
+        Err(error) => return Err(error),
+    };
     Ok(parse_bluetooth_output(&output))
 }
 
@@ -1726,23 +1864,71 @@ pub fn scan_bluetooth(
     bluetooth_parts(&state, &target, true, &sudo_password)
 }
 
+/// Powers the BlueZ adapter on/off and returns the refreshed snapshot from the same SSH operation.
+/// A powered-off adapter is not the only reason a board cannot use Bluetooth: bluetoothd is often
+/// stopped and the radio is soft-blocked by rfkill. Those two need root, so handle them here instead
+/// of leaving the UI with a "cannot read adapter" dead end.
 #[tauri::command(async)]
 pub fn set_bluetooth_power(
     state: State<'_, AppState>,
     target_id: String,
     enabled: bool,
     sudo_password: Option<String>,
-) -> Result<(), String> {
+) -> Result<BluetoothSnapshot, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
     let power = if enabled { "on" } else { "off" };
-    let output = ssh::remote_command_with(
-        &state,
-        &target,
-        &format!("bluetoothctl power {power} 2>&1"),
-        sudo_options(&sudo_password),
-    )?;
-    bluetoothctl_result(&output)?;
-    Ok(())
+    let prepare = if enabled {
+        "rfkill unblock bluetooth >/dev/null 2>&1 || true; \
+         if ! systemctl is-active --quiet bluetooth 2>/dev/null; then \
+           systemctl start bluetooth >/dev/null 2>&1 || true; sleep 2; \
+         fi; "
+    } else {
+        ""
+    };
+    let verify = if enabled {
+        "if [ $rc -eq 0 ]; then \
+           i=0; while [ $i -lt 5 ]; do \
+             bluetoothctl show 2>/dev/null | grep -q 'Powered: yes' && break; \
+             sleep 1; i=$((i+1)); \
+           done; \
+           if ! bluetoothctl show 2>/dev/null | grep -q 'Powered: yes'; then \
+             echo '适配器仍未上电：请检查 rfkill、蓝牙模块和 bluetooth.service'; rc=1; \
+           fi; \
+         fi; "
+    } else {
+        ""
+    };
+    let script = format!(
+        "export LC_ALL=C; command -v bluetoothctl >/dev/null 2>&1 || {{ echo 'UNSUPPORTED'; exit 0; }}; \
+         {prepare}OUT=$(bluetoothctl power {power} 2>&1); rc=$?; printf '%s\\n' \"$OUT\"; \
+         {verify}exit $rc"
+    );
+    let result = ssh::remote_command_with(&state, &target, &script, sudo_options(&sudo_password));
+    match result {
+        Ok(output) => bluetoothctl_result(&output)?,
+        Err(error) => {
+            let needs_root = sudo_password.as_deref().is_none_or(str::is_empty);
+            // BlueZ reports missing privileges under several names depending on the version
+            // (org.bluez.Error.NotAuthorized, .Failed, AccessDenied, ...). A power operation is
+            // privileged, so retry once with sudo for any Bluetooth-level failure; if it still fails
+            // the second time the user sees the real reason.
+            let lower = error.to_ascii_lowercase();
+            let service_hint = error.contains("waiting to connect to bluetoothd")
+                || error.contains("not available")
+                || error.contains("not authorized")
+                || error.contains("仍未上电")
+                || error.contains("适配器")
+                || lower.contains("bluez")
+                || lower.contains("bluetoothctl");
+            if needs_root && service_hint && !error.starts_with(ssh::SUDO_MARK) {
+                return Err(format!("{}{}", ssh::SUDO_MARK, error));
+            }
+            return Err(error);
+        }
+    }
+    // Read everything back under the same privilege level; a plain snapshot may be denied and would
+    // otherwise reset the page to "adapter unavailable" right after a successful power-on.
+    bluetooth_parts(&state, &target, false, &sudo_password)
 }
 
 #[tauri::command(async)]
