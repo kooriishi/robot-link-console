@@ -606,12 +606,26 @@ export default function RealApp() {
   </div>
 }
 
+// Which local NIC reaches the target: an IPv4 target inside a Wi-Fi interface's subnet is reached wirelessly.
+const ipv4ToInt = (ip: string) => { const p = ip.split('.').map(Number); return p.length === 4 && p.every(n => Number.isInteger(n) && n >= 0 && n <= 255) ? ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0 : null }
+const linkKind = (host: string, interfaces: HostInterface[]): 'wired' | 'wireless' => {
+  const target = ipv4ToInt(host)
+  if (target === null) return 'wired'
+  for (const iface of interfaces) for (const cidr of iface.ipv4) {
+    const [addr, bits] = cidr.split('/'); const local = ipv4ToInt(addr); const prefix = Number(bits)
+    if (local === null || !(prefix >= 0 && prefix <= 32)) continue
+    const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0
+    if (((local & mask) >>> 0) === ((target & mask) >>> 0)) return iface.kind === 'Wi-Fi' ? 'wireless' : 'wired'
+  }
+  return 'wired'
+}
 function OverviewPage({ hostInfo, target, trusted, connected, remote, services, onAdd, onConnect, onPage }: { hostInfo: HostInfo | null; target?: Target; trusted: boolean; connected: boolean; remote: RemoteOverview | null; services: Service[]; onAdd: () => void; onConnect: () => void; onPage: (page: Page) => void }) {
   const failed = services.filter(s => s.active !== 'active')
+  const link = target ? linkKind(target.host, hostInfo?.interfaces ?? []) : 'wired'
   return <div className="dashboard-grid real-dashboard">
     <section className="main-column">
       <section className="panel connection-card real-connection"><div className="panel-heading"><div><div className="section-kicker">DIRECT ETHERNET · NO INTERMEDIARY</div><h2>{target ? `${target.name} · ${target.host}` : '添加机器人 SSH 目标'}</h2></div><span className={`connected-pill ${connected ? '' : 'not-connected'}`}><span/>{connected ? 'SSH 会话已连接' : trusted ? '指纹已固定' : '未连接'}</span></div>
-        <div className="connection-map"><div className="endpoint"><div className="endpoint-icon host"><MonitorGlyph/></div><div><strong>本机</strong><small>{hostInfo?.hostname ?? '读取中…'}</small></div></div><div className="link-track"><div className="link-line"/><div className="link-chip"><Cable size={14}/>网线直连</div></div><div className="endpoint"><div className="endpoint-icon robot"><Cpu size={21}/></div><div><strong>{target?.name ?? 'Linux 机器人'}</strong><small>{target ? `${target.username}@${target.host}:${target.port}` : '未配置目标'}</small></div></div></div>
+        <div className="connection-map"><div className="endpoint"><div className="endpoint-icon host"><MonitorGlyph/></div><div><strong>本机</strong><small>{hostInfo?.hostname ?? '读取中…'}</small></div></div><div className={`link-track ${connected ? 'live' : ''} ${link === 'wireless' ? 'wireless' : ''}`}><div className="link-line"/><div className="link-chip">{link === 'wireless' ? <Wifi size={14}/> : <Cable size={14}/>}{link === 'wireless' ? '无线直连' : '网线直连'}</div></div><div className="endpoint"><div className="endpoint-icon robot"><Cpu size={21}/></div><div><strong>{target?.name ?? 'Linux 机器人'}</strong><small>{target ? `${target.username}@${target.host}:${target.port}` : '未配置目标'}</small></div></div></div>
         <div className="connection-footer"><span><ShieldCheck size={14}/>{trusted ? '独立主机指纹已固定' : '连接前需要核验 SSH 指纹'}</span><button onClick={target ? onConnect : onAdd}>{target ? '核验并连接' : '添加 SSH 目标'} <ArrowUpRight size={14}/></button></div></section>
       {!target && <div className="first-run-card"><div className="first-run-icon"><Cable size={22}/></div><div><strong>添加第一台机器人</strong><p>填写机器人的 IP 和 SSH 用户即可开始。</p></div><button className="button button-primary" onClick={onAdd}>添加设备</button></div>}
       {target && !trusted && <div className="network-warning"><div className="warning-icon"><LockKeyhole size={17}/></div><div><strong>尚未验证 SSH 指纹</strong><p>可在机器人上运行 <code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code> 比对。</p></div><button className="button button-subtle" onClick={onConnect}>查看指纹</button></div>}

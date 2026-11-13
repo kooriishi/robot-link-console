@@ -45,6 +45,9 @@ html[data-theme="light"] {
   --a-accent-hover: #0077ed;
   --a-accent-soft: rgba(0, 113, 227, .09);
   --a-focus: #0071e3;
+  --a-focus-border: rgba(0, 113, 227, .45);
+  --a-green-rgb: 52, 199, 89;
+  --a-blue-rgb: 0, 113, 227;
   --a-green: #34c759;
   --a-green-text: #248a3d;
   --a-green-soft: rgba(52, 199, 89, .12);
@@ -87,6 +90,9 @@ html[data-theme="dark"] {
   --a-accent-hover: #0077ed;
   --a-accent-soft: rgba(41, 151, 255, .15);
   --a-focus: #2997ff;
+  --a-focus-border: rgba(41, 151, 255, .5);
+  --a-green-rgb: 48, 209, 88;
+  --a-blue-rgb: 41, 151, 255;
   --a-green: #30d158;
   --a-green-text: #30d158;
   --a-green-soft: rgba(48, 209, 88, .14);
@@ -131,9 +137,10 @@ html[data-theme] body { background: var(--a-canvas); color: var(--a-ink); }
 html[data-theme] ::selection { background: var(--a-accent-soft); }
 
 html[data-theme] button:focus-visible,
-html[data-theme] input:focus-visible,
-html[data-theme] select:focus-visible,
 html[data-theme] summary:focus-visible { outline: 2px solid var(--a-focus); outline-offset: 2px; }
+/* Text fields and selects show focus with a quiet border tint instead of a hard blue ring. */
+html[data-theme] input:focus-visible,
+html[data-theme] select:focus-visible { outline: none; }
 
 /* ---------- Shell ---------- */
 html[data-theme] .app-shell { background: var(--a-canvas); color: var(--a-ink); }
@@ -186,7 +193,7 @@ html[data-theme] .scan-port-field input:focus,
 html[data-theme] .audio-card select:focus,
 html[data-theme] .dhcp-controls .dhcp-cidr input:focus,
 html[data-theme] .modal-card input:not([type=checkbox]):not([type=radio]):focus {
-  border-color: var(--a-focus); box-shadow: 0 0 0 3px var(--a-accent-soft); outline: none;
+  border-color: var(--a-focus-border); box-shadow: none; outline: none;
 }
 
 html[data-theme] .target-add {
@@ -195,6 +202,15 @@ html[data-theme] .target-add {
   font-size: 18px; font-weight: 300;
 }
 html[data-theme] .target-add:hover { background: var(--a-fill-2-hover); color: var(--a-ink); }
+/* The "+" is drawn with two bars so it sits exactly in the centre regardless of font metrics. */
+html[data-theme] .target-add { position: relative; padding: 0; font-size: 0; line-height: 0; }
+html[data-theme] .target-add::before,
+html[data-theme] .target-add::after {
+  content: ''; position: absolute; left: 50%; top: 50%;
+  width: 12px; height: 1.5px; border-radius: 1px; background: currentColor;
+  transform: translate(-50%, -50%);
+}
+html[data-theme] .target-add::after { transform: translate(-50%, -50%) rotate(90deg); }
 
 html[data-theme] .target-summary {
   border: 0; border-radius: var(--a-radius-md);
@@ -402,6 +418,29 @@ html[data-theme] .link-chip {
   color: var(--a-ink-2); font-size: 12px; padding: 5px 11px;
 }
 html[data-theme] .link-speed { color: var(--a-muted-2); font-size: 11px; }
+/* Live link: a soft glow along the cable once SSH is connected. Green for Ethernet, blue for Wi-Fi. */
+html[data-theme] .link-track { --a-link: rgb(var(--a-green-rgb)); --a-link-rgb: var(--a-green-rgb); }
+html[data-theme] .link-track.wireless { --a-link: rgb(var(--a-blue-rgb)); --a-link-rgb: var(--a-blue-rgb); }
+html[data-theme] .link-track.live .link-line {
+  border-top: 1.5px solid rgba(var(--a-link-rgb), .55);
+  box-shadow: 0 0 6px 0 rgba(var(--a-link-rgb), .35);
+}
+html[data-theme] .link-track.live .link-line:before,
+html[data-theme] .link-track.live .link-line:after {
+  background: var(--a-link);
+  box-shadow: 0 0 0 3px rgba(var(--a-link-rgb), .16), 0 0 8px rgba(var(--a-link-rgb), .45);
+  animation: a-link-breathe 2.4s ease-in-out infinite;
+}
+html[data-theme] .link-track.wireless .link-line:before,
+html[data-theme] .link-track.wireless .link-line:after { background: var(--a-link); }
+html[data-theme] .link-track.live .link-chip {
+  border-color: rgba(var(--a-link-rgb), .35);
+  color: var(--a-ink);
+  box-shadow: 0 0 12px rgba(var(--a-link-rgb), .18);
+}
+html[data-theme] .link-track.live .link-chip svg { color: var(--a-link); }
+@keyframes a-link-breathe { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+@media (prefers-reduced-motion: reduce) { html[data-theme] .link-track.live .link-line:before, html[data-theme] .link-track.live .link-line:after { animation: none; } }
 html[data-theme] .connection-footer {
   height: 46px; border-top: 1px solid var(--a-divider);
   color: var(--a-muted); font-size: 12px;
@@ -664,7 +703,9 @@ html[data-theme] .search-input {
   background: var(--a-fill); color: var(--a-muted-2);
   padding: 0 14px;
 }
-html[data-theme] .search-input:focus-within { background: var(--a-surface); box-shadow: 0 0 0 1px var(--a-hairline), 0 0 0 4px var(--a-accent-soft); }
+html[data-theme] .search-input:focus-within { background: var(--a-fill-2); box-shadow: none; border: 0; }
+html[data-theme] .search-input input:focus,
+html[data-theme] .search-input input:focus-visible { outline: none; box-shadow: none; border: 0; }
 html[data-theme] .search-input input { color: var(--a-ink); font-size: 13px; }
 html[data-theme] .search-input input::placeholder { color: var(--a-muted-2); }
 
