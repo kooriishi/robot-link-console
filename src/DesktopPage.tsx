@@ -74,8 +74,8 @@ export function DesktopPage({ target, sshReady, active, runPrivileged, sudoPassw
   useEffect(() => { if (rfbRef.current) rfbRef.current.scaleViewport = scale }, [scale])
   useEffect(() => { if (rfbRef.current) rfbRef.current.viewOnly = viewOnly }, [viewOnly])
   // The DOM Fullscreen API hangs/crashes WebKitGTK inside Tauri; instead make the window fullscreen and
-  // pin the desktop frame over the whole page with CSS. F11 or Ctrl+Alt+Enter toggles it (captured
-  // before noVNC, so the key is not sent to the board).
+  // pin the desktop frame over the whole page with CSS. Ctrl+F11 or Ctrl+Alt+Enter toggles it (captured
+  // before noVNC, so the key is not sent to the board). Plain F11 is reserved by the board's apps.
   const setWindowFullscreen = async (on: boolean) => {
     setFullscreen(on)
     try { await getCurrentWindow().setFullscreen(on) } catch (e) { if (on) setError(`窗口全屏失败，已改为铺满窗口：${errorText(e)}`) }
@@ -83,7 +83,7 @@ export function DesktopPage({ target, sshReady, active, runPrivileged, sudoPassw
   }
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      const toggle = event.key === 'F11' || (event.ctrlKey && event.altKey && event.key === 'Enter')
+      const toggle = (event.ctrlKey && event.key === 'F11') || (event.ctrlKey && event.altKey && event.key === 'Enter')
       if (!toggle || !rfbRef.current) return
       event.preventDefault(); event.stopPropagation()
       void setWindowFullscreen(!fullscreenRef.current)
@@ -199,7 +199,7 @@ export function DesktopPage({ target, sshReady, active, runPrivileged, sudoPassw
           <button className={`button button-subtle ${viewOnly ? 'active' : ''}`} onClick={() => setViewOnly(v => !v)} title="仅查看时不发送键鼠"><Eye size={14}/>仅查看</button>
           <button className="button button-subtle" onClick={() => void pasteClipboard()} disabled={!connected || viewOnly} title="把本机剪贴板文本发给开发板"><ClipboardPaste size={14}/>粘贴</button>
           <button className="button button-subtle" onClick={() => { rfbRef.current?.sendCtrlAltDel(); rfbRef.current?.focus() }} disabled={!connected || viewOnly}><Keyboard size={14}/>Ctrl+Alt+Del</button>
-          <button className="button button-subtle" onClick={toggleFullscreen} disabled={!connected}>{fullscreen ? <Minimize2 size={14}/> : <Maximize2 size={14}/>}{fullscreen ? '退出全屏 (F11)' : '全屏'}</button>
+          <button className="button button-subtle" onClick={toggleFullscreen} disabled={!connected}>{fullscreen ? <Minimize2 size={14}/> : <Maximize2 size={14}/>}{fullscreen ? '退出全屏 (Ctrl+F11)' : '全屏'}</button>
           <button className="button button-danger" onClick={() => void disconnect()}><Power size={14}/>断开</button>
         </div>
       </div>
