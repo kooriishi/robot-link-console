@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>RoboLink</vendor>
+  <action id="dev.robolink.console.net-helper">
+    <description>Configure the wired link to a robot board</description>
+    <description xml:lang="zh_CN">配置与开发板直连的有线网口</description>
+    <message>RoboLink needs administrator rights to scan and configure the wired interface</message>
+    <message xml:lang="zh_CN">RoboLink 需要管理员权限来扫描并配置直连网口</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <!-- Ask once, then keep the authorisation for a few minutes: the one-click flow runs
+           discovery and address setup back to back. -->
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/robolink-net-helper</annotate>
+  </action>
+</policyconfig>

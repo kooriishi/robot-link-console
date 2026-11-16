@@ -86,6 +86,14 @@ fn run() -> Result<(), String> {
             }
             add_address(&interface, &cidr, &peer)
         }
+        Some("add-address-auto") => {
+            let interface = args.next().ok_or("缺少网卡名")?;
+            let peer = args.next().ok_or("缺少已发现的对端 IPv4")?;
+            if args.next().is_some() {
+                return Err("参数过多".into());
+            }
+            add_address_auto(&interface, &peer)
+        }
         Some("remove-address") => {
             let interface = args.next().ok_or("缺少网卡名")?;
             let cidr = args.next().ok_or("缺少本机 IPv4/CIDR")?;
@@ -1572,6 +1580,25 @@ fn add_address(interface: &str, cidr: &str, peer_text: &str) -> Result<(), Strin
     if network(local, prefix).0 != network(peer, prefix).0 {
         return Err(format!("本机地址 {cidr} 与候选设备 {peer} 不在同一网段。前缀长度是用户选择的假设，请调整后再试。"));
     }
+    let via_nm = apply_address(interface, local, prefix, peer)
+        .map_err(|e| e.trim_start_matches(ADDRESS_IN_USE).to_string())?;
+    let cidr_arg = format!("{local}/{prefix}");
+    if via_nm {
+        println!("已通过 NetworkManager 临时连接“{}”在 {interface} 配置 {cidr_arg}（不设默认路由、不改 DNS），切换 Wi‑Fi 或网络重连时不会被清掉；清理后恢复该网口原来的连接。目标前缀 /{prefix} 为用户选择的假设。{peer}", nm_profile_name(interface));
+    } else {
+        println!("已在 {interface} 添加临时地址 {cidr_arg}；默认路由、DNS、Wi‑Fi 和机器人端配置未修改。目标前缀 /{prefix} 为用户选择的假设。{peer}");
+    }
+    Ok(())
+}
+
+/// Adds `local/prefix` to the interface after the conflict checks and rolls it back when the route to
+/// the peer does not end up on this interface. Returns whether NetworkManager holds the address.
+fn apply_address(
+    interface: &str,
+    local: Ipv4Addr,
+    prefix: u8,
+    peer: Ipv4Addr,
+) -> Result<bool, String> {
     let current = all_ipv4_addresses()?;
     if let Some((dev, _, _)) = current.iter().find(|(_, ip, _)| *ip == local) {
         return Err(format!(
@@ -1580,7 +1607,7 @@ fn add_address(interface: &str, cidr: &str, peer_text: &str) -> Result<(), Strin
     }
     check_route_conflicts(interface, local, prefix)?;
     if duplicate_address_probe(interface, local)? {
-        return Err(format!("检测到其他设备正在使用本机候选地址 {local}。没有添加该地址；请在窗口里选择另一个地址。"));
+        return Err(format!("{ADDRESS_IN_USE}检测到其他设备正在使用本机候选地址 {local}。没有添加该地址；请在窗口里选择另一个地址。"));
     }
     let cidr_arg = format!("{local}/{prefix}");
     let via_nm = nm_manages(interface);
@@ -1609,12 +1636,87 @@ fn add_address(interface: &str, cidr: &str, peer_text: &str) -> Result<(), Strin
             "添加后路由检查没有指向选定网卡；已撤销刚添加的地址，其他网络未作更改。".into(),
         );
     }
-    if via_nm {
-        println!("已通过 NetworkManager 临时连接“{}”在 {interface} 配置 {cidr_arg}（不设默认路由、不改 DNS），切换 Wi‑Fi 或网络重连时不会被清掉；清理后恢复该网口原来的连接。目标前缀 /{prefix} 为用户选择的假设。{peer}", nm_profile_name(interface));
+    Ok(via_nm)
+}
+
+/// Marks the one failure `add-address-auto` answers by trying its next candidate.
+const ADDRESS_IN_USE: &str = "\u{1}";
+
+/// Prefix RoboLink assumes for a board whose netmask it cannot know: link-local is /16 by
+/// definition, everything else is treated as the usual /24.
+fn assumed_prefix(peer: Ipv4Addr) -> u8 {
+    if peer.is_link_local() {
+        16
     } else {
-        println!("已在 {interface} 添加临时地址 {cidr_arg}；默认路由、DNS、Wi‑Fi 和机器人端配置未修改。目标前缀 /{prefix} 为用户选择的假设。{peer}");
+        24
     }
-    Ok(())
+}
+
+/// Local addresses to try next to `peer`, most conventional first.
+fn auto_candidates(peer: Ipv4Addr, mac: [u8; 6]) -> Vec<Ipv4Addr> {
+    let p = peer.octets();
+    if peer.is_link_local() {
+        // RFC 3927 keeps 169.254.0.x and 169.254.255.x reserved; spread the rest by MAC.
+        return (0..6u8)
+            .map(|i| {
+                let third = 1 + (mac[4].wrapping_add(i.wrapping_mul(37)) % 254);
+                let fourth = 1 + (mac[5].wrapping_add(i.wrapping_mul(101)) % 254);
+                Ipv4Addr::new(169, 254, third, fourth)
+            })
+            .filter(|ip| *ip != peer)
+            .collect();
+    }
+    [1u8, 2, 254, 100, 200, 50, 10, 20]
+        .into_iter()
+        .filter(|host| *host != p[3])
+        .map(|host| Ipv4Addr::new(p[0], p[1], p[2], host))
+        .collect()
+}
+
+/// One-click variant of `add-address`: picks a free local address in the board's subnet itself, or
+/// reports the address the interface already has there. Prints `{"cidr":…,"existing":…}`.
+fn add_address_auto(interface: &str, peer_text: &str) -> Result<(), String> {
+    physical_ethernet(interface, true)?;
+    let peer = peer_text
+        .parse::<Ipv4Addr>()
+        .map_err(|_| "开发板候选 IPv4 格式无效")?;
+    if peer.is_unspecified() || peer.is_loopback() || peer.is_multicast() || peer.is_broadcast() {
+        return Err("开发板候选 IPv4 不可用".into());
+    }
+    let report = |cidr: String, existing: bool| {
+        println!(
+            "{}",
+            serde_json::json!({ "cidr": cidr, "existing": existing })
+        );
+    };
+    if let Some((_, ip, prefix)) = all_ipv4_addresses()?.into_iter().find(|(dev, ip, prefix)| {
+        dev == interface && *ip != peer && network(*ip, *prefix).0 == network(peer, *prefix).0
+    }) {
+        report(format!("{ip}/{prefix}"), true);
+        return Ok(());
+    }
+    let prefix = assumed_prefix(peer);
+    let host_mask = !(u32::MAX << (32 - prefix));
+    if u32::from(peer) & host_mask == 0 || u32::from(peer) & host_mask == host_mask {
+        return Err(
+            "开发板地址是 /24 网段的网络地址或广播地址，无法自动判断网段；请手动配置本机 IP。"
+                .into(),
+        );
+    }
+    let mac = interface_mac(interface).unwrap_or([0; 6]);
+    for local in auto_candidates(peer, mac) {
+        match apply_address(interface, local, prefix, peer) {
+            Ok(_) => {
+                report(format!("{local}/{prefix}"), false);
+                return Ok(());
+            }
+            Err(error) if error.starts_with(ADDRESS_IN_USE) || error.contains("已由网卡") => {
+                continue
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err("自动挑选的本机地址都已被占用；请手动配置本机 IP。".into())
 }
 
 // NetworkManager integration. A bare `ip address add` on an interface that NetworkManager manages is
@@ -1824,6 +1926,26 @@ fn remove_address(interface: &str, cidr: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_candidates_stay_in_the_peer_subnet_and_skip_the_peer() {
+        let peer = Ipv4Addr::new(192, 168, 10, 1);
+        let list = auto_candidates(peer, [0; 6]);
+        assert_eq!(list[0], Ipv4Addr::new(192, 168, 10, 2));
+        assert!(list
+            .iter()
+            .all(|ip| *ip != peer && ip.octets()[..3] == [192, 168, 10]));
+        assert_eq!(assumed_prefix(peer), 24);
+
+        let peer = Ipv4Addr::new(169, 254, 7, 9);
+        let list = auto_candidates(peer, [2, 0, 0, 0, 0xfe, 0xff]);
+        assert!(!list.is_empty());
+        assert!(list.iter().all(|ip| {
+            let o = ip.octets();
+            ip.is_link_local() && (1..=254).contains(&o[2]) && (1..=254).contains(&o[3])
+        }));
+        assert_eq!(assumed_prefix(peer), 16);
+    }
 
     fn arp_frame(operation: u16, sender_ip: Ipv4Addr, target_ip: Ipv4Addr) -> Vec<u8> {
         let mut frame = vec![0_u8; 42];

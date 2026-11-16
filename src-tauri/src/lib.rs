@@ -12,6 +12,10 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let state = AppState::new().map_err(std::io::Error::other)?;
+            // Host-key pins used to be stored per address; they now belong to the device.
+            if let Err(error) = ssh::migrate_pins(&state) {
+                eprintln!("RoboLink: 迁移主机指纹失败：{error}");
+            }
             app.manage(state);
             Ok(())
         })
@@ -24,6 +28,14 @@ pub fn run() {
             commands::trust_host_key,
             commands::forget_host_key,
             commands::ssh_connection_ready,
+            commands::get_channel_status,
+            commands::drop_channel,
+            commands::set_key_login,
+            commands::sync_targets_with_discovery,
+            commands::relocate_target,
+            commands::auto_direct_address,
+            commands::power_action,
+            commands::collect_diagnostics,
             commands::scan_direct_interface,
             commands::scan_direct_interfaces,
             commands::discover_direct_devices,

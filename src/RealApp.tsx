@@ -15,7 +15,13 @@ import {
 } from 'lucide-react'
 
 type Page = 'overview' | 'network' | 'services' | 'bluetooth' | 'audio' | 'terminal' | 'desktop' | 'logs'
-type Target = { id: string; name: string; host: string; port: number; username: string }
+type Target = { id: string; name: string; host: string; port: number; username: string; macs?: string[]; interface?: string | null; keyLogin?: boolean }
+type TargetDraftState = { id: string; name: string; host: string; port: string; username: string; mac: string; interface: string }
+type ChannelStatus = { pinned: boolean; ready: boolean; via: 'session' | 'key' | 'none'; keyLogin: boolean }
+type TargetMove = { targetId: string; name: string; oldHost: string; newHost: string; interface?: string | null }
+type AutoAddress = { interface: string; cidr: string; peer: string; existing: boolean; owned: OwnedNetworkAddress[] }
+type DiagnosticsReport = { path: string; bytes: number; preview: string }
+type Waiting = { since: number; reason: 'lost' | 'reboot' | 'poweroff' }
 type HostInterface = { name: string; kind: string; mac?: string; ipv4: string[]; carrier: boolean; state: string; mtu?: number }
 type HostInfo = { hostname: string; os: string; interfaces: HostInterface[] }
 type DiscoveredHost = { address: string; interface: string; mac: string; port: number; portOpen: boolean; routeReady: boolean; source: string; confidence: string; arpReachable?: boolean | null; icmpReachable?: boolean | null; portChecked: boolean; ipv4?: string[]; ipv6?: string[] }
@@ -23,7 +29,7 @@ type DiscoveryOptions = { passiveArp: boolean; passiveDhcp: boolean; passiveIpv6
 type DiscoveryReport = { hosts: DiscoveredHost[]; skippedInterfaces: string[]; warnings: string[] }
 type DhcpStatus = { interface: string; cidr: string; running: boolean; owned: boolean; message: string; id: string }
 type OwnedNetworkAddress = { interface: string; cidr: string; peer: string; persistent: boolean }
-type HostKeyStatus = { fingerprints: string[]; pinnedFingerprints: string[]; trusted: boolean; changed: boolean }
+type HostKeyStatus = { fingerprints: string[]; pinnedFingerprints: string[]; trusted: boolean; changed: boolean; observedMac?: string | null; otherDevice?: boolean }
 type RemoteOverview = { hostname: string; uptime: string; load: string; memoryTotalKb?: number; memoryAvailableKb?: number; temperatureC?: number }
 type Service = { name: string; description: string; active: string; subState: string; enabled: string; scope?: 'system' | 'user' }
 type ServiceScope = 'system' | 'user'
@@ -121,7 +127,17 @@ export default function RealApp() {
   const [terminalExited, setTerminalExited] = useState(false)
   const [sshReady, setSshReady] = useState(false)
   const [targetDialog, setTargetDialog] = useState(false)
-  const [targetDraft, setTargetDraft] = useState({ id: '', name: '', host: '', port: '22', username: 'robot' })
+  const [targetDraft, setTargetDraft] = useState<TargetDraftState>({ id: '', name: '', host: '', port: '22', username: 'robot', mac: '', interface: '' })
+  // Background channel (terminal login or RoboLink key), independent of whether a terminal is open.
+  const [channel, setChannel] = useState<ChannelStatus | null>(null)
+  const [progress, setProgress] = useState('')
+  const [waiting, setWaiting] = useState<Waiting | null>(null)
+  const [recoveryKick, setRecoveryKick] = useState(0)
+  const [diagnostics, setDiagnostics] = useState<DiagnosticsReport | null>(null)
+  const readyRef = useRef(false)
+  const expectedDropRef = useRef(0)
+  const sawDownRef = useRef(false)
+  const connectAfterSaveRef = useRef(false)
   const [keyDialog, setKeyDialog] = useState(false)
   const [trustChecked, setTrustChecked] = useState(false)
   const [selectedFingerprint, setSelectedFingerprint] = useState('')
@@ -196,7 +212,7 @@ export default function RealApp() {
   }, [selectedId])
 
   useEffect(() => {
-    if (!selectedId || !keyStatus?.trusted || !sshReady) return
+    if (!selectedId || !sshReady) return
     const cacheKey = `${selectedId}:${page}${page === 'services' ? `:${serviceScope}` : ''}`
     const forced = pageRefreshSeenRef.current !== refreshCount
     pageRefreshSeenRef.current = refreshCount
@@ -226,7 +242,7 @@ export default function RealApp() {
     }
     void load()
     return () => { cancelled = true; setPageLoading(false) }
-  }, [page, selectedId, keyStatus?.trusted, sshReady, refreshCount, serviceScope])
+  }, [page, selectedId, sshReady, refreshCount, serviceScope])
 
   useEffect(() => { if (!sshReady) pageLoadedAtRef.current.clear() }, [sshReady])
 
@@ -253,7 +269,7 @@ export default function RealApp() {
       if (id === activeTerminalRef.current) {
         // Keep RoboLink's direct-link address when a session ends (network blip, `exit`, Wi-Fi switch):
         // removing it here made reconnecting and re-reading the host key impossible until it was re-added.
-        setTerminalExited(true); setSshReady(false); terminalWriterRef.current?.write(event.payload.data)
+        setTerminalExited(true); terminalWriterRef.current?.write(event.payload.data)
       }
       else if (openingTerminalRef.current) terminalExitQueue.add(id)
     }).then(fn => { offExit = fn })
@@ -261,24 +277,34 @@ export default function RealApp() {
     return () => { offOutput?.(); offExit?.() }
   }, [])
 
+  const selectedRef = useRef(selected); selectedRef.current = selected
+  const hostInfoRef = useRef(hostInfo); hostInfoRef.current = hostInfo
+  const waitingRef = useRef(waiting); waitingRef.current = waiting
+  const channelRef = useRef(channel); channelRef.current = channel
+  const terminalStateRef = useRef({ sessionId, terminalExited }); terminalStateRef.current = { sessionId, terminalExited }
+  const onChannelChangeRef = useRef<(status: ChannelStatus) => void>(() => {})
+
+  useEffect(() => { setChannel(null); readyRef.current = false; setWaiting(null) }, [selectedId])
+  // The channel is polled whenever a robot is selected: pages follow it, not the terminal.
   useEffect(() => {
-    if (!sessionId || !selectedId || terminalExited) { setSshReady(false); return }
+    if (!selectedId) { setSshReady(false); return }
     let cancelled = false
-    let timer = 0
+    let running = false
     const poll = async () => {
+      if (running) return
+      running = true
       try {
-        const ready = await invoke<boolean>('ssh_connection_ready', { targetId: selectedId })
-        if (ready && !cancelled) {
-          setSshReady(true)
-          setLogs(items => items.some(item => item.text === 'SSH 认证完成') ? items : [{ at: now(), text: 'SSH 认证完成', tone: 'ok' as const }, ...items].slice(0, 500))
-          window.clearInterval(timer)
-        }
-      } catch { /* A missing ControlMaster means the user may still be entering SSH credentials. */ }
+        const status = await invoke<ChannelStatus>('get_channel_status', { targetId: selectedId })
+        if (cancelled) return
+        setChannel(status); setSshReady(status.ready)
+        if (status.ready !== readyRef.current) { readyRef.current = status.ready; onChannelChangeRef.current(status) }
+      } catch { /* target removed meanwhile */ }
+      finally { running = false }
     }
     void poll()
-    timer = window.setInterval(() => { void poll() }, 800)
+    const timer = window.setInterval(() => { void poll() }, sessionId && !terminalExited && !sshReady ? 800 : 3000)
     return () => { cancelled = true; window.clearInterval(timer) }
-  }, [sessionId, selectedId, terminalExited])
+  }, [selectedId, sessionId, terminalExited, sshReady])
 
   // Forget the active id before closing, so the old session's terminal-exit event cannot be taken for the new one.
   const closeActiveTerminal = async () => {
@@ -292,22 +318,25 @@ export default function RealApp() {
     terminalOutputQueue.delete(sessionId); terminalExitQueue.delete(sessionId); activeTerminalRef.current = ''; terminalWriterRef.current = null; setSessionId(''); setTerminalExited(false); setSshReady(false)
     pageLoadedAtRef.current.clear()
     setRemoteOverview(null); setServices([]); setRemoteNetwork(null); setBluetooth(null); setAudio(null)
+    expectedDropRef.current = 0
     setSelectedId(id); setKeyStatus(null); setError(''); setPage('overview')
   }
   const refreshNow = () => { setRefreshCount(n => n + 1); void invoke<HostInfo>('get_host_info').then(setHostInfo).catch(e => setError(displayError(e))) }
-  const openNewTarget = (prefill = '', port = 22, username = 'robot') => {
-    setTargetDraft({ id: '', name: prefill ? `机器人 ${prefill}` : '', host: prefill, port: String(port), username })
+  const openNewTarget = (prefill = '', port = 22, username = 'robot', mac = '', iface = '') => {
+    connectAfterSaveRef.current = false
+    setTargetDraft({ id: '', name: prefill ? `机器人 ${prefill}` : '', host: prefill, port: String(port), username, mac, interface: iface })
     setTargetDialog(true)
   }
   const saveTarget = async (e: FormEvent) => {
     e.preventDefault()
-    const draft = { id: targetDraft.id || null, name: targetDraft.name, host: targetDraft.host, port: Number(targetDraft.port), username: targetDraft.username }
+    const draft = { id: targetDraft.id || null, name: targetDraft.name, host: targetDraft.host, port: Number(targetDraft.port), username: targetDraft.username, mac: targetDraft.mac || null, interface: targetDraft.interface || null }
     const saved = await withBusy(() => invoke<Target>('save_target', { draft }))
     if (saved) {
       const latest = await invoke<Target[]>('list_targets')
       setTargets(latest); setSelectedId(saved.id); setTargetDialog(false); setKeyStatus(null)
       log(`已保存 SSH 目标 ${saved.name} · ${saved.username}@${saved.host}:${saved.port}`)
-      notify('SSH 目标已保存；首次连接前需核对主机指纹')
+      if (connectAfterSaveRef.current) { connectAfterSaveRef.current = false; await connectTarget(saved) }
+      else notify('SSH 目标已保存；首次连接前需核对主机指纹')
     }
   }
   const deleteTarget = (target: Target) => setConfirm({ title: `移除 ${target.name}？`, description: '将从本机删除目标配置和本应用保存的主机指纹，不会改动机器人，也不会删除系统 SSH 配置。', danger: true, run: async () => {
@@ -315,13 +344,16 @@ export default function RealApp() {
     await invoke('delete_target', { id: target.id }); const latest = await invoke<Target[]>('list_targets'); setTargets(latest); setSelectedId(latest[0]?.id ?? ''); setKeyStatus(null); setConfirm(null); log(`移除目标 ${target.name}`, 'warn')
   } })
 
-  const connectTarget = async () => {
-    if (!selected) { openNewTarget(); return }
-    const status = await withBusy(() => invoke<HostKeyStatus>('get_host_key_status', { targetId: selected.id }))
+  const connectTarget = async (explicit?: Target) => {
+    const target = explicit ?? selected
+    if (!target) { openNewTarget(); return }
+    // Already logged in (key or earlier terminal): no need to read the host key again.
+    if (target.id === selectedId && readyRef.current) { await openTerminal(target); return }
+    const status = await withBusy(() => invoke<HostKeyStatus>('get_host_key_status', { targetId: target.id }))
     if (!status) return
-    if (status.trusted && !status.changed) { setKeyStatus(status); await openTerminal(); return }
+    if (status.trusted && !status.changed) { setKeyStatus(status); await openTerminal(target); return }
     setKeyStatus(status); setTrustChecked(false); setSelectedFingerprint(status.fingerprints[0] ?? ''); setKeyDialog(true)
-    if (status.changed) log(`检测到 ${selected.name} 的 SSH 主机密钥与已固定值不同`, 'warn')
+    if (status.changed) log(status.otherDevice ? `${target.host} 现在是另一台设备（MAC ${status.observedMac}），不是 ${target.name}` : `检测到 ${target.name} 的 SSH 主机密钥与已固定值不同`, 'warn')
   }
   const trustAndConnect = async () => {
     if (!selected || !keyStatus || !trustChecked || !selectedFingerprint) return
@@ -330,6 +362,7 @@ export default function RealApp() {
     if (!result) return
     setKeyStatus({ ...keyStatus, trusted: true, changed: false, pinnedFingerprints: [selectedFingerprint] })
     setKeyDialog(false); log(`已由用户确认并固定 ${selected.name} 的 SSH 主机密钥`, 'ok')
+    void invoke<Target[]>('list_targets').then(setTargets).catch(() => {})
     await openTerminal()
   }
   const clearChangedPin = () => {
@@ -338,20 +371,192 @@ export default function RealApp() {
       await invoke('forget_host_key', { targetId: selected.id }); const status = await invoke<HostKeyStatus>('get_host_key_status', { targetId: selected.id }); setKeyStatus(status); setTrustChecked(false); setSelectedFingerprint(status.fingerprints[0] ?? ''); setConfirm(null); log(`已清除 ${selected.name} 的旧 SSH 主机指纹，等待重新核验`, 'warn')
     } })
   }
-  const openTerminal = async () => {
-    if (!selected) return
-    if (sessionId && !terminalExited && activeTerminalRef.current === sessionId) { setPage('terminal'); return }
+  // `quiet` reopens the terminal in the background (auto-recovery) without switching pages.
+  const openTerminal = async (explicit?: Target, quiet = false) => {
+    const target = explicit ?? selected
+    if (!target) return
+    if (sessionId && !terminalExited && activeTerminalRef.current === sessionId) { if (!quiet) setPage('terminal'); return }
     await closeActiveTerminal()
     await terminalEventsReadyRef.current
     openingTerminalRef.current = true
-    const result = await withBusy(() => invoke<string>('open_ssh_terminal', { targetId: selected.id }))
+    const result = await withBusy(() => invoke<string>('open_ssh_terminal', { targetId: target.id }))
     openingTerminalRef.current = false
-    if (result) { activeTerminalRef.current = result; terminalWriterRef.current = null; setSessionId(result); setTerminalExited(terminalExitQueue.delete(result)); setSshReady(false); setPage('terminal'); log(`已打开到 ${selected.name} 的 SSH PTY 会话`, 'ok') }
+    if (result) { activeTerminalRef.current = result; terminalWriterRef.current = null; setSessionId(result); setTerminalExited(terminalExitQueue.delete(result)); if (!quiet) setPage('terminal'); log(`已打开到 ${target.name} 的 SSH 终端`, 'ok') }
   }
   const disconnectTerminal = async () => {
     terminalWriterRef.current?.write('\r\n[已断开 SSH 会话]\r\n')
+    expectedDropRef.current = Date.now() + 8000
     await closeActiveTerminal()
-    setSessionId(''); setTerminalExited(false); setSshReady(false); log('已断开 SSH 终端会话；本机直连地址保留，可直接重新连接')
+    setSessionId(''); setTerminalExited(false); log('已关闭 SSH 终端；本机直连地址保留，可直接重新连接')
+  }
+
+  const reloadTargets = async () => { const latest = await invoke<Target[]>('list_targets'); setTargets(latest); return latest }
+  const offerKeyLogin = (target: Target) => setConfirm({ title: '启用免密连接？', description: `RoboLink 会把自己的公钥加到 ${target.name} 的 ~/.ssh/authorized_keys。之后各页面不再依赖终端登录，断线或重启后也能自动连回来。\n\n私钥只保存在本机；随时可以在“设备总览”里关闭。`, run: async () => {
+    await invoke<Target>('set_key_login', { targetId: target.id, enabled: true }); await reloadTargets()
+    setConfirm(null); log(`已为 ${target.name} 启用免密连接`, 'ok'); notify('免密连接已启用')
+  } })
+  const toggleKeyLogin = () => {
+    if (!selected) return
+    if (!selected.keyLogin) { if (!readyRef.current) { notify('请先连接并登录一次，再启用免密连接'); return } offerKeyLogin(selected); return }
+    setConfirm({ title: '关闭免密连接？', description: `将从 ${selected.name} 的 authorized_keys 里移除 RoboLink 的公钥（开发板不在线时只在本机关闭）。之后需要在终端里登录。`, run: async () => {
+      expectedDropRef.current = Date.now() + 8000
+      await invoke<Target>('set_key_login', { targetId: selected.id, enabled: false }); await reloadTargets()
+      setConfirm(null); log(`已关闭 ${selected.name} 的免密连接`, 'warn')
+    } })
+  }
+  onChannelChangeRef.current = (status: ChannelStatus) => {
+    const target = selectedRef.current
+    if (!target) return
+    if (status.ready) {
+      log(status.via === 'key' ? `已用 RoboLink 密钥连上 ${target.name}` : 'SSH 认证完成', 'ok')
+      void reloadTargets().catch(() => {})
+      if (waitingRef.current) {
+        setWaiting(null); notify(`${target.name} 已重新连上`); log(`${target.name} 已恢复连接`, 'ok')
+        const terminal = terminalStateRef.current
+        if (terminal.sessionId && terminal.terminalExited) void openTerminal(target, true)
+      }
+      const askedKey = `robolink-key-asked-${target.id}`
+      if (!status.keyLogin && status.via === 'session' && !localStorage.getItem(askedKey)) {
+        localStorage.setItem(askedKey, '1')
+        window.setTimeout(() => { if (selectedRef.current?.id === target.id && readyRef.current) offerKeyLogin(target) }, 1500)
+      }
+    } else {
+      sawDownRef.current = true
+      if (Date.now() < expectedDropRef.current) { expectedDropRef.current = 0; return }
+      if (!waitingRef.current) { log(`与 ${target.name} 的连接断开，正在等它回来`, 'warn'); setWaiting({ since: Date.now(), reason: 'lost' }) }
+    }
+  }
+
+  // While waiting for the board: follow it to a new IP by MAC; the channel poll reconnects by key,
+  // and without a key the terminal is reopened for a password login once the board answers again.
+  useEffect(() => {
+    if (!waiting || !selectedId) return
+    let cancelled = false
+    let running = false
+    const tick = async () => {
+      if (running || cancelled) return
+      running = true
+      try {
+        if (Date.now() - waiting.since > 10 * 60_000) { setWaiting(null); log('等了 10 分钟开发板仍未回来，已停止等待', 'warn'); return }
+        const moved = await invoke<TargetMove | null>('relocate_target', { targetId: selectedId }).catch(() => null)
+        if (cancelled) return
+        if (moved) { await reloadTargets(); log(`${moved.name} 的地址从 ${moved.oldHost} 变为 ${moved.newHost}，已按 MAC 自动更新`, 'ok') }
+        if (channelRef.current?.keyLogin || readyRef.current) return
+        const status = await invoke<HostKeyStatus>('get_host_key_status', { targetId: selectedId }).catch(() => null)
+        if (cancelled) return
+        if (!status) { sawDownRef.current = true; return }
+        if (!status.trusted || !sawDownRef.current) return
+        setWaiting(null); setKeyStatus(status); log('开发板已重新上线，请在终端里登录', 'ok'); notify('开发板回来了，请在终端里重新登录')
+        const target = selectedRef.current
+        if (target) await openTerminal(target)
+      } finally { running = false }
+    }
+    const first = window.setTimeout(() => { void tick() }, waiting.reason === 'lost' ? 1500 : 6000)
+    const timer = window.setInterval(() => { void tick() }, 5000)
+    return () => { cancelled = true; window.clearTimeout(first); window.clearInterval(timer) }
+  }, [waiting, selectedId, recoveryKick])
+
+  // Cable watch: an unplugged cable ends the channel at once instead of after SSH's ~45 s timeout,
+  // and plugging it back in triggers an immediate search.
+  useEffect(() => {
+    if (!selectedId) return
+    const timer = window.setInterval(async () => {
+      const next = await invoke<HostInfo>('get_host_info').catch(() => null)
+      const previous = hostInfoRef.current
+      if (!next || !previous) return
+      if (JSON.stringify(next) !== JSON.stringify(previous)) setHostInfo(next)
+      for (const iface of next.interfaces.filter(i => i.kind === '有线以太网')) {
+        const before = previous.interfaces.find(i => i.name === iface.name)
+        if (!before || before.carrier === iface.carrier) continue
+        if (iface.carrier) { log(`网线已接上（${iface.name}）`); setRecoveryKick(n => n + 1); continue }
+        log(`网线已拔出（${iface.name}）`, 'warn')
+        const target = selectedRef.current
+        const uses = target && (target.interface ? target.interface === iface.name : reachesVia(target.host, before))
+        if (target && uses && readyRef.current) void invoke('drop_channel', { targetId: target.id }).catch(() => {})
+      }
+    }, 4000)
+    return () => window.clearInterval(timer)
+  }, [selectedId])
+
+  const powerAction = (action: 'reboot' | 'poweroff') => {
+    if (!selected) return
+    const label = action === 'reboot' ? '重启' : '关机'
+    showConfirm(`${label} ${selected.name}？`, action === 'reboot' ? '开发板会立即重启，所有连接都会断开。RoboLink 会等它回来并自动重新连接。' : '开发板会立即关机。重新上电后 RoboLink 会自动重新连接。', async () => {
+      await runPrivileged(`${label}开发板`, sudoPassword => invoke<string>('power_action', { targetId: selected.id, action, sudoPassword }))
+      sawDownRef.current = false
+      setConfirm(null); setWaiting({ since: Date.now(), reason: action }); log(`已让 ${selected.name} ${label}`, 'warn')
+    }, true)
+  }
+  const collectDiagnostics = async () => {
+    if (!selected || !(await requireSession())) return
+    setProgress('正在采集板端诊断信息…')
+    const report = await withBusy(() => invoke<DiagnosticsReport>('collect_diagnostics', { targetId: selected.id, sudoPassword: sudoPasswordRef.current || null }))
+    setProgress('')
+    if (report) { setDiagnostics(report); log(`板端诊断已保存到 ${report.path}`, 'ok') }
+  }
+  const autoAddress = async (host: DiscoveredHost) => {
+    const result = await invoke<AutoAddress>('auto_direct_address', { interface: host.interface, peer: host.address })
+    setOwnedNetworkAddresses(result.owned)
+    setDiscovered(items => items.map(item => item.interface === host.interface && item.address === host.address ? { ...item, routeReady: true } : item))
+    log(result.existing ? `${result.interface} 已有同网段地址 ${result.cidr}` : `已为 ${result.interface} 自动配置本机地址 ${result.cidr}`, 'ok')
+    void invoke<HostInfo>('get_host_info').then(setHostInfo).catch(() => {})
+    return result
+  }
+  // "配置本机 IP 后添加" on a candidate: pick the address automatically, fall back to the manual dialog.
+  const prepareCandidate = async (host: DiscoveredHost) => {
+    if (host.address.includes(':')) { openAddressDialog(host); return }
+    setBusy(true); setError('')
+    try {
+      await autoAddress(host)
+      if (!targets.some(t => t.host === host.address)) openNewTarget(host.address, Number(scanPort) || 22, 'sunrise', host.mac, host.interface)
+      else notify('本机直连地址已配置，可以连接了')
+    } catch (e) { setError(`${displayError(e)}（已打开手动配置）`); openAddressDialog(host) }
+    finally { setBusy(false) }
+  }
+  // One-click direct link: find the board, give this PC a matching address, then connect.
+  const quickConnect = async (retry = false) => {
+    setBusy(true); setError('')
+    try {
+      setProgress('检查网线…')
+      const info = await invoke<HostInfo>('get_host_info'); setHostInfo(info)
+      const wired = info.interfaces.filter(i => i.kind === '有线以太网' && i.carrier)
+      if (!wired.length) throw new Error('没有检测到插好的网线。请检查网线两端和开发板电源后再试。')
+      setProgress('正在寻找开发板，大约 10 秒（会请求一次系统授权）…')
+      const port = selected?.port ?? 22
+      const report = await invoke<DiscoveryReport>('discover_direct_devices', { port, interfaces: [], options: defaultDiscoveryOptions })
+      setDiscoveryReport(report); setDiscovered(report.hosts)
+      const hosts = report.hosts.filter(h => !h.address.includes(':'))
+      const moves = await invoke<TargetMove[]>('sync_targets_with_discovery', { seen: hosts.filter(h => h.mac).map(h => ({ address: h.address, mac: h.mac, interface: h.interface })) })
+      for (const m of moves) log(`${m.name} 的地址从 ${m.oldHost} 变为 ${m.newHost}，已按 MAC 自动更新`, 'ok')
+      const latest = await reloadTargets()
+      const known = (h: DiscoveredHost) => latest.find(t => t.host === h.address)
+      const pairs = hosts.map(h => ({ host: h, target: known(h) })).filter(p => p.target) as { host: DiscoveredHost; target: Target }[]
+      const pick = pairs.find(p => p.target.id === selectedId) ?? (pairs.length === 1 ? pairs[0] : undefined)
+      if (!pick && !hosts.length) {
+        if (retry) throw new Error('仍然没有发现开发板。请确认开发板已开机、网线指示灯亮；也可以到“网络与 Wi-Fi”页手动添加它的 IP。')
+        const iface = wired[0].name
+        showConfirm('没有发现开发板', `10 秒内没有设备应答。如果开发板是自动获取地址（DHCP），可以在 ${iface} 上启动直连 DHCP 给它分配地址，然后再找一次。\n\n只在这张网卡上生效，不提供网关和 DNS。`, async () => {
+          const statuses = await invoke<DhcpStatus[]>('start_direct_dhcp', { interface: iface, cidr: '192.168.77.1/24' })
+          setDhcpStatuses(statuses); setConfirm(null); log(`已启动直连 DHCP：${iface} · 192.168.77.1/24`, 'warn')
+          setProgress('等待开发板获取地址…')
+          window.setTimeout(() => { void quickConnect(true) }, 7000)
+        })
+        return
+      }
+      if (!pick && (pairs.length > 1 || hosts.length > 1)) { navPage('network'); notify(`发现 ${hosts.length} 台设备，请在列表里选择`); return }
+      const host = pick?.host ?? hosts[0]
+      if (!host.routeReady) { setProgress('正在为本机网口选择不冲突的地址…'); await autoAddress(host) }
+      if (pick) {
+        setProgress(`正在连接 ${pick.target.name}…`)
+        if (pick.target.id !== selectedId) await selectTarget(pick.target.id)
+        await connectTarget(pick.target)
+      } else {
+        openNewTarget(host.address, port, 'sunrise', host.mac, host.interface)
+        connectAfterSaveRef.current = true
+        notify(`找到开发板 ${host.address}，确认用户名后即可连接`)
+      }
+    } catch (e) { setError(displayError(e)) }
+    finally { setBusy(false); setProgress('') }
   }
   const scanInterface = async () => {
     const requestedPort = Number(scanPort)
@@ -460,7 +665,7 @@ export default function RealApp() {
   const requireSession = async () => {
     if (sshReady) return true
     if (selected && await invoke<boolean>('ssh_connection_ready', { targetId: selected.id }).catch(() => false)) return true
-    setError('SSH 还没有登录或已经断开。请先到“终端”页点击连接并完成登录，再执行此操作。')
+    setError('还没有连上开发板。请先点击“连接机器人”并完成登录，再执行此操作。')
     return false
   }
   const withScan = async <T,>(kind: 'wifi' | 'bluetooth', action: () => Promise<T>): Promise<T | undefined> => {
@@ -533,7 +738,7 @@ export default function RealApp() {
         await terminalEventsReadyRef.current; openingTerminalRef.current = true
         let result: string | null
         try { result = await invoke<string | null>('bluetooth_action', { targetId: selected.id, address: device.address, action }) } finally { openingTerminalRef.current = false }
-        setConfirm(null); if (result) { activeTerminalRef.current = result; terminalWriterRef.current = null; setSessionId(result); setTerminalExited(terminalExitQueue.delete(result)); setSshReady(false); setPage('terminal') } log(`请求蓝牙配对 ${device.name}`, 'warn')
+        setConfirm(null); if (result) { activeTerminalRef.current = result; terminalWriterRef.current = null; setSessionId(result); setTerminalExited(terminalExitQueue.delete(result)); setPage('terminal') } log(`请求蓝牙配对 ${device.name}`, 'warn')
       }, true); return
     }
     if (!(await requireSession())) return
@@ -556,6 +761,7 @@ export default function RealApp() {
     if (!selected) return
     await withBusy(async () => { await invoke('play_test_audio', { targetId: selected.id }); log('已在机器人请求播放 440 Hz 测试音') })
   }
+  const pinned = !!keyStatus?.trusted || !!channel?.pinned
   const visibleServices = services.filter(s => `${s.name} ${s.description}`.toLowerCase().includes(serviceQuery.toLowerCase()))
   const wiredInterfaces = hostInfo?.interfaces.filter(i => i.kind === '有线以太网') ?? []
   // Pages opened programmatically (e.g. connecting jumps to the terminal) must also be mounted, or they render blank.
@@ -570,28 +776,30 @@ export default function RealApp() {
         <select aria-label="选择机器人目标" value={selectedId} onChange={e => selectTarget(e.target.value)}><option value="">选择机器人…</option>{targets.map(t => <option value={t.id} key={t.id}>{t.name} · {t.host}</option>)}</select>
         <button className="icon-button target-add" onClick={() => openNewTarget()} title="添加 SSH 目标" aria-label="添加 SSH 目标">+</button>
       </div>
-      {selected && <div className="target-summary"><span className={`target-status-dot ${keyStatus?.trusted ? 'online' : ''}`}/><span><strong>{selected.name}</strong><small>{selected.username}@{selected.host}:{selected.port}</small></span><button className="icon-button" title="删除目标" aria-label="删除目标" onClick={() => deleteTarget(selected)}><Trash2 size={14}/></button></div>}
+      {selected && <div className="target-summary"><span className={`target-status-dot ${sshReady ? 'online' : ''}`}/><span><strong>{selected.name}</strong><small>{selected.username}@{selected.host}:{selected.port}</small></span><button className="icon-button" title="删除目标" aria-label="删除目标" onClick={() => deleteTarget(selected)}><Trash2 size={14}/></button></div>}
       <div className="nav-label">设备管理</div>
       <nav className="nav-list" aria-label="主导航">{nav.map(({ id, label, icon: Icon }) => <button key={id} className={`nav-item ${page === id ? 'active' : ''}`} onClick={() => navPage(id)}><Icon size={18}/><span>{label}</span>{id === 'services' && services.some(s => s.active !== 'active') && <span className="nav-badge">!</span>}</button>)}</nav>
-      <div className="sidebar-bottom"><div className="connection-mini"><div className="connection-mini-top"><span className={`pulse-dot ${sshReady && !terminalExited ? '' : 'offline'}`}/>{sshReady && !terminalExited ? 'SSH 已认证' : sessionId && !terminalExited ? '等待 SSH 认证' : '等待 SSH 连接'}</div><div className="connection-mini-bottom"><Cable size={13}/>{hostInfo?.hostname ?? 'Linux 开发机'} <ChevronRight size={12}/>{localInterface || '选择有线网卡'}<ChevronRight size={12}/>机器人</div></div>
+      <div className="sidebar-bottom"><div className="connection-mini"><div className="connection-mini-top"><span className={`pulse-dot ${sshReady ? '' : 'offline'}`}/>{sshReady ? (channel?.via === 'key' ? '已连接 · 免密' : 'SSH 已认证') : waiting ? '等待开发板回来' : sessionId && !terminalExited ? '等待 SSH 认证' : '等待 SSH 连接'}</div><div className="connection-mini-bottom"><Cable size={13}/>{hostInfo?.hostname ?? 'Linux 开发机'} <ChevronRight size={12}/>{localInterface || '选择有线网卡'}<ChevronRight size={12}/>机器人</div></div>
         <div className="profile-row"><div className="profile-avatar">RL</div><div className="profile-copy"><strong>{hostInfo?.os ?? 'Linux 开发机'}</strong><small>本机操作 · 默认不提权</small></div><ShieldCheck size={17} className="muted"/></div></div>
     </aside>
     {mobileNav && <button className="mobile-scrim" onClick={() => setMobileNav(false)} aria-label="关闭菜单"/>}
     <button className="theme-toggle" onClick={toggleTheme} aria-label={theme === 'dark' ? '切换到浅色模式' : '切换到深色模式'} title={theme === 'dark' ? '浅色模式' : '深色模式'}>{theme === 'dark' ? <Sun size={16}/> : <Moon size={16}/>}<span>{theme === 'dark' ? '浅色' : '深色'}</span></button>
     <main className="main-area">
-      <header className="topbar"><div className="topbar-left"><button className="icon-button menu-button" onClick={() => setMobileNav(true)} aria-label="打开菜单"><Menu size={19}/></button><div className="breadcrumb">RoboLink <ChevronRight size={14}/><strong>{selected?.name ?? '未选择设备'}</strong></div></div><div className="topbar-actions"><div className="secure-pill"><LockKeyhole size={13}/>{sshReady ? 'SSH 已认证' : keyStatus?.trusted ? sessionId && !terminalExited ? '指纹已固定 · 认证中' : 'SSH 指纹已固定' : '本地会话'}</div>{selected && <button className={`button ${sessionId && !terminalExited ? 'button-subtle' : 'button-primary'} connect-button`} onClick={sessionId && !terminalExited ? () => navPage('terminal') : connectTarget} disabled={busy}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : sessionId && !terminalExited ? <Terminal size={15}/> : <Cable size={15}/>}<span>{sessionId && !terminalExited ? '打开终端' : '连接机器人'}</span></button>}<button className="icon-button" onClick={() => notify('默认只读本机网卡；只有经 GUI 明确确认后，才会临时配置地址或启动直连 DHCP。SSH 使用本应用的指纹 pin。')} aria-label="安全说明"><CircleHelp size={18}/></button><div className="top-avatar">RL</div></div></header>
+      <header className="topbar"><div className="topbar-left"><button className="icon-button menu-button" onClick={() => setMobileNav(true)} aria-label="打开菜单"><Menu size={19}/></button><div className="breadcrumb">RoboLink <ChevronRight size={14}/><strong>{selected?.name ?? '未选择设备'}</strong></div></div><div className="topbar-actions"><div className="secure-pill"><LockKeyhole size={13}/>{sshReady ? (channel?.via === 'key' ? '已连接 · 免密' : 'SSH 已认证') : pinned ? sessionId && !terminalExited ? '指纹已固定 · 认证中' : 'SSH 指纹已固定' : '本地会话'}</div>{selected && <button className={`button ${sshReady || (sessionId && !terminalExited) ? 'button-subtle' : 'button-primary'} connect-button`} onClick={sessionId && !terminalExited ? () => navPage('terminal') : () => { void connectTarget() }} disabled={busy}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : sshReady || (sessionId && !terminalExited) ? <Terminal size={15}/> : <Cable size={15}/>}<span>{sshReady || (sessionId && !terminalExited) ? '打开终端' : '连接机器人'}</span></button>}<button className="icon-button" onClick={() => notify('默认只读本机网卡；只有经 GUI 明确确认后，才会临时配置地址或启动直连 DHCP。SSH 使用本应用的指纹 pin。')} aria-label="安全说明"><CircleHelp size={18}/></button><div className="top-avatar">RL</div></div></header>
       <div className="content-wrap">
-        <div className="page-heading"><div><div className="eyebrow">LINUX HOST <span>·</span> DIRECT ETHERNET / SSH</div><h1>{pageInfo[page].title}</h1><p>{pageInfo[page].subtitle}</p></div><div className="heading-actions"><span className={`runtime-tag ${selected && keyStatus?.trusted ? 'live' : ''}`}><span/>{selected && keyStatus?.trusted ? '真实设备' : '尚未连接'}</span><button className="button button-subtle" onClick={refreshNow} disabled={busy || pageLoading}>{pageLoading ? <LoaderCircle className="spin-icon" size={15}/> : <RefreshCw size={15}/>}{pageLoading ? '读取中' : '刷新'}</button></div></div>
+        <div className="page-heading"><div><div className="eyebrow">LINUX HOST <span>·</span> DIRECT ETHERNET / SSH</div><h1>{pageInfo[page].title}</h1><p>{pageInfo[page].subtitle}</p></div><div className="heading-actions"><span className={`runtime-tag ${selected && sshReady ? 'live' : ''}`}><span/>{selected && sshReady ? '已连接' : '尚未连接'}</span><button className="button button-subtle" onClick={refreshNow} disabled={busy || pageLoading}>{pageLoading ? <LoaderCircle className="spin-icon" size={15}/> : <RefreshCw size={15}/>}{pageLoading ? '读取中' : '刷新'}</button></div></div>
         {error && <div className="inline-error" ref={errorRef} role="alert"><AlertTriangle size={16}/><span className="error-copy"><strong>{errorHeading(error)}</strong>{error}</span><button onClick={() => setError('')} aria-label="关闭错误"><X size={15}/></button></div>}
-        <div className="page-view" hidden={page !== 'overview'}>{visitedPages.has('overview') && <OverviewPage hostInfo={hostInfo} target={selected} trusted={!!keyStatus?.trusted} connected={sshReady && !terminalExited} remote={remoteOverview} services={services} onAdd={() => openNewTarget()} onConnect={connectTarget} onPage={navPage}/>}</div>
-        <div className="page-view" hidden={page !== 'network'}>{visitedPages.has('network') && <NetworkPage hostInfo={hostInfo} interfaces={wiredInterfaces} selectedInterface={localInterface} setSelectedInterface={setLocalInterface} scanNic={scanNic} setScanNic={name => { setScanNic(name); setDiscovered([]) }} scanPort={scanPort} setScanPort={setScanPort} options={discoveryOptions} setOptions={setDiscoveryOptions} report={discoveryReport} discovered={discovered} ownedAddresses={ownedNetworkAddresses} onScan={scanInterface} onAddAddress={openAddressDialog} onRemoveAddress={removeOwnedAddress} onCleanupAddresses={cleanupOwnedAddresses} dhcpStatuses={dhcpStatuses} dhcpInterface={dhcpInterface} setDhcpInterface={setDhcpInterface} dhcpCidr={dhcpCidr} setDhcpCidr={setDhcpCidr} onQueryDhcp={queryDhcpStatus} onStartDhcp={startDhcpServer} onStopDhcp={stopDhcpServer} network={remoteNetwork} wifi={wifiNetworks} onScanWifi={scanWifi} onToggleWifi={toggleWifiRadio} onConnectWifi={connectWifi} onAddHost={(host, port) => openNewTarget(host, port, 'sunrise')} busy={busy} wifiScanning={scanning === 'wifi'}/>}</div>
+        {progress && <div className="inline-progress" role="status"><LoaderCircle className="spin-icon" size={16}/><span>{progress}</span></div>}
+        {waiting && !progress && <div className="inline-progress" role="status"><LoaderCircle className="spin-icon" size={16}/><span>{waiting.reason === 'poweroff' ? '开发板已关机，重新上电后会自动连回' : waiting.reason === 'reboot' ? '开发板正在重启，回来后会自动连接' : '连接已断开，正在等开发板回来'} · <Elapsed since={waiting.since}/></span><button onClick={() => setWaiting(null)}>不再等待</button></div>}
+        <div className="page-view" hidden={page !== 'overview'}>{visitedPages.has('overview') && <OverviewPage hostInfo={hostInfo} target={selected} trusted={pinned} connected={sshReady} remote={remoteOverview} services={services} onAdd={() => openNewTarget()} onConnect={() => { void connectTarget() }} onPage={navPage} onQuick={() => { void quickConnect() }} onKeyLogin={toggleKeyLogin} onPower={powerAction} busy={busy}/>}</div>
+        <div className="page-view" hidden={page !== 'network'}>{visitedPages.has('network') && <NetworkPage hostInfo={hostInfo} interfaces={wiredInterfaces} selectedInterface={localInterface} setSelectedInterface={setLocalInterface} scanNic={scanNic} setScanNic={name => { setScanNic(name); setDiscovered([]) }} scanPort={scanPort} setScanPort={setScanPort} options={discoveryOptions} setOptions={setDiscoveryOptions} report={discoveryReport} discovered={discovered} ownedAddresses={ownedNetworkAddresses} onScan={scanInterface} onQuick={() => { void quickConnect() }} onAddAddress={host => { void prepareCandidate(host) }} onRemoveAddress={removeOwnedAddress} onCleanupAddresses={cleanupOwnedAddresses} dhcpStatuses={dhcpStatuses} dhcpInterface={dhcpInterface} setDhcpInterface={setDhcpInterface} dhcpCidr={dhcpCidr} setDhcpCidr={setDhcpCidr} onQueryDhcp={queryDhcpStatus} onStartDhcp={startDhcpServer} onStopDhcp={stopDhcpServer} network={remoteNetwork} wifi={wifiNetworks} onScanWifi={scanWifi} onToggleWifi={toggleWifiRadio} onConnectWifi={connectWifi} onAddHost={(host, port) => { const found = discovered.find(d => d.address === host); openNewTarget(host, port, 'sunrise', found?.mac ?? '', found?.interface ?? '') }} busy={busy} wifiScanning={scanning === 'wifi'}/>}</div>
         <div className="page-view" hidden={page !== 'services'}>{visitedPages.has('services') && <ServicesPage services={visibleServices} query={serviceQuery} setQuery={setServiceQuery} onAction={doServiceAction} busy={busy} scope={serviceScope} setScope={scope => { setServices([]); setServiceScope(scope) }} loading={pageLoading}/>}</div>
         <div className="page-view" hidden={page !== 'bluetooth'}>{visitedPages.has('bluetooth') && <BluetoothPage snapshot={bluetooth} onScan={scanBluetooth} onTogglePower={toggleBluetoothPower} onAction={bluetoothAction} busy={busy} scanning={scanning === 'bluetooth'}/>}</div>
         <div className="page-view" hidden={page !== 'audio'}>{visitedPages.has('audio') && <AudioPage snapshot={audio} sourceVolume={sourceVolume} sinkVolume={sinkVolume} setSourceVolume={setSourceVolume} setSinkVolume={setSinkVolume} onDefault={setDefaultAudio} onVolume={commitAudioVolume} onTest={playTestAudio} busy={busy}/>}</div>
         <div className="page-view" hidden={page !== 'desktop'}>{visitedPages.has('desktop') && <DesktopPage target={selected} sshReady={sshReady} active={page === 'desktop'} runPrivileged={runPrivileged} sudoPassword={() => sudoPasswordRef.current} onLog={log} onGoTerminal={() => navPage('terminal')}/>}</div>
-        <div className="page-view" hidden={page !== 'terminal'}>{visitedPages.has('terminal') && <TerminalPage key={sessionId} sessionId={sessionId} exited={terminalExited} sshReady={sshReady} target={selected} theme={theme} onConnect={connectTarget} onDisconnect={disconnectTerminal} onRisk={setDangerLine} onPaste={setPastePreview} onError={setError}/>}</div>
-        <div className="page-view" hidden={page !== 'logs'}>{visitedPages.has('logs') && <LogsPage logs={logs} onClear={() => setConfirm({ title: '清空本地诊断记录？', description: '只删除 RoboLink 本机界面中的操作记录，不会影响机器人。', run: async () => { setLogs([]); setConfirm(null) } })}/>}</div>
-        <footer className="footer-note"><ShieldCheck size={14}/>本机地址仅按需临时添加 · SSH 使用独立 known_hosts · RoboLink v0.4.0 测试候选 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
+        <div className="page-view" hidden={page !== 'terminal'}>{visitedPages.has('terminal') && <TerminalPage key={sessionId} sessionId={sessionId} exited={terminalExited} sshReady={sshReady} target={selected} theme={theme} onConnect={() => { void connectTarget() }} onDisconnect={disconnectTerminal} onRisk={setDangerLine} onPaste={setPastePreview} onError={setError}/>}</div>
+        <div className="page-view" hidden={page !== 'logs'}>{visitedPages.has('logs') && <LogsPage logs={logs} onDiagnose={() => { void collectDiagnostics() }} canDiagnose={!!selected && sshReady && !busy} onClear={() => setConfirm({ title: '清空本地诊断记录？', description: '只删除 RoboLink 本机界面中的操作记录，不会影响机器人。', run: async () => { setLogs([]); setConfirm(null) } })}/>}</div>
+        <footer className="footer-note"><ShieldCheck size={14}/>本机地址仅按需临时添加 · SSH 使用独立 known_hosts · RoboLink v0.7.0 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
       </div>
     </main>
     {targetDialog && <TargetDialog value={targetDraft} setValue={setTargetDraft} onClose={() => setTargetDialog(false)} onSubmit={saveTarget} busy={busy}/>}
@@ -602,6 +810,7 @@ export default function RealApp() {
     {sudoPrompt && <SudoDialog prompt={sudoPrompt} target={selected} onDone={password => { const p = sudoPrompt; setSudoPrompt(null); p.resolve(password) }}/>}
     {dangerLine && <ConfirmDialog confirm={{ title: '高风险终端命令', description: `目标：${selected?.username}@${selected?.host}\n命令：${dangerLine}\n\n此命令可能改变网络、服务或磁盘。确认后才会将回车发送到远端 Shell。`, danger: true, run: async () => { await terminalWriterRef.current?.confirmDangerous(); setDangerLine('') } }} onCancel={async () => { await terminalWriterRef.current?.cancelDangerous(); setDangerLine('') }} onConfirm={async () => { await terminalWriterRef.current?.confirmDangerous(); setDangerLine('') }}/>}
     {pastePreview && <ConfirmDialog confirm={{ title: '确认粘贴多行命令？', description: `目标：${selected?.username}@${selected?.host}\n\n${pastePreview.slice(0, 1600)}${pastePreview.length > 1600 ? '\n…（预览已截断）' : ''}\n\n粘贴内容可能包含多个会执行的命令。请先检查目标和每一行。`, danger: true, run: async () => { await terminalWriterRef.current?.confirmPaste(); setPastePreview('') } }} onCancel={async () => { await terminalWriterRef.current?.cancelPaste(); setPastePreview('') }} onConfirm={async () => { await terminalWriterRef.current?.confirmPaste(); setPastePreview('') }}/>}
+    {diagnostics && <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setDiagnostics(null) }}><div className="modal-card diagnostics-modal"><div className="modal-title"><div><h2>板端诊断</h2></div><button className="icon-button" onClick={() => setDiagnostics(null)} aria-label="关闭"><X size={18}/></button></div><p className="modal-intro">已保存到 <code>{diagnostics.path}</code>（{(diagnostics.bytes / 1024).toFixed(0)} KB）</p><pre className="diagnostics-preview">{diagnostics.preview}</pre><div className="modal-actions"><button className="button button-subtle" onClick={() => { void navigator.clipboard?.writeText(diagnostics.preview).then(() => notify('已复制')) }}>复制内容</button><button className="button button-primary" onClick={() => setDiagnostics(null)}>完成</button></div></div></div>}
     {toast && <div className="toast"><Check size={16}/>{toast}</div>}
   </div>
 }
@@ -619,21 +828,38 @@ const linkKind = (host: string, interfaces: HostInterface[]): 'wired' | 'wireles
   }
   return 'wired'
 }
-function OverviewPage({ hostInfo, target, trusted, connected, remote, services, onAdd, onConnect, onPage }: { hostInfo: HostInfo | null; target?: Target; trusted: boolean; connected: boolean; remote: RemoteOverview | null; services: Service[]; onAdd: () => void; onConnect: () => void; onPage: (page: Page) => void }) {
+// Whether an IPv4 host lies inside one of the interface's subnets.
+const reachesVia = (host: string, iface: HostInterface) => {
+  const target = ipv4ToInt(host)
+  if (target === null) return false
+  return iface.ipv4.some(cidr => {
+    const [addr, bits] = cidr.split('/'); const local = ipv4ToInt(addr); const prefix = Number(bits)
+    if (local === null || !(prefix > 0 && prefix <= 32)) return false
+    const mask = (0xffffffff << (32 - prefix)) >>> 0
+    return ((local & mask) >>> 0) === ((target & mask) >>> 0)
+  })
+}
+function Elapsed({ since }: { since: number }) {
+  const [, setTick] = useState(0)
+  useEffect(() => { const timer = window.setInterval(() => setTick(n => n + 1), 1000); return () => window.clearInterval(timer) }, [])
+  const seconds = Math.max(0, Math.round((Date.now() - since) / 1000))
+  return <>{seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`}</>
+}
+function OverviewPage({ hostInfo, target, trusted, connected, remote, services, onAdd, onConnect, onPage, onQuick, onKeyLogin, onPower, busy }: { hostInfo: HostInfo | null; target?: Target; trusted: boolean; connected: boolean; remote: RemoteOverview | null; services: Service[]; onAdd: () => void; onConnect: () => void; onPage: (page: Page) => void; onQuick: () => void; onKeyLogin: () => void; onPower: (action: 'reboot' | 'poweroff') => void; busy: boolean }) {
   const failed = services.filter(s => s.active !== 'active')
   const link = target ? linkKind(target.host, hostInfo?.interfaces ?? []) : 'wired'
   return <div className="dashboard-grid real-dashboard">
     <section className="main-column">
-      <section className="panel connection-card real-connection"><div className="panel-heading"><div><div className="section-kicker">DIRECT ETHERNET · NO INTERMEDIARY</div><h2>{target ? `${target.name} · ${target.host}` : '添加机器人 SSH 目标'}</h2></div><span className={`connected-pill ${connected ? '' : 'not-connected'}`}><span/>{connected ? 'SSH 会话已连接' : trusted ? '指纹已固定' : '未连接'}</span></div>
+      <section className="panel connection-card real-connection"><div className="panel-heading"><div><div className="section-kicker">DIRECT ETHERNET · NO INTERMEDIARY</div><h2>{target ? `${target.name} · ${target.host}` : '添加机器人 SSH 目标'}</h2></div><span className={`connected-pill ${connected ? '' : 'not-connected'}`}><span/>{connected ? '已连接' : trusted ? '指纹已固定' : '未连接'}</span></div>
         <div className="connection-map"><div className="endpoint"><div className="endpoint-icon host"><MonitorGlyph/></div><div><strong>本机</strong><small>{hostInfo?.hostname ?? '读取中…'}</small></div></div><div className={`link-track ${connected ? 'live' : ''} ${link === 'wireless' ? 'wireless' : ''}`}><div className="link-line"/><div className="link-chip">{link === 'wireless' ? <Wifi size={14}/> : <Cable size={14}/>}{link === 'wireless' ? '无线直连' : '网线直连'}</div></div><div className="endpoint"><div className="endpoint-icon robot"><Cpu size={21}/></div><div><strong>{target?.name ?? 'Linux 机器人'}</strong><small>{target ? `${target.username}@${target.host}:${target.port}` : '未配置目标'}</small></div></div></div>
-        <div className="connection-footer"><span><ShieldCheck size={14}/>{trusted ? '独立主机指纹已固定' : '连接前需要核验 SSH 指纹'}</span><button onClick={target ? onConnect : onAdd}>{target ? '核验并连接' : '添加 SSH 目标'} <ArrowUpRight size={14}/></button></div></section>
-      {!target && <div className="first-run-card"><div className="first-run-icon"><Cable size={22}/></div><div><strong>添加第一台机器人</strong><p>填写机器人的 IP 和 SSH 用户即可开始。</p></div><button className="button button-primary" onClick={onAdd}>添加设备</button></div>}
+        <div className="connection-footer"><span><ShieldCheck size={14}/>{trusted ? target?.keyLogin ? '指纹已固定 · 免密已启用' : '主机指纹已固定' : '连接前需要核验 SSH 指纹'}</span><span className="footer-actions">{!connected && <button onClick={onQuick} disabled={busy}>一键直连 <Zap size={14}/></button>}<button onClick={target ? onConnect : onAdd}>{!target ? '添加 SSH 目标' : connected ? '打开终端' : '连接'} <ArrowUpRight size={14}/></button></span></div></section>
+      {!target && <div className="first-run-card"><div className="first-run-icon"><Cable size={22}/></div><div><strong>添加第一台机器人</strong><p>插好网线后点一键直连，会自动找到开发板并配置本机地址。</p></div><span className="first-run-actions"><button className="button button-primary" onClick={onQuick} disabled={busy}><Zap size={15}/>一键直连</button><button className="button button-subtle" onClick={onAdd}>手动添加</button></span></div>}
       {target && !trusted && <div className="network-warning"><div className="warning-icon"><LockKeyhole size={17}/></div><div><strong>尚未验证 SSH 指纹</strong><p>可在机器人上运行 <code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code> 比对。</p></div><button className="button button-subtle" onClick={onConnect}>查看指纹</button></div>}
       <div className="metric-grid real-metrics"><Metric label="系统服务" value={trusted ? `${services.filter(s => s.active === 'active').length} / ${services.length}` : '未连接'} detail={trusted && failed.length ? `${failed.length} 个异常` : ''} tone="green" icon={Server} onClick={() => onPage('services')}/><Metric label="机器人 Wi-Fi" value="查看" detail="" tone="blue" icon={Wifi} onClick={() => onPage('network')}/><Metric label="机器人蓝牙" value="查看" detail="" tone="violet" icon={Bluetooth} onClick={() => onPage('bluetooth')}/><Metric label="音频设备" value="查看" detail="" tone="amber" icon={AudioLines} onClick={() => onPage('audio')}/></div>
       <section className="panel service-panel"><div className="panel-heading"><div><div className="section-kicker">SYSTEMD</div><h2>服务概况</h2></div><button className="text-button" onClick={() => onPage('services')}>查看服务 <ChevronRight size={15}/></button></div>{!trusted ? <EmptyState text="连接后显示服务状态。"/> : services.length ? services.slice(0,5).map(s => <div className="service-row real-service-row" key={s.name}><div className="service-name-cell"><span className={`service-icon ${s.active === 'active' ? 'is-running' : 'is-stopped'}`}><Zap size={15}/></span><span><strong>{s.name}</strong><small>{s.description}</small></span></div><span className={`state-label ${s.active === 'active' ? 'state-ok' : 'state-down'}`}><i/>{s.active} · {s.subState}</span><span className="uptime-text">{s.enabled}</span></div>) : <EmptyState text="未读到 systemd 服务，或当前用户无权读取。"/>}</section>
     </section>
     <aside className="right-column"><section className="panel health-panel"><div className="panel-heading"><div><div className="section-kicker">ROBOT HEALTH</div><h2>机器人状态</h2></div><span className="small-muted">{remote ? '实时读取' : '连接后读取'}</span></div>{remote ? <div className="remote-health"><HealthRow icon={Cpu} label="主机名" value={remote.hostname} sub={remote.uptime} percent={100} color="green"/><HealthRow icon={Gauge} label="系统负载" value={remote.load} sub="1 / 5 / 15 分钟" percent={Math.min(100, parseFloat(remote.load) * 25 || 0)} color="blue"/><HealthRow icon={HardDrive} label="可用内存" value={`${formatMemory(remote.memoryAvailableKb)} / ${formatMemory(remote.memoryTotalKb)}`} sub="/proc/meminfo" percent={remote.memoryTotalKb && remote.memoryAvailableKb ? 100 - remote.memoryAvailableKb / remote.memoryTotalKb * 100 : 0} color="violet"/>{remote.temperatureC != null && <HealthRow icon={Zap} label="CPU 温度" value={`${remote.temperatureC.toFixed(1)}°C`} sub="thermal zone" percent={Math.min(100,remote.temperatureC)} color="amber"/>}</div> : <EmptyState text="连接后显示主机名、负载和内存。"/>}<div className="health-time"><Clock3 size={13}/>{remote ? `运行时间 · ${remote.uptime}` : '未创建远端会话'}</div></section>
-      <section className="panel quick-panel"><div className="panel-heading"><div><div className="section-kicker">QUICK ACCESS</div><h2>快速调试</h2></div></div><QuickAction icon={Terminal} title="打开 SSH 终端" detail={connected ? '已连接' : '需先连接'} onClick={() => onPage('terminal')}/><QuickAction icon={ListChecks} title="检查 systemd 服务" detail={trusted ? `${services.length} 项` : '连接后读取'} onClick={() => onPage('services')}/><QuickAction icon={FileClock} title="查看诊断记录" detail="本机操作历史" onClick={() => onPage('logs')}/></section>
+      <section className="panel quick-panel"><div className="panel-heading"><div><div className="section-kicker">QUICK ACCESS</div><h2>快速调试</h2></div></div><QuickAction icon={Terminal} title="打开 SSH 终端" detail={connected ? '已连接' : '需先连接'} onClick={() => onPage('terminal')}/><QuickAction icon={ListChecks} title="检查 systemd 服务" detail={trusted ? `${services.length} 项` : '连接后读取'} onClick={() => onPage('services')}/><QuickAction icon={FileClock} title="查看诊断记录" detail="本机操作历史" onClick={() => onPage('logs')}/>{target && trusted && <QuickAction icon={LockKeyhole} title="免密连接" detail={target.keyLogin ? '已启用' : '未启用'} onClick={onKeyLogin}/>}{target && connected && <><QuickAction icon={RefreshCw} title="重启开发板" detail="重启后自动连回" onClick={() => onPower('reboot')}/><QuickAction icon={Power} title="关机" detail="上电后自动连回" onClick={() => onPower('poweroff')}/></>}</section>
       <section className="safety-note"><div className="safety-icon"><ShieldCheck size={17}/></div><div><strong>安全默认值</strong><p>本机默认只读，配置需确认；host key 独立固定；不保存 SSH 或 Wi-Fi 密码。</p></div></section>
     </aside>
   </div>
@@ -644,7 +870,7 @@ function HealthRow({ icon: Icon, label, value, sub, percent, color }: { icon: ty
 function QuickAction({ icon: Icon, title, detail, onClick }: { icon: typeof Terminal; title: string; detail: string; onClick: () => void }) { return <button className="quick-action" onClick={onClick}><span className="quick-icon blue"><Icon size={17}/></span><span><strong>{title}</strong><small>{detail}</small></span><ChevronRight size={16}/></button> }
 function EmptyState({ text }: { text: string }) { return <div className="empty-state"><Activity size={17}/><span>{text}</span></div> }
 
-function NetworkPage({ hostInfo, interfaces, selectedInterface, setSelectedInterface, scanNic, setScanNic, scanPort, setScanPort, options, setOptions, report, discovered, ownedAddresses, onScan, onAddAddress, onRemoveAddress, onCleanupAddresses, dhcpStatuses, dhcpInterface, setDhcpInterface, dhcpCidr, setDhcpCidr, onQueryDhcp, onStartDhcp, onStopDhcp, network, wifi, onScanWifi, onToggleWifi, onConnectWifi, onAddHost, busy, wifiScanning }: { hostInfo: HostInfo | null; interfaces: HostInterface[]; selectedInterface: string; setSelectedInterface: (v: string) => void; scanNic: string; setScanNic: (v: string) => void; scanPort: string; setScanPort: (v: string) => void; options: DiscoveryOptions; setOptions: (v: DiscoveryOptions) => void; report: DiscoveryReport | null; discovered: DiscoveredHost[]; ownedAddresses: OwnedNetworkAddress[]; onScan: () => void; onAddAddress: (host: DiscoveredHost) => void; onRemoveAddress: (entry: OwnedNetworkAddress) => void; onCleanupAddresses: () => void; dhcpStatuses: DhcpStatus[] | null; dhcpInterface: string; setDhcpInterface: (v: string) => void; dhcpCidr: string; setDhcpCidr: (v: string) => void; onQueryDhcp: () => void; onStartDhcp: () => void; onStopDhcp: (entry: DhcpStatus) => void; network: RemoteNetwork | null; wifi: WifiNetwork[]; onScanWifi: () => void; onToggleWifi: (v: boolean) => void; onConnectWifi: (n: WifiNetwork) => void; onAddHost: (host?: string, port?: number) => void; busy: boolean; wifiScanning: boolean }) {
+function NetworkPage({ hostInfo, interfaces, selectedInterface, setSelectedInterface, scanNic, setScanNic, scanPort, setScanPort, options, setOptions, report, discovered, ownedAddresses, onScan, onQuick, onAddAddress, onRemoveAddress, onCleanupAddresses, dhcpStatuses, dhcpInterface, setDhcpInterface, dhcpCidr, setDhcpCidr, onQueryDhcp, onStartDhcp, onStopDhcp, network, wifi, onScanWifi, onToggleWifi, onConnectWifi, onAddHost, busy, wifiScanning }: { hostInfo: HostInfo | null; interfaces: HostInterface[]; selectedInterface: string; setSelectedInterface: (v: string) => void; scanNic: string; setScanNic: (v: string) => void; scanPort: string; setScanPort: (v: string) => void; options: DiscoveryOptions; setOptions: (v: DiscoveryOptions) => void; report: DiscoveryReport | null; discovered: DiscoveredHost[]; ownedAddresses: OwnedNetworkAddress[]; onScan: () => void; onQuick: () => void; onAddAddress: (host: DiscoveredHost) => void; onRemoveAddress: (entry: OwnedNetworkAddress) => void; onCleanupAddresses: () => void; dhcpStatuses: DhcpStatus[] | null; dhcpInterface: string; setDhcpInterface: (v: string) => void; dhcpCidr: string; setDhcpCidr: (v: string) => void; onQueryDhcp: () => void; onStartDhcp: () => void; onStopDhcp: (entry: DhcpStatus) => void; network: RemoteNetwork | null; wifi: WifiNetwork[]; onScanWifi: () => void; onToggleWifi: (v: boolean) => void; onConnectWifi: (n: WifiNetwork) => void; onAddHost: (host?: string, port?: number) => void; busy: boolean; wifiScanning: boolean }) {
   const selectedLink = interfaces.find(i => i.name === selectedInterface)
   const setOption = (key: keyof DiscoveryOptions, checked: boolean) => setOptions({ ...options, [key]: checked })
   const toggle = (key: keyof DiscoveryOptions, title: string, description: string) => <label className="strategy-option" key={key}><input type="checkbox" checked={options[key]} onChange={e => setOption(key, e.target.checked)} disabled={busy}/><span><strong>{title}</strong><small>{description}</small></span></label>
@@ -658,9 +884,9 @@ function NetworkPage({ hostInfo, interfaces, selectedInterface, setSelectedInter
       <div className={`direct-link-state ${selectedLink?.carrier ? 'ready' : 'needs-setup'}`}><Cable size={16}/><div><strong>{!selectedLink ? '先选择直连接口' : !selectedLink.carrier ? '尚未检测到所选网口链路' : !selectedLink.ipv4.length ? '网线已连通；开发机网口暂时没有 IPv4 地址' : '直连接口已配置 IPv4'}</strong><p>{!selectedLink ? '选择用于本机临时地址等设置的物理以太网口；扫描网卡可以单独选择。' : !selectedLink.carrier ? '所选网口目前没有链路；检查机器人电源、网线两端。' : !selectedLink.ipv4.length ? '可被动发现候选；只有点击并确认后才会给此接口临时配置 IPv4。' : `当前网口地址：${selectedLink.ipv4.join(' · ')}。`}</p>{selectedLink?.carrier && <button className="text-button" onClick={() => onAddHost()}>我已知道机器人 IP / 主机名，手动添加 <ChevronRight size={14}/></button>}</div></div>
       <div className="connection-steps"><strong>发现边界</strong><ol><li>主动 ARP 扫描：以 0.0.0.0 为源地址发送 ARP 探测（RFC 5227），Linux 开发板会为自己的 IP 应答，无需开发板重启或主动发包。</li><li>被动监听 ARP（包括 gratuitous/probe）、DHCP Discover/Request、IPv6 ND 与 mDNS，可作为补充，均可单独选择。</li><li>ICMP 与指定单一 TCP/SSH 端口只验证已有候选；TCP 默认端口 22，需要本机网口与开发板同网段后才能验证。</li><li>可分别选择扫描所有物理有线网口或单张网卡；此选择独立于本机地址配置网卡。</li></ol></div>
       <details className="strategy-panel"><summary>发现策略（展开说明与选择）</summary><div className="strategy-groups"><fieldset><legend>A0 · 主动 ARP 扫描（推荐）</legend>{toggle('arpSweep','常见开发板网段 ARP 扫描（默认开）','对本机网段及 192.168.1/0/127/137/55、10.42.0 等约 30 个常见 /24 发送 ARP 探测；开发板静默时也能发现。')}{toggle('arpSweepDeep','网线直连深度扫描（默认开）','额外覆盖整个 192.168.0.0/16（勾选 IPv4 Link-Local 时含 169.254/16），约 5 秒发完；承载默认路由的接口自动跳过。')}</fieldset><fieldset><legend>A · 被动发现来源</legend>{toggle('passiveArp','被动 ARP（默认开）','监听 ARP 请求、应答、gratuitous ARP 与 probe；只将可判定的设备候选列出。')}{toggle('passiveDhcp','DHCP Discover / Request（默认开）','观察 DHCP 请求及本应用的 DHCPACK 日志缓存线索；不会启动 DHCP 服务，缓存仍需复验。')}{toggle('passiveIpv6','IPv6 Neighbor Discovery（默认开）','被动观察 IPv6 ND 消息与邻居线索。')}{toggle('mdns','mDNS（默认开）','观察本链路 mDNS 报文的源 IP/MAC；不确认所有广告主机记录。')}</fieldset><fieldset><legend>B · 对候选地址主动验证</legend>{toggle('activeArp','候选地址 ARP 验证（默认开）','仅对发现得到的候选地址进行 ARP 验证，不枚举或探测任意 IPv4 段。')}{toggle('icmp','ICMP 辅助验证（默认关）','对候选地址发送 ICMP 探测；不回应不等于设备离线。')}{toggle('tcp','单一 TCP / SSH 端口（默认 22）','只对候选地址检查下方指定的一个端口；无路由或端口不通都不能证明设备离线。')}</fieldset><fieldset><legend>D · Link-Local 设备候选</legend>{toggle('ipv4LinkLocal','IPv4 Link-Local（默认开）','识别 169.254/16 范围候选；需要配置本机地址时默认建议 /16。')}{toggle('ipv6LinkLocal','IPv6 Link-Local（默认开）','读取邻居并发送受限 IPv6 全节点探测；fe80::/10 候选保留 %scope，不回应不代表离线。')}</fieldset></div><p className="strategy-footnote">至少勾选一种 A0/A 类来源或 D 类 Link-Local；B 类验证选项本身不构成发现来源。策略会保存在本机浏览器存储中。</p></details>
-      <div className="scan-controls scan-controls-expanded"><label className="scan-port-field"><span>扫描接口</span><select aria-label="选择发现扫描网卡" value={scanNic} onChange={e => setScanNic(e.target.value)} disabled={busy}><option value="">全部物理有线网卡</option>{interfaces.map(i => <option key={i.name} value={i.name}>{i.name}{i.carrier ? ' · 链路已连接' : ''}</option>)}</select></label><label className="scan-port-field"><span>SSH TCP 单端口</span><input aria-label="SSH TCP 探测端口" type="number" min="1" max="65535" step="1" value={scanPort} onChange={event => setScanPort(event.target.value)} disabled={busy || !options.tcp}/></label><button className="button button-primary" onClick={onScan} disabled={busy || !interfaces.length || !sourceEnabled || (options.tcp && (!Number.isInteger(Number(scanPort)) || Number(scanPort) < 1 || Number(scanPort) > 65535))}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : <Search size={15}/>}开始发现</button><span className="small-muted">主动扫描与监听约 8 秒，随后按已选策略验证候选</span></div>
+      <div className="scan-controls scan-controls-expanded"><label className="scan-port-field"><span>扫描接口</span><select aria-label="选择发现扫描网卡" value={scanNic} onChange={e => setScanNic(e.target.value)} disabled={busy}><option value="">全部物理有线网卡</option>{interfaces.map(i => <option key={i.name} value={i.name}>{i.name}{i.carrier ? ' · 链路已连接' : ''}</option>)}</select></label><label className="scan-port-field"><span>SSH TCP 单端口</span><input aria-label="SSH TCP 探测端口" type="number" min="1" max="65535" step="1" value={scanPort} onChange={event => setScanPort(event.target.value)} disabled={busy || !options.tcp}/></label><button className="button button-primary" onClick={onScan} disabled={busy || !interfaces.length || !sourceEnabled || (options.tcp && (!Number.isInteger(Number(scanPort)) || Number(scanPort) < 1 || Number(scanPort) > 65535))}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : <Search size={15}/>}开始发现</button><button className="button button-subtle" onClick={onQuick} disabled={busy || !interfaces.length} title="自动发现、配置本机地址并连接"><Zap size={15}/>一键直连</button><span className="small-muted">主动扫描与监听约 8 秒，随后按已选策略验证候选</span></div>
       {(report?.skippedInterfaces.length || report?.warnings.length) ? <div className="report-notes">{report.skippedInterfaces.map((item, i) => <p key={`skip-${i}`}><strong>未扫描接口：</strong>{item}</p>)}{report.warnings.map((item, i) => <p key={`warn-${i}`}><strong>发现提示：</strong>{item}</p>)}</div> : null}
-      {report && <div className="discovery-list"><div className="section-kicker">发现报告 · {discovered.length} 个候选</div>{discovered.length ? discovered.map((host, index) => <div className="discovered-row" key={`${host.interface}-${host.address}-${host.mac}-${index}`}><span className="wifi-small-icon"><Signal size={16}/></span><span className="discovered-copy"><strong>{host.address}</strong><small>{host.interface} · MAC {host.mac || '未报告'} · 来源 {host.source}（{host.confidence}）</small>{(host.ipv4?.length || host.ipv6?.length) ? <small>IPv4 {host.ipv4?.join('、') || '—'} · IPv6 {host.ipv6?.join('、') || '—'}</small> : null}<small>接口路由：{host.routeReady ? '已就绪' : '未就绪/未确认'} · 主动验证：ARP {host.arpReachable == null ? '未提供结果' : host.arpReachable ? '可达' : '未回应'} · ICMP {host.icmpReachable == null ? '未探测/未提供' : host.icmpReachable ? '可达' : '未回应'} · {portStatus(host)}</small></span><div className="discovery-actions"><button className="button button-subtle" onClick={() => { if (!host.address.includes(':') && !host.routeReady) onAddAddress(host); else onAddHost(host.address, host.port) }} disabled={busy} title={!host.address.includes(':') && !host.routeReady ? '本机网口还没有与开发板同网段的地址，先配置临时 IPv4 才能 SSH' : undefined}>{!host.address.includes(':') && !host.routeReady ? '配置本机 IP 后添加' : '添加为 SSH 主机'}</button></div></div>) : <EmptyState text={dhcpStatuses?.some(s => s.running) ? '没有候选地址。直连 DHCP 已在运行；若开发板仍持有其他网络的旧租约，它可能不会立即请求新地址。请重启开发板或重新插拔网线触发 DHCP，然后重新扫描。' : '没有候选地址。静态 IP 设备若未发报文，可能需要从设备资料手动添加；扫描不保证发现任意地址。'}/>}</div>}
+      {report && <div className="discovery-list"><div className="section-kicker">发现报告 · {discovered.length} 个候选</div>{discovered.length ? discovered.map((host, index) => <div className="discovered-row" key={`${host.interface}-${host.address}-${host.mac}-${index}`}><span className="wifi-small-icon"><Signal size={16}/></span><span className="discovered-copy"><strong>{host.address}</strong><small>{host.interface} · MAC {host.mac || '未报告'} · 来源 {host.source}（{host.confidence}）</small>{(host.ipv4?.length || host.ipv6?.length) ? <small>IPv4 {host.ipv4?.join('、') || '—'} · IPv6 {host.ipv6?.join('、') || '—'}</small> : null}<small>接口路由：{host.routeReady ? '已就绪' : '未就绪/未确认'} · 主动验证：ARP {host.arpReachable == null ? '未提供结果' : host.arpReachable ? '可达' : '未回应'} · ICMP {host.icmpReachable == null ? '未探测/未提供' : host.icmpReachable ? '可达' : '未回应'} · {portStatus(host)}</small></span><div className="discovery-actions"><button className="button button-subtle" onClick={() => { if (!host.address.includes(':') && !host.routeReady) onAddAddress(host); else onAddHost(host.address, host.port) }} disabled={busy} title={!host.address.includes(':') && !host.routeReady ? '本机网口还没有与开发板同网段的地址；RoboLink 会自动挑一个不冲突的地址' : undefined}>{!host.address.includes(':') && !host.routeReady ? '自动配置本机 IP 并添加' : '添加为 SSH 主机'}</button></div></div>) : <EmptyState text={dhcpStatuses?.some(s => s.running) ? '没有候选地址。直连 DHCP 已在运行；若开发板仍持有其他网络的旧租约，它可能不会立即请求新地址。请重启开发板或重新插拔网线触发 DHCP，然后重新扫描。' : '没有候选地址。静态 IP 设备若未发报文，可能需要从设备资料手动添加；扫描不保证发现任意地址。'}/>}</div>}
       {discovered.some(host => !host.address.includes(':')) && <div className="subtle-callout"><Activity size={15}/><span>已发现 IPv4 地址时，通常无需 DHCP；TCP 未探测或不通不代表机器人离线。</span></div>}
       <details className="dhcp-panel"><summary>直连 DHCP 服务 <span className={`dhcp-state ${dhcpStatuses === null ? '' : dhcpStatuses.some(s => s.running) ? 'active' : ''}`}>{dhcpLabel}</span></summary><div className="dhcp-content"><div className="subtle-callout"><AlertTriangle size={15}/><span>服务默认关闭且扫描不会启动它。只用于专接机器人的接口；不给网关/DNS、不共享上网。可能影响该以太网口上已有 DHCP 设备。启动前必须确认直连接口；若已发现机器人静态 IP，通常无需 DHCP。</span></div><div className="dhcp-controls"><label className="scan-port-field"><span>DHCP 有线网卡</span><select aria-label="选择直连 DHCP 网卡" value={dhcpInterface} onChange={e => setDhcpInterface(e.target.value)} disabled={busy}><option value="">选择物理有线网卡…</option>{interfaces.map(i => <option key={i.name} value={i.name}>{i.name}{i.carrier ? ' · 链路已连接' : ''}</option>)}</select></label><label className="scan-port-field dhcp-cidr"><span>本机私网 IPv4 /24（地址须避开 .10–.200）</span><input aria-label="直连 DHCP 本机 IPv4 CIDR" value={dhcpCidr} onChange={e => setDhcpCidr(e.target.value)} disabled={busy} placeholder="192.168.77.1/24"/></label><button className="button button-subtle" onClick={onQueryDhcp} disabled={busy}><RefreshCw size={14}/>查看状态</button><button className="button button-primary" onClick={onStartDhcp} disabled={busy || !dhcpLinkReady}><Play size={14}/>确认后启动…</button></div><p className="small-muted">状态未查询时不推断服务已停止。查询可识别本应用记录及遗留服务；实际 CIDR/接口约束由后端再次验证。</p>{dhcpStatuses !== null && <div className="dhcp-status-list">{dhcpStatuses.length ? dhcpStatuses.map((entry, i) => <div className="dhcp-status-row" key={`${entry.interface}-${entry.id}-${i}`}><span><strong>{entry.interface} · {entry.cidr}</strong><small>{entry.running ? '运行中' : '未运行'} · {entry.owned ? 'RoboLink 记录/管理' : '非本应用记录'}{entry.id ? ` · ${entry.id}` : ''}{entry.message ? ` · ${entry.message}` : ''}</small></span>{(entry.running || entry.owned) && <button className="button button-danger" onClick={() => onStopDhcp(entry)} disabled={busy}><Power size={14}/>{entry.running ? '停止并清理' : '清理记录'}</button>}</div>) : <EmptyState text="查询完成：未发现直连 DHCP 服务记录。"/>}</div>}</div></details>
       {ownedAddresses.length > 0 && <div className="owned-addresses"><div className="owned-addresses-heading"><div><div className="section-kicker">ROBOlink OWNED · LOCAL IPv4</div><strong>RoboLink 添加的地址</strong></div><button className="button button-subtle" onClick={onCleanupAddresses} disabled={busy}><Trash2 size={14}/>全部清理</button></div>{ownedAddresses.map(entry => <div className="owned-address-row" key={`${entry.interface}-${entry.cidr}`}><span><strong>{entry.cidr}</strong><small>{entry.interface} · 对端 {entry.peer} · 保留到手动清理</small></span><button className="icon-button" title="清理此地址" aria-label={`清理 ${entry.cidr}`} onClick={() => onRemoveAddress(entry)} disabled={busy}><Trash2 size={15}/></button></div>)}</div>}
@@ -811,13 +1037,13 @@ function TerminalPage({ sessionId, exited, sshReady, target, theme, onConnect, o
   return <div className="terminal-page real-terminal"><div className="terminal-toolbar"><div className="terminal-target"><span className={`terminal-dot ${exited?'offline':''}`}/><span><strong>{target?.host ?? '未选择目标'}</strong><small>{target ? `${target.username} · SSH ${target.port}` : 'SSH PTY'}</small></span><LockKeyhole size={14}/></div><div className="terminal-tools"><span className="terminal-mode"><LockKeyhole size={13}/>{!sessionId ? '未连接' : exited ? '会话结束' : sshReady ? 'SSH 已认证' : '等待 SSH 认证'}</span>{sessionId && <button className="button button-subtle" onClick={()=>{term.current?.clear();term.current?.focus()}} title="清除终端屏幕和回滚内容（不影响远端）"><Trash2 size={14}/>清屏</button>}{sessionId && <button className="button button-subtle" onClick={onDisconnect}>断开 SSH</button>}{!sessionId && <button className="button button-primary" onClick={onConnect}>连接 SSH</button>}</div></div><div className="terminal-safety"><AlertTriangle size={15}/><span>这是机器人上的真实 Shell。输入命令会立即发往 <strong>{target?.username}@{target?.host}</strong>；高风险回车与多行粘贴需要确认。远端输出按不可信文本处理。</span></div>{sessionId ? <div className="xterm-shell"><div className="xterm-host" ref={container} aria-label="SSH 终端"/></div> : <div className="terminal-disconnected"><Terminal size={24}/><strong>尚未建立 SSH 会话</strong><p>先核验 SSH 主机指纹，再启动交互式终端。密码认证提示会在终端内交互，不会存入 RoboLink。</p><button className="button button-primary" onClick={onConnect}>连接并打开终端</button></div>}<div className="terminal-bottom"><div><span className={`terminal-bottom-dot ${sessionId&&!exited?'':'offline'}`}/>目标 <strong>{target?.host ?? '—'}</strong><span className="dot-divider">·</span>用户 <strong>{target?.username ?? '—'}</strong><span className="dot-divider">·</span>不自动提权</div><span className="terminal-status-note">SSH 使用应用独立指纹文件</span></div></div>
 }
 
-function LogsPage({ logs, onClear }: { logs: AppLog[]; onClear:()=>void }) { return <div className="page-stack"><div className="logs-toolbar list-toolbar"><span className="small-muted">{logs.length} 条本地事件 · 终端输入与密码不记录</span><button className="button button-subtle" onClick={onClear}><Trash2 size={14}/>清空</button></div><section className="panel logs-panel">{logs.length ? logs.map((l,i)=><div className="log-row" key={`${l.at}-${i}`}><span className={`log-tone ${l.tone}`}>{l.tone==='warn'?<AlertTriangle size={14}/>:l.tone==='ok'?<Check size={14}/>:<Activity size={14}/>}</span><span className="log-time">{l.at}</span><span className="log-message">{l.text}</span><span className={`log-category ${l.tone}`}>{l.tone==='warn'?'注意':l.tone==='ok'?'完成':'系统'}</span></div>) : <EmptyState text="尚无本地操作记录。"/>}</section><div className="subtle-callout"><LockKeyhole size={16}/><span>诊断日志仅记操作事件，不采集终端输入、SSH 密码、Wi-Fi 密码或麦克风内容。</span></div></div> }
+function LogsPage({ logs, onClear, onDiagnose, canDiagnose }: { logs: AppLog[]; onClear:()=>void; onDiagnose:()=>void; canDiagnose:boolean }) { return <div className="page-stack"><div className="logs-toolbar list-toolbar"><span className="small-muted">{logs.length} 条本地事件 · 终端输入与密码不记录</span><span className="inline-actions"><button className="button button-primary" onClick={onDiagnose} disabled={!canDiagnose} title={canDiagnose ? '采集 journalctl、dmesg、磁盘、温度、网络等信息并保存到本机' : '连接开发板后可用'}><Activity size={14}/>采集板端诊断</button><button className="button button-subtle" onClick={onClear}><Trash2 size={14}/>清空</button></span></div><section className="panel logs-panel">{logs.length ? logs.map((l,i)=><div className="log-row" key={`${l.at}-${i}`}><span className={`log-tone ${l.tone}`}>{l.tone==='warn'?<AlertTriangle size={14}/>:l.tone==='ok'?<Check size={14}/>:<Activity size={14}/>}</span><span className="log-time">{l.at}</span><span className="log-message">{l.text}</span><span className={`log-category ${l.tone}`}>{l.tone==='warn'?'注意':l.tone==='ok'?'完成':'系统'}</span></div>) : <EmptyState text="尚无本地操作记录。"/>}</section><div className="subtle-callout"><LockKeyhole size={16}/><span>诊断日志仅记操作事件，不采集终端输入、SSH 密码、Wi-Fi 密码或麦克风内容。</span></div></div> }
 
 function HostKeyDialog({ target, status, fingerprint, setFingerprint, checked, setChecked, onTrust, onClear, onClose, busy }: { target: Target; status: HostKeyStatus; fingerprint: string; setFingerprint: (v: string) => void; checked: boolean; setChecked: (v: boolean) => void; onTrust: () => void; onClear: () => void; onClose: () => void; busy: boolean }) {
   return <div className="modal-backdrop"><div className="modal-card hostkey-modal">
     <div className="modal-title"><div><div className="section-kicker">SSH HOST AUTHENTICITY</div><h2>{status.changed ? '主机指纹发生变化' : '核对机器人主机指纹'}</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭"><X size={18}/></button></div>
     <p className="modal-intro">目标：<strong>{target.username}@{target.host}:{target.port}</strong> · 网络扫描本身无法证明身份。请通过机器人本地可信控制台或其他可信渠道核对一把密钥。</p>
-    {status.changed && <div className="inline-error"><AlertTriangle size={15}/><span>已固定的密钥不匹配或来自旧版多密钥规则。连接已阻断；请先可信核验，再清除旧 pin 并重新固定。</span></div>}
+    {status.changed && <div className="inline-error"><AlertTriangle size={15}/><span>{status.otherDevice ? `这个地址现在由另一台设备（MAC ${status.observedMac}）使用，不是原来的 ${target.name}。原来的开发板可能换了地址：关闭此窗口后点“一键直连”可以按 MAC 重新找到它。` : '已固定的密钥不匹配或来自旧版多密钥规则。连接已阻断；请先可信核验，再清除旧 pin 并重新固定。'}</span></div>}
     <div className="fingerprint-list"><div className="section-kicker">选择一把主机密钥并核对 SHA-256 指纹（推荐 ED25519）</div>
       {status.fingerprints.map(fp => <label className={`fingerprint-choice ${fingerprint === fp ? 'selected' : ''}`} key={fp}><input type="radio" name="host-fingerprint" value={fp} checked={fingerprint === fp} onChange={() => { setFingerprint(fp); setChecked(false) }}/><code>{fp}</code></label>)}
       {!status.fingerprints.length && <EmptyState text="未读取到主机指纹。"/>}
@@ -843,13 +1069,14 @@ function SudoDialog({ prompt, target, onDone }: { prompt: { reason: string; erro
 function ConfirmDialog({ confirm, onCancel, onConfirm, busy = false }: { confirm:Confirm;onCancel:()=>void|Promise<void>;onConfirm:()=>void|Promise<void>;busy?:boolean }) { return <div className="modal-backdrop"><div className="modal-card confirm-modal"><div className="modal-title"><div className={`confirm-icon ${confirm.danger?'danger':''}`}>{confirm.danger?<AlertTriangle size={20}/>:<ShieldCheck size={20}/>}</div><div><div className="section-kicker">OPERATION CONFIRMATION</div><h2>{confirm.title}</h2></div></div><p className="modal-intro preserve-lines">{confirm.description}</p><div className="modal-actions"><button className="button button-subtle" onClick={onCancel} disabled={busy}>返回</button><button className={`button ${confirm.danger?'button-danger':'button-primary'}`} onClick={onConfirm} disabled={busy}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : null}{confirm.danger?'确认执行':'继续'}</button></div></div></div> }
 
 
-function TargetDialog({ value, setValue, onClose, onSubmit, busy }: { value: { id: string; name: string; host: string; port: string; username: string }; setValue: (v: { id: string; name: string; host: string; port: string; username: string }) => void; onClose: () => void; onSubmit: (e: FormEvent) => void; busy: boolean }) {
+function TargetDialog({ value, setValue, onClose, onSubmit, busy }: { value: TargetDraftState; setValue: (v: TargetDraftState) => void; onClose: () => void; onSubmit: (e: FormEvent) => void; busy: boolean }) {
   return <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) onClose() }}><form className="modal-card" onSubmit={onSubmit}>
     <div className="modal-title"><div><div className="section-kicker">SSH TARGET</div><h2>添加 Linux 机器人</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="关闭"><X size={18}/></button></div>
     <p className="modal-intro">目标可用机器人 IP 或主机名。密码不会保存；可使用 SSH Agent/密钥或在交互式终端输入密码。</p>
     <label>设备名称<input required maxLength={80} autoFocus value={value.name} onChange={e => setValue({ ...value, name: e.target.value })} placeholder="例如：R2 测试机器人"/></label>
     <label>机器人 IP / 主机名<input required maxLength={253} value={value.host} onChange={e => setValue({ ...value, host: e.target.value })} placeholder="192.168.7.2 或 robot-r2.local"/></label>
     <div className="form-split"><label>SSH 用户名<input required maxLength={64} value={value.username} onChange={e => setValue({ ...value, username: e.target.value })} placeholder="robot"/></label><label>SSH 端口<input required type="number" min="1" max="65535" value={value.port} onChange={e => setValue({ ...value, port: e.target.value })}/></label></div>
+    {value.mac && <p className="small-muted">已记录这块开发板的 MAC {value.mac}；以后它换了 IP，RoboLink 也能自动认出来。</p>}
     <div className="subtle-callout"><Cable size={15}/><span>网线直接连接开发机与机器人；RoboLink 不会擅自改动本机网络配置。</span></div>
     <div className="modal-actions"><button type="button" className="button button-subtle" onClick={onClose}>取消</button><button className="button button-primary" disabled={busy}>{busy ? <LoaderCircle className="spin-icon" size={15}/> : null}保存目标</button></div>
   </form></div>
