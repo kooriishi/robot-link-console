@@ -493,6 +493,10 @@ pub fn auto_direct_address(
         .get("existing")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let host_route = reply
+        .get("hostRoute")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let mut owned = state.load_network_addresses()?;
     if !existing {
         owned.retain(|item| item.interface != interface || item.cidr != cidr);
@@ -514,6 +518,7 @@ pub fn auto_direct_address(
         cidr,
         peer: peer_ip.to_string(),
         existing,
+        host_route,
         owned,
     })
 }
@@ -1408,7 +1413,7 @@ pub fn discover_direct_devices(
     }
     for (address, dev) in wrong_route {
         report.warnings.push(format!(
-            "候选 {address} 的流量目前会经 {dev}，不是扫描到它的直连网卡；请在该候选上“配置本机 IP 后添加”，让直连网卡拥有同网段地址后再连接。"
+            "候选 {address} 的流量目前会经 {dev}，不是扫描到它的直连网卡；点该候选上的“自动配置本机 IP 并添加”即可：RoboLink 会只给这台设备加一条走直连网卡的主机路由，不影响 {dev} 上的其他网络。"
         ));
     }
     Ok(report)

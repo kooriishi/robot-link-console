@@ -19,7 +19,7 @@ type Target = { id: string; name: string; host: string; port: number; username: 
 type TargetDraftState = { id: string; name: string; host: string; port: string; username: string; mac: string; interface: string }
 type ChannelStatus = { pinned: boolean; ready: boolean; via: 'session' | 'key' | 'none'; keyLogin: boolean }
 type TargetMove = { targetId: string; name: string; oldHost: string; newHost: string; interface?: string | null }
-type AutoAddress = { interface: string; cidr: string; peer: string; existing: boolean; owned: OwnedNetworkAddress[] }
+type AutoAddress = { interface: string; cidr: string; peer: string; existing: boolean; hostRoute?: boolean; owned: OwnedNetworkAddress[] }
 type DiagnosticsReport = { path: string; bytes: number; preview: string }
 type Waiting = { since: number; reason: 'lost' | 'reboot' | 'poweroff' }
 type HostInterface = { name: string; kind: string; mac?: string; ipv4: string[]; carrier: boolean; state: string; mtu?: number }
@@ -520,7 +520,7 @@ export default function RealApp() {
     const result = await invoke<AutoAddress>('auto_direct_address', { interface: host.interface, peer: host.address })
     setOwnedNetworkAddresses(result.owned)
     setDiscovered(items => items.map(item => item.interface === host.interface && item.address === host.address ? { ...item, routeReady: true } : item))
-    log(result.existing ? `${result.interface} 已有同网段地址 ${result.cidr}` : `已为 ${result.interface} 自动配置本机地址 ${result.cidr}`, 'ok')
+    log(result.existing ? `${result.interface} 已有到 ${result.peer} 的地址 ${result.cidr}` : result.hostRoute ? `${result.peer} 和本机其他网卡同网段，已只为它在 ${result.interface} 上加了主机路由（本机 ${result.cidr}），其他网络不受影响` : `已为 ${result.interface} 自动配置本机地址 ${result.cidr}`, 'ok')
     void invoke<HostInfo>('get_host_info').then(setHostInfo).catch(() => {})
     return result
   }
@@ -831,7 +831,7 @@ export default function RealApp() {
         <div className="page-view" hidden={page !== 'desktop'}>{visitedPages.has('desktop') && <DesktopPage target={selected} sshReady={sshReady} active={page === 'desktop'} runPrivileged={runPrivileged} sudoPassword={() => sudoPasswordRef.current} onLog={log} onGoTerminal={() => navPage('terminal')}/>}</div>
         <div className="page-view" hidden={page !== 'terminal'}>{visitedPages.has('terminal') && <TerminalPage key={sessionId} sessionId={sessionId} exited={terminalExited} sshReady={sshReady} target={selected} theme={theme} onConnect={() => { void connectTarget() }} onDisconnect={disconnectTerminal} onRisk={setDangerLine} onPaste={setPastePreview} onError={setError}/>}</div>
         <div className="page-view" hidden={page !== 'logs'}>{visitedPages.has('logs') && <LogsPage logs={logs} onDiagnose={() => { void collectDiagnostics() }} canDiagnose={!!selected && sshReady && !busy} onClear={() => setConfirm({ title: '清空本地诊断记录？', description: '只删除 RoboLink 本机界面中的操作记录，不会影响机器人。', run: async () => { setLogs([]); setConfirm(null) } })}/>}</div>
-        <footer className="footer-note"><ShieldCheck size={14}/>本机地址仅按需临时添加 · SSH 使用独立 known_hosts · RoboLink v0.7.1 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
+        <footer className="footer-note"><ShieldCheck size={14}/>本机地址仅按需临时添加 · SSH 使用独立 known_hosts · RoboLink v0.7.2 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
       </div>
     </main>
     {targetDialog && <TargetDialog value={targetDraft} setValue={setTargetDraft} onClose={() => setTargetDialog(false)} onSubmit={saveTarget} busy={busy}/>}

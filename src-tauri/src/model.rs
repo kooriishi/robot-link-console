@@ -74,6 +74,8 @@ pub struct AutoAddress {
     pub peer: String,
     /// The interface already had an address in the peer's subnet; nothing was added.
     pub existing: bool,
+    /// The board's subnet is routed through another NIC; only a /32 route to the board was added.
+    pub host_route: bool,
     pub owned: Vec<crate::state::OwnedNetworkAddress>,
 }
 

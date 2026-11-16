@@ -1384,15 +1384,17 @@ fn parse_cidr(value: &str) -> Result<(Ipv4Addr, u8), String> {
         .parse::<Ipv4Addr>()
         .map_err(|_| "本机 IPv4 地址格式无效")?;
     let prefix = prefix.parse::<u8>().map_err(|_| "IPv4 前缀长度无效")?;
-    if !(1..=30).contains(&prefix)
+    if !((1..=30).contains(&prefix) || prefix == 32)
         || address.is_unspecified()
         || address.is_multicast()
         || address == Ipv4Addr::BROADCAST
     {
-        return Err("仅支持非特殊 IPv4 地址和 /1–/30 前缀".into());
+        return Err("仅支持非特殊 IPv4 地址和 /1–/30 或 /32 前缀".into());
     }
     let host_mask = !(u32::MAX << (32 - prefix));
-    if u32::from(address) & host_mask == 0 || u32::from(address) & host_mask == host_mask {
+    if prefix != 32
+        && (u32::from(address) & host_mask == 0 || u32::from(address) & host_mask == host_mask)
+    {
         return Err("本机地址不能是所选子网的网络地址或广播地址".into());
     }
     Ok((address, prefix))
@@ -1673,6 +1675,123 @@ fn auto_candidates(peer: Ipv4Addr, mac: [u8; 6]) -> Vec<Ipv4Addr> {
         .collect()
 }
 
+/// The board's subnet is already routed through another NIC (typically the PC's Wi-Fi LAN uses the
+/// same 192.168.x.0/24 as the board's static address). Instead of a /24 that would fight that route,
+/// give this interface one /32 address and a /32 route to the board only: everything else in that
+/// subnet keeps going through the other NIC.
+fn apply_host_route(interface: &str, local: Ipv4Addr, peer: Ipv4Addr) -> Result<bool, String> {
+    let current = all_ipv4_addresses()?;
+    if let Some((dev, _, _)) = current.iter().find(|(_, ip, _)| *ip == local) {
+        return Err(format!(
+            "本机 IPv4 {local} 已由网卡 {dev} 使用；RoboLink 不会接管或覆盖现有地址。"
+        ));
+    }
+    if duplicate_address_probe(interface, local)? {
+        return Err(format!(
+            "{ADDRESS_IN_USE}检测到网线另一端有设备在使用 {local}。"
+        ));
+    }
+    let cidr_arg = format!("{local}/32");
+    let route = format!("{peer}/32 src={local}");
+    let via_nm = nm_manages(interface);
+    if via_nm {
+        nm_add_address_with_route(interface, &cidr_arg, Some(&route))?;
+    } else {
+        let output = ip_command(&["address", "add", &cidr_arg, "dev", interface])?;
+        if !output.status.success() {
+            return Err(format!(
+                "添加临时 IPv4 地址失败：{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let peer_route = format!("{peer}/32");
+        let local_text = local.to_string();
+        let output = ip_command(&[
+            "route",
+            "replace",
+            &peer_route,
+            "dev",
+            interface,
+            "src",
+            &local_text,
+        ])?;
+        if !output.status.success() {
+            let _ = remove_address(interface, &cidr_arg);
+            return Err(format!(
+                "添加到开发板的主机路由失败：{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    if route_device(peer).as_deref() != Some(interface) {
+        let _ = remove_address(interface, &cidr_arg);
+        return Err(
+            "添加后到开发板的路由仍没有走选定网卡；已撤销刚添加的地址，其他网络未作更改。".into(),
+        );
+    }
+    Ok(via_nm)
+}
+
+/// Interface the kernel currently uses for `peer`, and the source address it picks.
+fn route_device_and_source(peer: Ipv4Addr) -> Option<(String, Option<Ipv4Addr>)> {
+    let route = ip_command(&["-4", "route", "get", &peer.to_string()]).ok()?;
+    if !route.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&route.stdout).to_string();
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    let value = |key: &str| words.windows(2).find(|w| w[0] == key).map(|w| w[1]);
+    Some((
+        value("dev")?.to_string(),
+        value("src").and_then(|s| s.parse().ok()),
+    ))
+}
+fn route_device(peer: Ipv4Addr) -> Option<String> {
+    route_device_and_source(peer).map(|(dev, _)| dev)
+}
+
+/// Local addresses to try in host-route mode: high host numbers, skipping the board, our own
+/// addresses, the gateway and anything we already talk to on other NICs (those would become
+/// unreachable while the /32 sits on the cable).
+fn host_route_candidates(peer: Ipv4Addr, avoid: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+    let p = peer.octets();
+    (200u8..=254)
+        .rev()
+        .map(|host| Ipv4Addr::new(p[0], p[1], p[2], host))
+        .filter(|ip| *ip != peer && !avoid.contains(ip))
+        .take(12)
+        .collect()
+}
+
+/// Addresses that must not be used for the /32: neighbours and gateways seen on other NICs.
+fn addresses_in_use_elsewhere(interface: &str) -> Vec<Ipv4Addr> {
+    let mut used = Vec::new();
+    if let Ok(out) = ip_command(&["-4", "neigh", "show"]) {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let words = line.split_whitespace().collect::<Vec<_>>();
+            let dev = words.windows(2).find(|w| w[0] == "dev").map(|w| w[1]);
+            if dev != Some(interface) {
+                if let Some(ip) = words.first().and_then(|w| w.parse().ok()) {
+                    used.push(ip);
+                }
+            }
+        }
+    }
+    if let Ok(out) = ip_command(&["-4", "route", "show", "default"]) {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let words = line.split_whitespace().collect::<Vec<_>>();
+            if let Some(ip) = words
+                .windows(2)
+                .find(|w| w[0] == "via")
+                .and_then(|w| w[1].parse().ok())
+            {
+                used.push(ip);
+            }
+        }
+    }
+    used
+}
+
 /// One-click variant of `add-address`: picks a free local address in the board's subnet itself, or
 /// reports the address the interface already has there. Prints `{"cidr":…,"existing":…}`.
 fn add_address_auto(interface: &str, peer_text: &str) -> Result<(), String> {
@@ -1689,11 +1808,24 @@ fn add_address_auto(interface: &str, peer_text: &str) -> Result<(), String> {
             serde_json::json!({ "cidr": cidr, "existing": existing })
         );
     };
-    if let Some((_, ip, prefix)) = all_ipv4_addresses()?.into_iter().find(|(dev, ip, prefix)| {
+    let current = all_ipv4_addresses()?;
+    if let Some((_, ip, prefix)) = current.iter().find(|(dev, ip, prefix)| {
         dev == interface && *ip != peer && network(*ip, *prefix).0 == network(peer, *prefix).0
     }) {
         report(format!("{ip}/{prefix}"), true);
         return Ok(());
+    }
+    // A host route set up earlier already sends the board through this cable.
+    if let Some((dev, Some(src))) = route_device_and_source(peer) {
+        if dev == interface {
+            if let Some((_, ip, prefix)) = current
+                .iter()
+                .find(|(d, ip, _)| d == interface && *ip == src)
+            {
+                report(format!("{ip}/{prefix}"), true);
+                return Ok(());
+            }
+        }
     }
     let prefix = assumed_prefix(peer);
     let host_mask = !(u32::MAX << (32 - prefix));
@@ -1702,6 +1834,24 @@ fn add_address_auto(interface: &str, peer_text: &str) -> Result<(), String> {
             "开发板地址是 /24 网段的网络地址或广播地址，无法自动判断网段；请手动配置本机 IP。"
                 .into(),
         );
+    }
+    if !peer.is_link_local() && check_route_conflicts(interface, peer, prefix).is_err() {
+        let mut avoid = addresses_in_use_elsewhere(interface);
+        avoid.extend(current.iter().map(|(_, ip, _)| *ip));
+        for local in host_route_candidates(peer, &avoid) {
+            match apply_host_route(interface, local, peer) {
+                Ok(_) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "cidr": format!("{local}/32"), "existing": false, "hostRoute": true })
+                    );
+                    return Ok(());
+                }
+                Err(error) if error.starts_with(ADDRESS_IN_USE) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        return Err("开发板所在网段已经由其他网卡使用，自动挑选的本机地址又都被占用；请临时断开那张网卡后再试。".into());
     }
     let mac = interface_mac(interface).unwrap_or([0; 6]);
     for local in auto_candidates(peer, mac) {
@@ -1785,7 +1935,44 @@ fn parse_nm_addresses(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn nm_profile_args(interface: &str, addresses: &[String], create: bool) -> Vec<String> {
+/// Host routes of our profile (`192.168.11.50/32 src=192.168.11.254`), used by host-route mode.
+fn nm_profile_routes(interface: &str) -> Vec<String> {
+    if nmcli_path().is_none() {
+        return Vec::new();
+    }
+    match nmcli(&[
+        "-g",
+        "ipv4.routes",
+        "connection",
+        "show",
+        &nm_profile_name(interface),
+    ]) {
+        Ok(out) if out.status.success() => parse_nm_routes(&String::from_utf8_lossy(&out.stdout)),
+        _ => Vec::new(),
+    }
+}
+fn parse_nm_routes(text: &str) -> Vec<String> {
+    text.trim()
+        .split(',')
+        .map(|item| item.trim().replace('\\', ""))
+        .filter(|item| {
+            item.split_whitespace()
+                .next()
+                .is_some_and(|dest| parse_cidr(dest).is_ok())
+        })
+        .collect()
+}
+fn route_uses_source(route: &str, source: Ipv4Addr) -> bool {
+    route
+        .split_whitespace()
+        .any(|word| word == format!("src={source}"))
+}
+fn nm_profile_args(
+    interface: &str,
+    addresses: &[String],
+    routes: &[String],
+    create: bool,
+) -> Vec<String> {
     let name = nm_profile_name(interface);
     let mut args: Vec<String> = if create {
         [
@@ -1811,6 +1998,7 @@ fn nm_profile_args(interface: &str, addresses: &[String], create: bool) -> Vec<S
         ("connection.autoconnect-priority", "100"),
         ("ipv4.method", "manual"),
         ("ipv4.addresses", &addresses.join(",")),
+        ("ipv4.routes", &routes.join(", ")),
         ("ipv4.gateway", ""),
         ("ipv4.never-default", "yes"),
         ("ipv4.ignore-auto-dns", "yes"),
@@ -1824,9 +2012,13 @@ fn nm_profile_args(interface: &str, addresses: &[String], create: bool) -> Vec<S
     args
 }
 
-fn nm_apply_profile(interface: &str, addresses: &[String]) -> Result<(), String> {
+fn nm_apply_profile(
+    interface: &str,
+    addresses: &[String],
+    routes: &[String],
+) -> Result<(), String> {
     let exists = nm_profile_addresses(interface).is_some();
-    let args = nm_profile_args(interface, addresses, !exists);
+    let args = nm_profile_args(interface, addresses, routes, !exists);
     let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
     let out = nmcli(&refs)?;
     if !out.status.success() {
@@ -1858,11 +2050,24 @@ fn nm_apply_profile(interface: &str, addresses: &[String]) -> Result<(), String>
 /// Adds an address to RoboLink's in-memory NetworkManager profile for this interface (creating and
 /// activating it if needed). Prints nothing, so DHCP commands can keep stdout for JSON.
 fn nm_add_address(interface: &str, cidr: &str) -> Result<(), String> {
+    nm_add_address_with_route(interface, cidr, None)
+}
+fn nm_add_address_with_route(
+    interface: &str,
+    cidr: &str,
+    route: Option<&str>,
+) -> Result<(), String> {
     let mut addresses = nm_profile_addresses(interface).unwrap_or_default();
     if !addresses.iter().any(|item| item == cidr) {
         addresses.push(cidr.to_string());
     }
-    nm_apply_profile(interface, &addresses)
+    let mut routes = nm_profile_routes(interface);
+    if let Some(route) = route {
+        let dest = route.split_whitespace().next().unwrap_or_default();
+        routes.retain(|item| item.split_whitespace().next() != Some(dest));
+        routes.push(route.to_string());
+    }
+    nm_apply_profile(interface, &addresses, &routes)
 }
 
 /// Removes an address from RoboLink's NM profile; Ok(false) when the profile does not hold it.
@@ -1877,6 +2082,11 @@ fn nm_remove_address(interface: &str, cidr: &str) -> Result<bool, String> {
         .into_iter()
         .filter(|item| item != cidr)
         .collect::<Vec<_>>();
+    let removed_ip = parse_cidr(cidr).map(|(ip, _)| ip).ok();
+    let routes = nm_profile_routes(interface)
+        .into_iter()
+        .filter(|route| !removed_ip.is_some_and(|ip| route_uses_source(route, ip)))
+        .collect::<Vec<_>>();
     if remaining.is_empty() {
         let out = nmcli(&["connection", "delete", &nm_profile_name(interface)])?;
         if !out.status.success() {
@@ -1886,7 +2096,7 @@ fn nm_remove_address(interface: &str, cidr: &str) -> Result<bool, String> {
             ));
         }
     } else {
-        nm_apply_profile(interface, &remaining)?;
+        nm_apply_profile(interface, &remaining, &routes)?;
     }
     Ok(true)
 }
@@ -1926,6 +2136,20 @@ fn remove_address(interface: &str, cidr: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_route_candidates_avoid_gateway_neighbours_and_the_board() {
+        let peer = Ipv4Addr::new(192, 168, 11, 254);
+        let avoid = [
+            Ipv4Addr::new(192, 168, 11, 253),
+            Ipv4Addr::new(192, 168, 11, 1),
+        ];
+        let list = host_route_candidates(peer, &avoid);
+        assert_eq!(list[0], Ipv4Addr::new(192, 168, 11, 252));
+        assert!(list.iter().all(|ip| *ip != peer && !avoid.contains(ip)));
+        assert!(parse_cidr("192.168.11.252/32").is_ok());
+        assert!(parse_cidr("192.168.11.0/31").is_err());
+    }
 
     #[test]
     fn auto_candidates_stay_in_the_peer_subnet_and_skip_the_peer() {
@@ -2264,7 +2488,7 @@ mod tests {
 
     #[test]
     fn nm_profile_is_manual_without_default_route() {
-        let args = nm_profile_args("enp3s0", &["192.168.127.1/24".into()], true);
+        let args = nm_profile_args("enp3s0", &["192.168.127.1/24".into()], &[], true);
         let joined = args.join(" ");
         assert!(joined.starts_with(
             "connection add save no type ethernet con-name robolink-enp3s0 ifname enp3s0"
@@ -2275,6 +2499,7 @@ mod tests {
         let modify = nm_profile_args(
             "enp3s0",
             &["192.168.127.1/24".into(), "192.168.1.2/24".into()],
+            &[],
             false,
         );
         assert_eq!(&modify[..3], ["connection", "modify", "robolink-enp3s0"]);
@@ -2284,6 +2509,23 @@ mod tests {
             vec!["192.168.127.1/24", "192.168.1.2/24"]
         );
         assert!(parse_nm_addresses("\n").is_empty());
+        // Host-route mode: a /32 address plus a /32 route with an explicit source.
+        assert_eq!(
+            parse_nm_addresses("192.168.77.1/24, 192.168.11.254/32"),
+            vec!["192.168.77.1/24", "192.168.11.254/32"]
+        );
+        let routes = parse_nm_routes("192.168.11.50/32 src=192.168.11.254\n");
+        assert_eq!(routes, vec!["192.168.11.50/32 src=192.168.11.254"]);
+        assert!(route_uses_source(
+            &routes[0],
+            Ipv4Addr::new(192, 168, 11, 254)
+        ));
+        assert!(!route_uses_source(
+            &routes[0],
+            Ipv4Addr::new(192, 168, 11, 25)
+        ));
+        let with_route = nm_profile_args("enx1", &["192.168.11.254/32".into()], &routes, true);
+        assert!(with_route.contains(&"192.168.11.50/32 src=192.168.11.254".to_string()));
         assert!(nm_state_is_managed("100 (connected)"));
         assert!(nm_state_is_managed("30 (disconnected)"));
         assert!(!nm_state_is_managed("10 (unmanaged)"));
