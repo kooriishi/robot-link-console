@@ -940,3 +940,4 @@ html[data-theme] .diagnostics-preview {
   white-space: pre-wrap; word-break: break-word;
 }
 html[data-theme] .diagnostics-modal .modal-intro code { word-break: break-all; }
+html[data-theme] .discovered-copy small.requested-note { color: var(--a-orange-text); }
