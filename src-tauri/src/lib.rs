@@ -1,6 +1,7 @@
 mod commands;
 mod desktop;
 mod link;
+mod link_ipv4;
 mod model;
 mod ssh;
 mod state;
@@ -39,6 +40,12 @@ pub fn run() {
             link::link_login,
             link::link_robot_ipv4,
             link::link_finish,
+            link_ipv4::link_ipv4_probe,
+            link_ipv4::link_ipv4_dhcp,
+            link_ipv4::link_ipv4_propose,
+            link_ipv4::link_ipv4_temp_add,
+            link_ipv4::link_ipv4_temp_remove,
+            link_ipv4::link_use_ipv6,
             commands::drop_channel,
             commands::set_key_login,
             commands::sync_targets_with_discovery,

@@ -1227,6 +1227,7 @@ mod tests {
             interface: None,
             key_login: false,
             hostname: None,
+            link: None,
         }
     }
 

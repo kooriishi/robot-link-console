@@ -24,6 +24,32 @@ pub struct Target {
     /// their SSH host key, so the host name is what tells them apart.
     #[serde(default)]
     pub hostname: Option<String>,
+    /// How the cabled link to this robot was set up (see link_ipv4.rs), remembered for next time.
+    #[serde(default)]
+    pub link: Option<LinkRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkRecord {
+    /// The robot's IPv6 link-local address on the cabled port (without the zone).
+    pub link_local: String,
+    /// This PC's interface the cable is in.
+    pub pc_interface: String,
+    /// The robot's NIC that owns the link-local address.
+    #[serde(default)]
+    pub robot_device: Option<String>,
+    /// IPv4/prefix the robot has on that NIC, if any.
+    #[serde(default)]
+    pub ipv4: Option<String>,
+    /// "existing" | "dhcp" | "temporary" | "ipv6".
+    pub source: String,
+    /// Address RoboLink added on the robot with `ip addr add`; gone after the robot reboots.
+    #[serde(default)]
+    pub temp_cidr: Option<String>,
+    /// `Host` alias RoboLink wrote to ~/.ssh/config for the link-local address.
+    #[serde(default)]
+    pub ssh_alias: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

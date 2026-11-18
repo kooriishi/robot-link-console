@@ -88,7 +88,7 @@ pub fn is_robot_name(name: &str) -> bool {
     ROBOT_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
-fn parse_link_local(value: &str) -> Result<Ipv6Addr, String> {
+pub(crate) fn parse_link_local(value: &str) -> Result<Ipv6Addr, String> {
     let ip = value
         .split('%')
         .next()
@@ -504,11 +504,11 @@ pub fn find_link_peers(state: State<'_, AppState>) -> Result<LinkScan, String> {
     })
 }
 
-fn link_host(ip: Ipv6Addr, interface: &str) -> String {
+pub(crate) fn link_host(ip: Ipv6Addr, interface: &str) -> String {
     format!("{ip}%{interface}")
 }
 
-fn save_target(state: &AppState, target: &Target) -> Result<(), String> {
+pub(crate) fn save_target(state: &AppState, target: &Target) -> Result<(), String> {
     let mut targets = state.load_targets()?;
     if let Some(entry) = targets.iter_mut().find(|t| t.id == target.id) {
         *entry = target.clone();
@@ -549,6 +549,7 @@ pub fn link_prepare(
         interface: None,
         key_login: false,
         hostname: None,
+        link: None,
     });
     if let Some(old) = &existing {
         ssh::drop_channel(&state, old);
@@ -720,6 +721,9 @@ pub fn link_finish(
     state: State<'_, AppState>,
     target_id: String,
     ipv4: Option<String>,
+    source: Option<String>,
+    robot_device: Option<String>,
+    link_local: Option<String>,
 ) -> Result<LinkFinished, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
     let Some(address) = ipv4
@@ -754,9 +758,17 @@ pub fn link_finish(
     }
     let mut candidate = target.clone();
     candidate.host = address.to_string();
+    // `ssh <user>@<IPv4> true` with RoboLink's key.
     if !ssh::key_login(&state, &candidate) {
         return stay(format!("经 {address} 用密钥登录失败"));
     }
+    crate::link_ipv4::remember(
+        &mut candidate,
+        link_local.as_deref(),
+        robot_device,
+        ipv4.clone(),
+        source.as_deref().unwrap_or("existing"),
+    );
     save_target(&state, &candidate)?;
     // The link-local master is no longer needed.
     ssh::drop_channel(&state, &target);

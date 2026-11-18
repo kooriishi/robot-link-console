@@ -157,6 +157,7 @@ pub fn save_target(state: State<'_, AppState>, draft: TargetDraft) -> Result<Tar
             .as_ref()
             .is_some_and(|t| t.key_login && t.username == draft.username.trim()),
         hostname: previous.as_ref().and_then(|t| t.hostname.clone()),
+        link: previous.as_ref().and_then(|t| t.link.clone()),
     };
     if let Some(existing) = targets.iter_mut().find(|t| t.id == target.id) {
         *existing = target.clone();
@@ -899,7 +900,7 @@ fn trusted_network_helper() -> Result<std::path::PathBuf, String> {
     Ok(helper)
 }
 
-fn run_network_helper(arguments: &[String]) -> Result<String, String> {
+pub(crate) fn run_network_helper(arguments: &[String]) -> Result<String, String> {
     let helper = trusted_network_helper()?;
     let output = Command::new("/usr/bin/pkexec")
         .arg(helper)
@@ -2801,6 +2802,7 @@ mod tests {
             interface: None,
             key_login: false,
             hostname: None,
+            link: None,
         }
     }
 

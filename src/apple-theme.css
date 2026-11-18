@@ -965,3 +965,32 @@ html[data-theme] .legacy-scan-body { display: flex; flex-direction: column; gap:
 html[data-theme] .link-dialog .link-facts { margin: 12px 0 4px; }
 html[data-theme] .link-dialog .inline-progress,
 html[data-theme] .link-dialog .inline-error { margin: 12px 0 0; }
+
+/* ---------- 0.8.3: get-robot-IPv4 wizard ---------- */
+html[data-theme] .wizard-steps { list-style: none; margin: 14px 0 0; padding: 0; display: flex; flex-direction: column; }
+html[data-theme] .wizard-step { position: relative; display: flex; gap: 12px; padding: 0 0 14px; }
+html[data-theme] .wizard-step:not(:last-child)::before {
+  content: ''; position: absolute; left: 11px; top: 26px; bottom: 2px; width: 1px; background: var(--a-divider);
+}
+html[data-theme] .wizard-icon {
+  flex: none; width: 23px; height: 23px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--a-fill); color: var(--a-muted); font-size: 11px; font-weight: 600;
+}
+html[data-theme] .wizard-step.running .wizard-icon { background: var(--a-accent-soft); color: var(--a-accent); }
+html[data-theme] .wizard-step.done .wizard-icon { background: rgba(52, 199, 89, .14); color: #248a3d; }
+html[data-theme] .wizard-step.fail .wizard-icon { background: rgba(255, 59, 48, .12); color: #d70015; }
+html[data-theme] .wizard-dash { width: 8px; height: 1.5px; border-radius: 1px; background: currentColor; }
+html[data-theme] .wizard-copy { display: flex; flex-direction: column; gap: 3px; min-width: 0; padding-top: 2px; }
+html[data-theme] .wizard-copy strong { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--a-ink); }
+html[data-theme] .wizard-step.pending .wizard-copy strong,
+html[data-theme] .wizard-step.skip .wizard-copy strong { color: var(--a-muted); font-weight: 500; }
+html[data-theme] .wizard-copy small { color: var(--a-muted); font-size: 12px; line-height: 1.5; word-break: break-all; }
+html[data-theme] .wizard-step.fail .wizard-copy small { color: #d70015; }
+html[data-theme] .wizard-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 4px; }
+html[data-theme] .wizard-ipv6 { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+html[data-theme] .wizard-ipv6 code { display: block; padding: 7px 10px; border-radius: 8px; background: var(--a-fill); font-size: 12px; overflow-x: auto; white-space: nowrap; }
+html[data-theme] .temp-address-strip { display: flex; align-items: center; gap: 10px; padding: 12px 18px; font-size: 13px; color: var(--a-ink); }
+html[data-theme] .temp-address-strip .current-badge { margin-left: 8px; }
+html[data-theme] .temp-dialog-text { margin: 4px 0 8px; font-size: 14px; line-height: 1.6; color: var(--a-ink); }
+html[data-theme="dark"] .wizard-step.done .wizard-icon { color: #30d158; }
+html[data-theme="dark"] .wizard-step.fail .wizard-icon, html[data-theme="dark"] .wizard-step.fail .wizard-copy small { color: #ff6961; }
