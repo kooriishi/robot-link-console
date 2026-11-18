@@ -97,7 +97,7 @@ pub fn get_host_info() -> Result<HostInfo, String> {
     })
 }
 
-fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
+pub(crate) fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
     let out = Command::new(program)
         .args(args)
         .output()
@@ -156,6 +156,7 @@ pub fn save_target(state: State<'_, AppState>, draft: TargetDraft) -> Result<Tar
         key_login: previous
             .as_ref()
             .is_some_and(|t| t.key_login && t.username == draft.username.trim()),
+        hostname: previous.as_ref().and_then(|t| t.hostname.clone()),
     };
     if let Some(existing) = targets.iter_mut().find(|t| t.id == target.id) {
         *existing = target.clone();
@@ -384,6 +385,15 @@ pub fn relocate_target(
     target_id: String,
 ) -> Result<Option<TargetMove>, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
+    if let Some(moved) = relocate_by_ipv4(&state, &target)? {
+        return Ok(Some(moved));
+    }
+    // The robot may have left its IPv4 subnet altogether (or the PC lost its address there): its
+    // MAC still answers on the IPv6 all-nodes group.
+    Ok(crate::link::relocate_by_link_local(&state, &target))
+}
+
+fn relocate_by_ipv4(state: &AppState, target: &Target) -> Result<Option<TargetMove>, String> {
     if target.macs.is_empty() || target.host.parse::<Ipv4Addr>().is_err() {
         return Ok(None);
     }
@@ -440,7 +450,7 @@ pub fn relocate_target(
     let Some(moved) = moves.into_iter().find(|m| m.target_id == target.id) else {
         return Ok(None);
     };
-    ssh::drop_channel(&state, &target);
+    ssh::drop_channel(state, target);
     Ok(Some(moved))
 }
 
@@ -469,16 +479,33 @@ pub fn auto_direct_address(
     state: State<'_, AppState>,
     interface: String,
     peer: String,
+    prefix: Option<u8>,
+    avoid: Option<Vec<String>>,
 ) -> Result<AutoAddress, String> {
     validate_ifname(&interface)?;
     let peer_ip = peer
         .parse::<Ipv4Addr>()
         .map_err(|_| "候选设备必须是 IPv4 地址".to_string())?;
-    let output = run_network_helper(&[
-        "add-address-auto".into(),
+    let mut arguments = vec![
+        "add-address-auto".to_string(),
         interface.clone(),
         peer_ip.to_string(),
-    ])?;
+    ];
+    // The robot told us its real prefix and which addresses it already uses.
+    if let Some(prefix) = prefix.filter(|p| (16..=30).contains(p)) {
+        arguments.push(prefix.to_string());
+        let avoid = avoid
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
+            .take(200)
+            .map(|ip| ip.to_string())
+            .collect::<Vec<_>>();
+        if !avoid.is_empty() {
+            arguments.push(avoid.join(","));
+        }
+    }
+    let output = run_network_helper(&arguments)?;
     let reply: Value = output
         .lines()
         .rev()
@@ -967,7 +994,7 @@ fn route_details(address: &str, interface: &str) -> Option<String> {
 /// Interface the kernel actually uses for this address. Unlike `ip route get ... oif`, this shows
 /// when a candidate would leave through Wi-Fi or another NIC, which is the usual reason a discovered
 /// board still cannot be reached over the direct cable.
-fn route_interface(address: &str) -> Option<String> {
+pub(crate) fn route_interface(address: &str) -> Option<String> {
     let ip = address
         .split('%')
         .next()
@@ -2773,6 +2800,7 @@ mod tests {
             macs: macs.iter().map(|m| m.to_string()).collect(),
             interface: None,
             key_login: false,
+            hostname: None,
         }
     }
 

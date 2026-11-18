@@ -941,3 +941,27 @@ html[data-theme] .diagnostics-preview {
 }
 html[data-theme] .diagnostics-modal .modal-intro code { word-break: break-all; }
 html[data-theme] .discovered-copy small.requested-note { color: var(--a-orange-text); }
+
+/* ---------- 0.8.0: find robots over IPv6 link-local ---------- */
+html[data-theme] .link-finder .panel-heading { align-items: center; }
+html[data-theme] .link-finder-sub { margin: 4px 0 0; color: var(--a-muted); font-size: 13px; line-height: 1.5; }
+html[data-theme] .link-peers { display: flex; flex-direction: column; margin-top: 14px; }
+html[data-theme] .link-peer {
+  display: flex; align-items: center; gap: 14px; padding: 14px 0;
+  border-top: 1px solid var(--a-divider);
+}
+html[data-theme] .link-peer-icon {
+  flex: none; width: 38px; height: 38px; border-radius: 11px; display: grid; place-items: center;
+  background: var(--a-fill); color: var(--a-muted);
+}
+html[data-theme] .link-peer.robot .link-peer-icon { background: var(--a-accent-soft); color: var(--a-accent); }
+html[data-theme] .link-peer-copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+html[data-theme] .link-peer-copy strong { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 15px; font-weight: 600; color: var(--a-ink); }
+html[data-theme] .link-peer-copy small { color: var(--a-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+html[data-theme] .current-badge.muted-badge { background: var(--a-fill); color: var(--a-muted); }
+html[data-theme] .legacy-scan { margin-top: 16px; border-top: 1px solid var(--a-divider); padding-top: 12px; }
+html[data-theme] .legacy-scan > summary { cursor: pointer; color: var(--a-muted); font-size: 13px; font-weight: 600; list-style-position: inside; }
+html[data-theme] .legacy-scan-body { display: flex; flex-direction: column; gap: 14px; margin-top: 14px; }
+html[data-theme] .link-dialog .link-facts { margin: 12px 0 4px; }
+html[data-theme] .link-dialog .inline-progress,
+html[data-theme] .link-dialog .inline-error { margin: 12px 0 0; }

@@ -89,10 +89,27 @@ fn run() -> Result<(), String> {
         Some("add-address-auto") => {
             let interface = args.next().ok_or("缺少网卡名")?;
             let peer = args.next().ok_or("缺少已发现的对端 IPv4")?;
+            let prefix = match args.next() {
+                Some(text) => Some(
+                    text.parse::<u8>()
+                        .ok()
+                        .filter(|p| (16..=30).contains(p))
+                        .ok_or("前缀长度必须为 16–30")?,
+                ),
+                None => None,
+            };
+            let avoid = match args.next() {
+                Some(text) => text
+                    .split(',')
+                    .take(256)
+                    .map(|ip| ip.parse::<Ipv4Addr>().map_err(|_| "需避开的地址格式无效"))
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => Vec::new(),
+            };
             if args.next().is_some() {
                 return Err("参数过多".into());
             }
-            add_address_auto(&interface, &peer)
+            add_address_auto(&interface, &peer, prefix, &avoid)
         }
         Some("remove-address") => {
             let interface = args.next().ok_or("缺少网卡名")?;
@@ -1792,9 +1809,32 @@ fn addresses_in_use_elsewhere(interface: &str) -> Vec<Ipv4Addr> {
     used
 }
 
+/// Rarely used addresses at the top of the robot's subnet (.250, .251, … in a /24), skipping the
+/// robot and the addresses the robot reports for its other ports and neighbours.
+fn high_candidates(peer: Ipv4Addr, prefix: u8, avoid: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+    let (net, mask) = network(peer, prefix);
+    let broadcast = net | !mask;
+    let mut list = Vec::new();
+    for back in [5u32, 4, 3, 2, 6, 7, 8, 9, 10, 15, 20, 25, 30, 40, 50, 55] {
+        let Some(value) = broadcast.checked_sub(back) else {
+            continue;
+        };
+        let ip = Ipv4Addr::from(value);
+        if value > net && ip != peer && !avoid.contains(&ip) && !list.contains(&ip) {
+            list.push(ip);
+        }
+    }
+    list
+}
+
 /// One-click variant of `add-address`: picks a free local address in the board's subnet itself, or
 /// reports the address the interface already has there. Prints `{"cidr":…,"existing":…}`.
-fn add_address_auto(interface: &str, peer_text: &str) -> Result<(), String> {
+fn add_address_auto(
+    interface: &str,
+    peer_text: &str,
+    known_prefix: Option<u8>,
+    robot_avoid: &[Ipv4Addr],
+) -> Result<(), String> {
     physical_ethernet(interface, true)?;
     let peer = peer_text
         .parse::<Ipv4Addr>()
@@ -1827,7 +1867,7 @@ fn add_address_auto(interface: &str, peer_text: &str) -> Result<(), String> {
             }
         }
     }
-    let prefix = assumed_prefix(peer);
+    let prefix = known_prefix.unwrap_or_else(|| assumed_prefix(peer));
     let host_mask = !(u32::MAX << (32 - prefix));
     if u32::from(peer) & host_mask == 0 || u32::from(peer) & host_mask == host_mask {
         return Err(
@@ -1838,6 +1878,7 @@ fn add_address_auto(interface: &str, peer_text: &str) -> Result<(), String> {
     if !peer.is_link_local() && check_route_conflicts(interface, peer, prefix).is_err() {
         let mut avoid = addresses_in_use_elsewhere(interface);
         avoid.extend(current.iter().map(|(_, ip, _)| *ip));
+        avoid.extend_from_slice(robot_avoid);
         for local in host_route_candidates(peer, &avoid) {
             match apply_host_route(interface, local, peer) {
                 Ok(_) => {
@@ -1854,7 +1895,12 @@ fn add_address_auto(interface: &str, peer_text: &str) -> Result<(), String> {
         return Err("开发板所在网段已经由其他网卡使用，自动挑选的本机地址又都被占用；请临时断开那张网卡后再试。".into());
     }
     let mac = interface_mac(interface).unwrap_or([0; 6]);
-    for local in auto_candidates(peer, mac) {
+    let candidates = if peer.is_link_local() {
+        auto_candidates(peer, mac)
+    } else {
+        high_candidates(peer, prefix, robot_avoid)
+    };
+    for local in candidates {
         match apply_address(interface, local, prefix, peer) {
             Ok(_) => {
                 report(format!("{local}/{prefix}"), false);
@@ -2136,6 +2182,22 @@ fn remove_address(interface: &str, cidr: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn high_candidates_start_at_250_and_skip_robot_addresses() {
+        let peer = Ipv4Addr::new(192, 168, 9, 17);
+        let avoid = [Ipv4Addr::new(192, 168, 9, 251)];
+        let list = high_candidates(peer, 24, &avoid);
+        assert_eq!(list[0], Ipv4Addr::new(192, 168, 9, 250));
+        assert_eq!(list[1], Ipv4Addr::new(192, 168, 9, 252));
+        assert!(!list.contains(&Ipv4Addr::new(192, 168, 9, 251)));
+        let wide = high_candidates(Ipv4Addr::new(10, 1, 2, 3), 16, &[]);
+        assert_eq!(wide[0], Ipv4Addr::new(10, 1, 255, 250));
+        let narrow = high_candidates(Ipv4Addr::new(192, 168, 9, 1), 29, &[]);
+        assert!(narrow
+            .iter()
+            .all(|ip| ip.octets()[3] > 0 && ip.octets()[3] < 7));
+    }
 
     #[test]
     fn host_route_candidates_avoid_gateway_neighbours_and_the_board() {

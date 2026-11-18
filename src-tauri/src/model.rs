@@ -20,6 +20,10 @@ pub struct Target {
     /// the interactive terminal's login.
     #[serde(default)]
     pub key_login: bool,
+    /// Host name the device answered with (mDNS / `hostname`). Robots built from one image share
+    /// their SSH host key, so the host name is what tells them apart.
+    #[serde(default)]
+    pub hostname: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -33,12 +33,10 @@ pub fn lookup_target(state: &AppState, id: &str) -> Result<Target, String> {
         .ok_or_else(|| "找不到所选机器人".into())
 }
 
+/// ssh takes IPv6 (including `fe80::…%nic`) unbracketed in `user@host`; brackets would become part
+/// of the host name it resolves.
 fn ssh_host(target: &Target) -> String {
-    if target.host.contains(':') && !target.host.starts_with('[') {
-        format!("[{}]", target.host)
-    } else {
-        target.host.clone()
-    }
+    target.host.trim_matches(['[', ']']).to_string()
 }
 
 pub(crate) fn ssh_destination(target: &Target) -> String {
@@ -342,7 +340,7 @@ fn control_socket(state: &AppState, target: &Target) -> std::path::PathBuf {
         .join(format!("cm-{}", safe_socket_key(target)))
 }
 
-fn master_alive(state: &AppState, target: &Target) -> bool {
+pub(crate) fn master_alive(state: &AppState, target: &Target) -> bool {
     Command::new("ssh")
         .arg("-F")
         .arg("/dev/null")
@@ -405,7 +403,7 @@ pub fn channel_status(state: &AppState, target: &Target) -> crate::model::Channe
 
 /// Opens the shared background connection with RoboLink's key. Never prompts. The master is
 /// started detached (`-f -N`) with no pipes, so nothing waits on its stdio afterwards.
-fn key_login(state: &AppState, target: &Target) -> bool {
+pub(crate) fn key_login(state: &AppState, target: &Target) -> bool {
     let mut cmd = Command::new("ssh");
     // OpenSSH keeps the first value it sees for an option, so overrides go before ssh_args.
     cmd.args([
@@ -442,6 +440,134 @@ fn key_login(state: &AppState, target: &Target) -> bool {
             }
         }
     }
+}
+
+/// Logs in once with the user's password and keeps the connection as the shared master, so the
+/// key can be installed and background commands run without a terminal. The password reaches ssh
+/// through RoboLink acting as its SSH_ASKPASS helper, over a one-shot socket in the private config
+/// directory: it is never written to disk, put on a command line or left in an environment.
+pub fn password_login(state: &AppState, target: &Target, password: &str) -> Result<(), String> {
+    if password.is_empty() || password.len() > 512 || password.contains(['\n', '\r', '\0']) {
+        return Err("密码不能为空、不能包含换行，且长度不超过 512".into());
+    }
+    if master_alive(state, target) {
+        return Ok(());
+    }
+    let token = Uuid::new_v4().simple().to_string();
+    let socket_path = state.config_dir.join(format!("askpass-{token}.sock"));
+    let log_path = state.config_dir.join(format!("ssh-login-{token}.log"));
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+        .map_err(|e| format!("无法准备密码传递：{e}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("无法准备密码传递：{e}"))?;
+    let secret = password.to_string();
+    let server_path = socket_path.clone();
+    let server = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+        // Answer exactly one prompt: a second one means the password was wrong.
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.write_all(secret.as_bytes());
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(std::time::Duration::from_millis(40));
+                }
+                Err(_) => break,
+            }
+        }
+        drop(listener);
+        let _ = std::fs::remove_file(&server_path);
+    });
+    let exe = askpass_program()?;
+    let mut cmd = Command::new("ssh");
+    cmd.env("SSH_ASKPASS", &exe)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("ROBOLINK_ASKPASS", &socket_path)
+        .env_remove("SSH_AUTH_SOCK");
+    cmd.args([
+        "-o",
+        "ControlMaster=yes",
+        "-o",
+        "PubkeyAuthentication=no",
+        "-o",
+        "PreferredAuthentications=password,keyboard-interactive",
+        "-o",
+        "NumberOfPasswordPrompts=1",
+        "-E",
+    ]);
+    cmd.arg(&log_path);
+    cmd.args(["-f", "-N"]);
+    cmd.args(ssh_args(state, target, false, false));
+    cmd.arg(ssh_destination(target));
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let result = (|| {
+        let mut child = cmd.spawn().map_err(|e| format!("无法运行 OpenSSH：{e}"))?;
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                break status;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(25) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("登录超时：机器人在 25 秒内没有完成 SSH 登录。".to_string());
+            }
+            thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let log = std::fs::read(&log_path).unwrap_or_default();
+        if status.success() && master_alive(state, target) {
+            return Ok(());
+        }
+        let detail = safe_stderr(&log);
+        if detail.contains("Permission denied") {
+            return Err(format!(
+                "{PASSWORD_MARK}密码不正确，或机器人不允许用户 {} 用密码登录。",
+                target.username
+            ));
+        }
+        Err(if detail.is_empty() {
+            "SSH 登录失败".to_string()
+        } else {
+            format!("SSH 登录失败：{detail}")
+        })
+    })();
+    let _ = std::fs::remove_file(&log_path);
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = server.join();
+    result
+}
+
+fn askpass_program() -> Result<std::path::PathBuf, String> {
+    #[cfg(test)]
+    if let Ok(program) = std::env::var("ROBOLINK_TEST_ASKPASS_PROGRAM") {
+        return Ok(program.into());
+    }
+    std::env::current_exe().map_err(|e| format!("无法定位 RoboLink 程序：{e}"))
+}
+
+/// Prefix of errors that mean "ask the user for the SSH password".
+pub const PASSWORD_MARK: &str = "[需要密码] ";
+
+/// Answers ssh's password prompt when RoboLink runs as its own SSH_ASKPASS helper.
+pub fn askpass_main(socket_path: &str) -> ! {
+    let prompt = std::env::args().nth(1).unwrap_or_default().to_lowercase();
+    if !prompt.contains("password") {
+        std::process::exit(1);
+    }
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket_path) else {
+        std::process::exit(1);
+    };
+    let mut secret = String::new();
+    if stream.read_to_string(&mut secret).is_err() || secret.is_empty() {
+        std::process::exit(1);
+    }
+    println!("{secret}");
+    std::process::exit(0);
 }
 
 /// Creates RoboLink's key pair on first use and returns the public key line.
@@ -1100,6 +1226,7 @@ mod tests {
             macs: vec![],
             interface: None,
             key_login: false,
+            hostname: None,
         }
     }
 
@@ -1216,6 +1343,42 @@ mod tests {
         };
         assert!(!host_key_status(&state, &other).unwrap().trusted);
         assert!(remote_command(&state, &other, "true").is_err());
+    }
+
+    /// Password login through RoboLink's askpass, then key install, over an IPv6 destination.
+    /// `ROBOLINK_TEST_SSH=user@[::1]:2222 ROBOLINK_TEST_PASSWORD=… ROBOLINK_TEST_ASKPASS_PROGRAM=
+    /// target/debug/robot-link-console cargo test live_password -- --ignored`
+    #[test]
+    #[ignore]
+    fn live_password_login_then_key() {
+        let spec = std::env::var("ROBOLINK_TEST_SSH").expect("ROBOLINK_TEST_SSH");
+        let password = std::env::var("ROBOLINK_TEST_PASSWORD").expect("password");
+        let (user, rest) = spec.split_once('@').unwrap();
+        let (host, port) = rest.rsplit_once(':').unwrap();
+        let state = AppState::new().unwrap();
+        let mut t = target("pw1", host.trim_matches(['[', ']']));
+        t.username = user.into();
+        t.port = port.parse().unwrap();
+        let status = host_key_status(&state, &t).unwrap();
+        trust_host_key(&state, &t, &status.fingerprints[0]).unwrap();
+        let wrong = password_login(&state, &t, "definitely-wrong").unwrap_err();
+        assert!(wrong.starts_with(PASSWORD_MARK), "{wrong}");
+        password_login(&state, &t, &password).unwrap();
+        assert!(master_alive(&state, &t));
+        assert_eq!(remote_command(&state, &t, "echo pw").unwrap().trim(), "pw");
+        install_app_key(&state, &t).unwrap();
+        drop_channel(&state, &t);
+        assert!(key_login(&state, &t));
+        drop_channel(&state, &t);
+        let leftovers = std::fs::read_dir(&state.config_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with("askpass-") || name.starts_with("ssh-login-")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[test]

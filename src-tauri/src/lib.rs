@@ -1,11 +1,16 @@
 mod commands;
 mod desktop;
+mod link;
 mod model;
 mod ssh;
 mod state;
 
 use state::AppState;
 use tauri::Manager;
+
+pub fn askpass_main(socket: &str) -> ! {
+    ssh::askpass_main(socket)
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -29,6 +34,11 @@ pub fn run() {
             commands::forget_host_key,
             commands::ssh_connection_ready,
             commands::get_channel_status,
+            link::find_link_peers,
+            link::link_prepare,
+            link::link_login,
+            link::link_robot_ipv4,
+            link::link_finish,
             commands::drop_channel,
             commands::set_key_login,
             commands::sync_targets_with_discovery,
