@@ -201,7 +201,7 @@ fn neighbors(interface: &str) -> BTreeMap<Ipv6Addr, Option<String>> {
 fn link_peers(interface: &str) -> Vec<(Ipv6Addr, Option<String>)> {
     let target = format!("ff02::1%{interface}");
     let mut ping = Command::new("ping");
-    ping.args(["-6", "-n", "-c", "3", "-i", "0.3", "-W", "1", &target])
+    ping.args(["-6", "-n", "-c", "2", "-W", "1", &target])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .stdout(Stdio::piped());
