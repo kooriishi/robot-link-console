@@ -605,6 +605,7 @@ export default function RealApp() {
       const info = await invoke<RobotIpv4>('link_robot_ipv4', { targetId: target.id, linkLocal: peer.linkLocal })
       const cidr = info.cidrs[0]
       let ipv4: string | null = null
+      let ipv4Note = ''
       if (cidr) {
         const [address, bits] = cidr.split('/')
         log(`${info.hostname || target.name} 的 ${info.device ?? '网口'} 是 ${cidr}`)
@@ -614,16 +615,18 @@ export default function RealApp() {
           setOwnedNetworkAddresses(result.owned)
           log(result.existing ? `${peer.interface} 已有同网段地址 ${result.cidr}` : `已为 ${peer.interface} 添加 ${result.cidr}`, 'ok')
           ipv4 = address
-        } catch (e) { log(`没有给本机加上 IPv4 地址：${displayError(e)}；改用 IPv6 链路本地地址连接`, 'warn') }
-      } else log(`${target.name} 这个网口没有 IPv4，改用 IPv6 链路本地地址连接`, 'warn')
+        } catch (e) { ipv4Note = `本机没加上 ${address} 同网段地址（${displayError(e)}）`; log(`没有给本机加上 IPv4 地址：${displayError(e)}；改用 IPv6 链路本地地址连接`, 'warn') }
+      } else { ipv4Note = `机器人 ${info.device ?? '这个网口'} 上没有 IPv4`; log(`${target.name} 的 ${info.device ?? '这个网口'} 没有 IPv4，改用 IPv6 链路本地地址连接`, 'warn') }
       update({ step: '验证连接…' })
-      const finished = await invoke<{ target: Target; viaIpv4: boolean }>('link_finish', { targetId: target.id, ipv4 })
+      const finished = await invoke<{ target: Target; viaIpv4: boolean; reason?: string | null }>('link_finish', { targetId: target.id, ipv4 })
       await reloadTargets()
       setLinkDialog(null)
       await selectTarget(finished.target.id)
       void invoke<HostInfo>('get_host_info').then(setHostInfo).catch(() => {})
       const where = finished.viaIpv4 ? finished.target.host : 'IPv6 链路本地地址'
-      log(`已连接 ${finished.target.name}（${where}）`, 'ok'); notify(`已连接 ${finished.target.name}`)
+      if (finished.reason) log(`没有切到 IPv4 ${ipv4}：${finished.reason}`, 'warn')
+      log(`已连接 ${finished.target.name}（${where}）`, 'ok')
+      notify(ipv4Note ? `已连接 ${finished.target.name}，仍用 IPv6：${ipv4Note}` : finished.reason ? `已连接 ${finished.target.name}，仍用 IPv6：${finished.reason}` : `已连接 ${finished.target.name}`)
     } catch (e) { update({ running: false, step: '', error: displayError(e) }) }
   }
   // One-click direct link: find the board, give this PC a matching address, then connect.
@@ -912,7 +915,7 @@ export default function RealApp() {
         <div className="page-view" hidden={page !== 'desktop'}>{visitedPages.has('desktop') && <DesktopPage target={selected} sshReady={sshReady} active={page === 'desktop'} runPrivileged={runPrivileged} sudoPassword={() => sudoPasswordRef.current} onLog={log} onGoTerminal={() => navPage('terminal')}/>}</div>
         <div className="page-view" hidden={page !== 'terminal'}>{visitedPages.has('terminal') && <TerminalPage key={sessionId} sessionId={sessionId} exited={terminalExited} sshReady={sshReady} target={selected} theme={theme} onConnect={() => { void connectTarget() }} onDisconnect={disconnectTerminal} onRisk={setDangerLine} onPaste={setPastePreview} onError={setError}/>}</div>
         <div className="page-view" hidden={page !== 'logs'}>{visitedPages.has('logs') && <LogsPage logs={logs} onDiagnose={() => { void collectDiagnostics() }} canDiagnose={!!selected && sshReady && !busy} onClear={() => setConfirm({ title: '清空本地诊断记录？', description: '只删除 RoboLink 本机界面中的操作记录，不会影响机器人。', run: async () => { setLogs([]); setConfirm(null) } })}/>}</div>
-        <footer className="footer-note"><ShieldCheck size={14}/>本机地址仅按需临时添加 · SSH 使用独立 known_hosts · RoboLink v0.8.1 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
+        <footer className="footer-note"><ShieldCheck size={14}/>本机地址仅按需临时添加 · SSH 使用独立 known_hosts · RoboLink v0.8.2 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
       </div>
     </main>
     {targetDialog && <TargetDialog value={targetDraft} setValue={setTargetDraft} onClose={() => setTargetDialog(false)} onSubmit={saveTarget} busy={busy}/>}

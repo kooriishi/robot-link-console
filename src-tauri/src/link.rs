@@ -79,6 +79,8 @@ pub struct RobotIpv4 {
 pub struct LinkFinished {
     pub target: Target,
     pub via_ipv4: bool,
+    /// Why the link-local address was kept, when an IPv4 address was offered.
+    pub reason: Option<String>,
 }
 
 pub fn is_robot_name(name: &str) -> bool {
@@ -727,22 +729,33 @@ pub fn link_finish(
         return Ok(LinkFinished {
             target,
             via_ipv4: false,
+            reason: None,
         });
     };
     let interface = target.interface.clone().unwrap_or_default();
-    if !target.key_login || route_interface(&address.to_string()).as_deref() != Some(&interface) {
-        return Ok(LinkFinished {
-            target,
+    let stay = |reason: String| {
+        Ok(LinkFinished {
+            target: target.clone(),
             via_ipv4: false,
-        });
+            reason: Some(reason),
+        })
+    };
+    if !target.key_login {
+        return stay("免密密钥没有装上，IPv4 上无法自动登录".into());
+    }
+    match route_interface(&address.to_string()) {
+        Some(dev) if dev == interface => {}
+        Some(dev) => {
+            return stay(format!(
+                "本机去 {address} 的路由走的是 {dev}，不是网线所在的 {interface}"
+            ))
+        }
+        None => return stay(format!("本机没有去 {address} 的路由")),
     }
     let mut candidate = target.clone();
     candidate.host = address.to_string();
     if !ssh::key_login(&state, &candidate) {
-        return Ok(LinkFinished {
-            target,
-            via_ipv4: false,
-        });
+        return stay(format!("经 {address} 用密钥登录失败"));
     }
     save_target(&state, &candidate)?;
     // The link-local master is no longer needed.
@@ -750,6 +763,7 @@ pub fn link_finish(
     Ok(LinkFinished {
         target: candidate,
         via_ipv4: true,
+        reason: None,
     })
 }
 
