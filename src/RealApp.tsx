@@ -1022,7 +1022,7 @@ export default function RealApp() {
         <div className="page-view" hidden={page !== 'desktop'}>{visitedPages.has('desktop') && <DesktopPage target={selected} sshReady={sshReady} active={page === 'desktop'} runPrivileged={runPrivileged} sudoPassword={() => sudoPasswordRef.current} onLog={log} onGoTerminal={() => navPage('terminal')}/>}</div>
         <div className="page-view" hidden={page !== 'terminal'}>{visitedPages.has('terminal') && <TerminalPage key={sessionId} sessionId={sessionId} exited={terminalExited} sshReady={sshReady} target={selected} theme={theme} onConnect={() => { void connectTarget() }} onDisconnect={disconnectTerminal} onRisk={setDangerLine} onPaste={setPastePreview} onError={setError}/>}</div>
         <div className="page-view" hidden={page !== 'logs'}>{visitedPages.has('logs') && <LogsPage logs={logs} onDiagnose={() => { void collectDiagnostics() }} canDiagnose={!!selected && sshReady && !busy} onClear={() => setConfirm({ title: '清空本地诊断记录？', description: '只删除 RoboLink 本机界面中的操作记录，不会影响机器人。', run: async () => { setLogs([]); setConfirm(null) } })}/>}</div>
-        <footer className="footer-note"><ShieldCheck size={14}/>本机地址仅按需临时添加 · SSH 使用独立 known_hosts · RoboLink v0.8.3 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
+        <footer className="footer-note"><ShieldCheck size={14}/>本机地址仅按需临时添加 · SSH 使用独立 known_hosts · RoboLink v0.8.4 <span>·</span><span>{hostInfo?.os ?? 'Linux'}</span></footer>
       </div>
     </main>
     {targetDialog && <TargetDialog value={targetDraft} setValue={setTargetDraft} onClose={() => setTargetDialog(false)} onSubmit={saveTarget} busy={busy}/>}
