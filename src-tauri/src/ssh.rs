@@ -2,7 +2,6 @@ use crate::model::{HostKeyStatus, Target};
 use crate::state::{AppState, HostPin};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
-use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -34,12 +33,10 @@ pub fn lookup_target(state: &AppState, id: &str) -> Result<Target, String> {
         .ok_or_else(|| "找不到所选机器人".into())
 }
 
+/// ssh takes IPv6 (including `fe80::…%nic`) unbracketed in `user@host`; brackets would become part
+/// of the host name it resolves.
 fn ssh_host(target: &Target) -> String {
-    if target.host.contains(':') && !target.host.starts_with('[') {
-        format!("[{}]", target.host)
-    } else {
-        target.host.clone()
-    }
+    target.host.trim_matches(['[', ']']).to_string()
 }
 
 pub(crate) fn ssh_destination(target: &Target) -> String {
@@ -147,32 +144,142 @@ fn scan_keys(target: &Target) -> Result<Vec<ScannedKey>, String> {
     Ok(keys)
 }
 
+/// The pin belongs to the device (target id), not to `host:port`: a board that comes back with
+/// another IP keeps its pinned key, and another board that takes over the old IP is rejected.
+fn device_key(target: &Target) -> String {
+    format!("id:{}", target.id)
+}
+
+/// Name under which the device's key is stored in RoboLink's known_hosts (`HostKeyAlias`).
+pub(crate) fn host_alias(target: &Target) -> String {
+    format!("robolink-{}", target.id)
+}
+
+/// `<type> <base64>` of a known_hosts / ssh-keyscan line, i.e. the key without its host name.
+fn key_blob(line: &str) -> Option<String> {
+    let mut fields = line.split_whitespace();
+    let _host = fields.next()?;
+    Some(format!("{} {}", fields.next()?, fields.next()?))
+}
+
+fn aliased_line(line: &str, alias: &str) -> Option<String> {
+    key_blob(line).map(|blob| format!("{alias} {blob}"))
+}
+
+fn find_pin<'a>(pins: &'a [HostPin], target: &Target) -> Option<&'a HostPin> {
+    let key = device_key(target);
+    pins.iter().find(|p| p.target_key == key)
+}
+
+fn pin_is_usable(pin: &HostPin) -> bool {
+    pin.fingerprints.len() == 1
+        && pin.known_hosts_lines.len() == 1
+        && host_key_algorithms(&pin.key_algorithm).is_some()
+}
+
+/// Pins written before 0.7.0 were keyed by `host:port` and stored the raw ssh-keyscan line. Re-key
+/// them to every target that currently points at that address; pins with no target are dropped.
+pub fn migrate_pins(state: &AppState) -> Result<(), String> {
+    let pins = state.load_pins()?;
+    if pins.iter().all(|p| p.target_key.starts_with("id:")) {
+        return Ok(());
+    }
+    let targets = state.load_targets()?;
+    let migrated = migrate_pin_list(pins, &targets);
+    state.save_pins(&migrated)
+}
+
+fn migrate_pin_list(pins: Vec<HostPin>, targets: &[Target]) -> Vec<HostPin> {
+    let mut result: Vec<HostPin> = Vec::new();
+    for pin in pins {
+        if pin.target_key.starts_with("id:") {
+            if !result.iter().any(|p| p.target_key == pin.target_key) {
+                result.push(pin);
+            }
+            continue;
+        }
+        for target in targets
+            .iter()
+            .filter(|t| target_identity(t) == pin.target_key)
+        {
+            let key = device_key(target);
+            if result.iter().any(|p| p.target_key == key) {
+                continue;
+            }
+            let alias = host_alias(target);
+            result.push(HostPin {
+                target_key: key,
+                fingerprints: pin.fingerprints.clone(),
+                key_algorithm: pin.key_algorithm.clone(),
+                known_hosts_lines: pin
+                    .known_hosts_lines
+                    .iter()
+                    .filter_map(|line| aliased_line(line, &alias))
+                    .collect(),
+            });
+        }
+    }
+    result
+}
+
+/// MAC that currently answers for the target's IPv4 address, when the address is on-link.
+pub fn observed_mac(target: &Target) -> Option<(String, String)> {
+    let ip = target.host.parse::<std::net::Ipv4Addr>().ok()?;
+    let output = Command::new("ip")
+        .args(["-4", "neigh", "show", &ip.to_string()])
+        .output()
+        .ok()?;
+    parse_neighbor_line(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `192.168.1.10 dev enp3s0 lladdr aa:bb:cc:dd:ee:ff REACHABLE` → (mac, interface).
+fn parse_neighbor_line(text: &str) -> Option<(String, String)> {
+    for line in text.lines() {
+        let words = line.split_whitespace().collect::<Vec<_>>();
+        if matches!(words.last(), Some(&"FAILED") | Some(&"INCOMPLETE")) {
+            continue;
+        }
+        let value = |key: &str| words.windows(2).find(|w| w[0] == key).map(|w| w[1]);
+        if let (Some(dev), Some(mac)) = (value("dev"), value("lladdr")) {
+            if let Some(mac) = crate::model::normalize_mac(mac) {
+                return Some((mac, dev.to_string()));
+            }
+        }
+    }
+    None
+}
+
 pub fn host_key_status(state: &AppState, target: &Target) -> Result<HostKeyStatus, String> {
     let scanned = scan_keys(target)?;
     let fingerprints = scanned
         .iter()
         .map(|key| key.fingerprint.clone())
         .collect::<Vec<_>>();
-    let key = target_identity(target);
     let pins = state.load_pins()?;
-    let pin = pins.iter().find(|p| p.target_key == key);
+    let pin = find_pin(&pins, target);
     let pinned = pin.map(|p| p.fingerprints.clone()).unwrap_or_default();
-    let legacy = pin
-        .map(|p| {
-            p.key_algorithm.is_empty()
-                || p.fingerprints.len() != 1
-                || p.known_hosts_lines.len() != 1
-        })
-        .unwrap_or(false);
-    let current: HashSet<&str> = fingerprints.iter().map(String::as_str).collect();
-    let trusted =
-        !legacy && !pinned.is_empty() && pinned.iter().all(|fp| current.contains(fp.as_str()));
+    let pinned_blob = pin
+        .filter(|p| pin_is_usable(p))
+        .and_then(|p| key_blob(&p.known_hosts_lines[0]));
+    let trusted = pinned_blob.is_some_and(|blob| {
+        scanned
+            .iter()
+            .any(|key| key_blob(&key.known_hosts_line).as_deref() == Some(blob.as_str()))
+    });
     let changed = !pinned.is_empty() && !trusted;
+    let observed = observed_mac(target).map(|(mac, _)| mac);
+    let other_device = changed
+        && !target.macs.is_empty()
+        && observed
+            .as_ref()
+            .is_some_and(|mac| !target.macs.contains(mac));
     Ok(HostKeyStatus {
         fingerprints,
         pinned_fingerprints: pinned,
         trusted,
         changed,
+        observed_mac: observed,
+        other_device,
     })
 }
 
@@ -182,75 +289,354 @@ pub fn trust_host_key(state: &AppState, target: &Target, fingerprint: &str) -> R
         .iter()
         .find(|key| key.fingerprint == fingerprint)
         .ok_or("主机密钥在确认过程中发生变化。未保存，请重新读取指纹并核对。")?;
-    let target_key = target_identity(target);
+    let line = aliased_line(&selected.known_hosts_line, &host_alias(target))
+        .ok_or("SSH 主机密钥格式无效")?;
     let mut pins = state.load_pins()?;
-    if let Some(old) = pins.iter().find(|p| p.target_key == target_key) {
-        if old.fingerprints.len() != 1
+    if let Some(old) = find_pin(&pins, target) {
+        if !pin_is_usable(old)
             || old.fingerprints[0] != fingerprint
             || old.key_algorithm != selected.algorithm
-            || old.known_hosts_lines.len() != 1
-            || old.known_hosts_lines[0] != selected.known_hosts_line
+            || old.known_hosts_lines[0] != line
         {
             return Err("机器人主机指纹与已固定值不一致。为防止中间人攻击，未覆盖旧值；请先核验后显式清除旧指纹。".into());
         }
         return Ok(());
     }
     pins.push(HostPin {
-        target_key,
+        target_key: device_key(target),
         fingerprints: vec![fingerprint.to_string()],
         key_algorithm: selected.algorithm.clone(),
-        known_hosts_lines: vec![selected.known_hosts_line.clone()],
+        known_hosts_lines: vec![line],
     });
     state.save_pins(&pins)
 }
 
 pub fn forget_host_key(state: &AppState, target: &Target) -> Result<(), String> {
-    let key = target_identity(target);
+    let key = device_key(target);
     let mut pins = state.load_pins()?;
     pins.retain(|p| p.target_key != key);
     state.save_pins(&pins)
 }
 
+pub fn is_pinned(state: &AppState, target: &Target) -> bool {
+    state
+        .load_pins()
+        .map(|pins| find_pin(&pins, target).is_some_and(pin_is_usable))
+        .unwrap_or(false)
+}
+
 pub fn ensure_pinned(state: &AppState, target: &Target) -> Result<(), String> {
-    let key = target_identity(target);
     let pins = state.load_pins()?;
-    let pin = pins
-        .iter()
-        .find(|p| p.target_key == key)
-        .ok_or("请先核对并固定机器人的 SSH 主机指纹，再连接。")?;
-    if pin.fingerprints.len() != 1
-        || pin.known_hosts_lines.len() != 1
-        || host_key_algorithms(&pin.key_algorithm).is_none()
-    {
+    let pin = find_pin(&pins, target).ok_or("请先核对并固定机器人的 SSH 主机指纹，再连接。")?;
+    if !pin_is_usable(pin) {
         return Err("此机器人保存的是旧版或不受支持的多密钥 pin。请先核验可信的主机指纹，再显式清除旧 pin 并重新固定一把密钥。".into());
     }
     Ok(())
 }
 
-pub fn connection_ready(state: &AppState, target: &Target) -> Result<bool, String> {
-    ensure_pinned(state, target)?;
-    let socket = state
+fn control_socket(state: &AppState, target: &Target) -> std::path::PathBuf {
+    state
         .config_dir
-        .join(format!("cm-{}", safe_socket_key(target)));
-    let output = Command::new("ssh")
+        .join(format!("cm-{}", safe_socket_key(target)))
+}
+
+pub(crate) fn master_alive(state: &AppState, target: &Target) -> bool {
+    Command::new("ssh")
         .arg("-F")
         .arg("/dev/null")
         .arg("-p")
         .arg(target.port.to_string())
         .arg("-S")
-        .arg(socket)
+        .arg(control_socket(state, target))
         .arg("-O")
         .arg("check")
         .arg(ssh_destination(target))
         .output()
-        .map_err(|e| format!("无法检查 OpenSSH 会话：{e}"))?;
-    Ok(output.status.success())
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Close the shared connection (cable pulled, board rebooting) so later commands fail fast and a
+/// fresh connection is made once the board is back.
+pub fn drop_channel(state: &AppState, target: &Target) {
+    let _ = Command::new("ssh")
+        .arg("-F")
+        .arg("/dev/null")
+        .arg("-p")
+        .arg(target.port.to_string())
+        .arg("-S")
+        .arg(control_socket(state, target))
+        .arg("-O")
+        .arg("exit")
+        .arg(ssh_destination(target))
+        .output();
+}
+
+pub fn connection_ready(state: &AppState, target: &Target) -> Result<bool, String> {
+    Ok(channel_status(state, target).ready)
+}
+
+/// Whether background commands can run. A live terminal login is reused when there is one;
+/// otherwise RoboLink's own key opens (and keeps) a connection without the terminal.
+pub fn channel_status(state: &AppState, target: &Target) -> crate::model::ChannelStatus {
+    let pinned = is_pinned(state, target);
+    let mut status = crate::model::ChannelStatus {
+        pinned,
+        ready: false,
+        via: "none".into(),
+        key_login: target.key_login,
+    };
+    if !pinned {
+        return status;
+    }
+    if master_alive(state, target) {
+        status.ready = true;
+        status.via = "session".into();
+        return status;
+    }
+    if target.key_login && state.identity_file.is_file() && key_login(state, target) {
+        status.ready = true;
+        status.via = "key".into();
+    }
+    status
+}
+
+/// Opens the shared background connection with RoboLink's key. Never prompts. The master is
+/// started detached (`-f -N`) with no pipes, so nothing waits on its stdio afterwards.
+pub(crate) fn key_login(state: &AppState, target: &Target) -> bool {
+    let mut cmd = Command::new("ssh");
+    // OpenSSH keeps the first value it sees for an option, so overrides go before ssh_args.
+    cmd.args([
+        "-o",
+        "ControlMaster=yes",
+        "-o",
+        "ConnectTimeout=4",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "PreferredAuthentications=publickey",
+        "-f",
+        "-N",
+    ]);
+    cmd.args(ssh_args(state, target, false, true));
+    cmd.arg(ssh_destination(target));
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success() && master_alive(state, target),
+            Ok(None) if started.elapsed() < std::time::Duration::from_secs(8) => {
+                thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Logs in once with the user's password and keeps the connection as the shared master, so the
+/// key can be installed and background commands run without a terminal. The password reaches ssh
+/// through RoboLink acting as its SSH_ASKPASS helper, over a one-shot socket in the private config
+/// directory: it is never written to disk, put on a command line or left in an environment.
+pub fn password_login(state: &AppState, target: &Target, password: &str) -> Result<(), String> {
+    if password.is_empty() || password.len() > 512 || password.contains(['\n', '\r', '\0']) {
+        return Err("密码不能为空、不能包含换行，且长度不超过 512".into());
+    }
+    if master_alive(state, target) {
+        return Ok(());
+    }
+    let token = Uuid::new_v4().simple().to_string();
+    let socket_path = state.config_dir.join(format!("askpass-{token}.sock"));
+    let log_path = state.config_dir.join(format!("ssh-login-{token}.log"));
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+        .map_err(|e| format!("无法准备密码传递：{e}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("无法准备密码传递：{e}"))?;
+    let secret = password.to_string();
+    let server_path = socket_path.clone();
+    let server = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+        // Answer exactly one prompt: a second one means the password was wrong.
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.write_all(secret.as_bytes());
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(std::time::Duration::from_millis(40));
+                }
+                Err(_) => break,
+            }
+        }
+        drop(listener);
+        let _ = std::fs::remove_file(&server_path);
+    });
+    let exe = askpass_program()?;
+    let mut cmd = Command::new("ssh");
+    cmd.env("SSH_ASKPASS", &exe)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("ROBOLINK_ASKPASS", &socket_path)
+        .env_remove("SSH_AUTH_SOCK");
+    cmd.args([
+        "-o",
+        "ControlMaster=yes",
+        "-o",
+        "PubkeyAuthentication=no",
+        "-o",
+        "PreferredAuthentications=password,keyboard-interactive",
+        "-o",
+        "NumberOfPasswordPrompts=1",
+        "-E",
+    ]);
+    cmd.arg(&log_path);
+    cmd.args(["-f", "-N"]);
+    cmd.args(ssh_args(state, target, false, false));
+    cmd.arg(ssh_destination(target));
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let result = (|| {
+        let mut child = cmd.spawn().map_err(|e| format!("无法运行 OpenSSH：{e}"))?;
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                break status;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(25) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("登录超时：机器人在 25 秒内没有完成 SSH 登录。".to_string());
+            }
+            thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let log = std::fs::read(&log_path).unwrap_or_default();
+        if status.success() && master_alive(state, target) {
+            return Ok(());
+        }
+        let detail = safe_stderr(&log);
+        if detail.contains("Permission denied") {
+            return Err(format!(
+                "{PASSWORD_MARK}密码不正确，或机器人不允许用户 {} 用密码登录。",
+                target.username
+            ));
+        }
+        Err(if detail.is_empty() {
+            "SSH 登录失败".to_string()
+        } else {
+            format!("SSH 登录失败：{detail}")
+        })
+    })();
+    let _ = std::fs::remove_file(&log_path);
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = server.join();
+    result
+}
+
+fn askpass_program() -> Result<std::path::PathBuf, String> {
+    #[cfg(test)]
+    if let Ok(program) = std::env::var("ROBOLINK_TEST_ASKPASS_PROGRAM") {
+        return Ok(program.into());
+    }
+    std::env::current_exe().map_err(|e| format!("无法定位 RoboLink 程序：{e}"))
+}
+
+/// Prefix of errors that mean "ask the user for the SSH password".
+pub const PASSWORD_MARK: &str = "[需要密码] ";
+
+/// Answers ssh's password prompt when RoboLink runs as its own SSH_ASKPASS helper.
+pub fn askpass_main(socket_path: &str) -> ! {
+    let prompt = std::env::args().nth(1).unwrap_or_default().to_lowercase();
+    if !prompt.contains("password") {
+        std::process::exit(1);
+    }
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket_path) else {
+        std::process::exit(1);
+    };
+    let mut secret = String::new();
+    if stream.read_to_string(&mut secret).is_err() || secret.is_empty() {
+        std::process::exit(1);
+    }
+    println!("{secret}");
+    std::process::exit(0);
+}
+
+/// Creates RoboLink's key pair on first use and returns the public key line.
+pub fn app_public_key(state: &AppState) -> Result<String, String> {
+    let public = state.identity_file.with_extension("pub");
+    if !state.identity_file.is_file() || !public.is_file() {
+        let _ = std::fs::remove_file(&state.identity_file);
+        let _ = std::fs::remove_file(&public);
+        let output = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "robolink", "-f"])
+            .arg(&state.identity_file)
+            .output()
+            .map_err(|e| format!("无法运行 ssh-keygen：{e}；请安装 OpenSSH 客户端"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "生成 RoboLink SSH 密钥失败：{}",
+                safe_stderr(&output.stderr)
+            ));
+        }
+    }
+    let line = std::fs::read_to_string(&public)
+        .map_err(|e| format!("读取 RoboLink 公钥失败：{e}"))?
+        .trim()
+        .to_string();
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let valid = fields.len() >= 2
+        && fields[0] == "ssh-ed25519"
+        && fields[1]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='));
+    if !valid {
+        return Err("RoboLink 公钥文件格式无效，请删除配置目录下的 id_ed25519* 后重试。".into());
+    }
+    Ok(format!("{} {} robolink", fields[0], fields[1]))
+}
+
+/// Appends RoboLink's public key to the login user's authorized_keys over the already
+/// authenticated connection, then checks that key login really works.
+pub fn install_app_key(state: &AppState, target: &Target) -> Result<(), String> {
+    let key = app_public_key(state)?;
+    let script = format!(
+        "umask 077; mkdir -p \"$HOME/.ssh\" && touch \"$HOME/.ssh/authorized_keys\" && chmod 700 \"$HOME/.ssh\" && chmod 600 \"$HOME/.ssh/authorized_keys\" && (grep -qxF {key} \"$HOME/.ssh/authorized_keys\" || printf '%s\\n' {key} >> \"$HOME/.ssh/authorized_keys\")",
+        key = shell_quote(&key)
+    );
+    remote_command(state, target, &script)?;
+    let mut cmd = Command::new("ssh");
+    cmd.args([
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "PreferredAuthentications=publickey",
+    ]);
+    cmd.args(ssh_args(state, target, false, true));
+    cmd.arg(ssh_destination(target));
+    cmd.arg("true");
+    let output = output_with_timeout(cmd, std::time::Duration::from_secs(12), b"")?;
+    if !output.status.success() {
+        return Err(format!(
+            "公钥已写入开发板，但密钥登录没有通过：{}。常见原因是开发板 sshd 关闭了 PubkeyAuthentication，或用户主目录权限过宽。",
+            safe_stderr(&output.stderr)
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn ssh_args(state: &AppState, target: &Target, tty: bool, batch: bool) -> Vec<String> {
-    let socket = state
-        .config_dir
-        .join(format!("cm-{}", safe_socket_key(target)));
+    let socket = control_socket(state, target);
     let mut args = vec![
         "-F".into(),
         "/dev/null".into(),
@@ -275,15 +661,29 @@ pub(crate) fn ssh_args(state: &AppState, target: &Target, tty: bool, batch: bool
         "-o".into(),
         format!("ControlPath={}", socket.display()),
         "-o".into(),
-        "ControlMaster=auto".into(),
+        // Background commands only reuse a connection; the terminal or key_login() owns it.
+        if batch {
+            "ControlMaster=no"
+        } else {
+            "ControlMaster=auto"
+        }
+        .into(),
         "-o".into(),
-        "ControlPersist=120".into(),
+        "ControlPersist=600".into(),
+        // The key is looked up by device, so a new IP for the same board is not a "changed host".
+        "-o".into(),
+        format!("HostKeyAlias={}", host_alias(target)),
+        "-o".into(),
+        "CheckHostIP=no".into(),
     ];
+    if state.identity_file.is_file() {
+        args.extend([
+            "-o".into(),
+            format!("IdentityFile={}", state.identity_file.display()),
+        ]);
+    }
     if let Ok(pins) = state.load_pins() {
-        if let Some(pin) = pins
-            .iter()
-            .find(|pin| pin.target_key == target_identity(target))
-        {
+        if let Some(pin) = find_pin(&pins, target) {
             if let Some(algorithms) = host_key_algorithms(&pin.key_algorithm) {
                 args.extend(["-o".into(), format!("HostKeyAlgorithms={algorithms}")]);
             }
@@ -363,6 +763,9 @@ pub fn remote_command_with(
         return Err("密码不能包含换行，且长度不超过 512".into());
     }
     let seconds = options.timeout_secs.unwrap_or(18).clamp(5, 600);
+    if target.key_login && state.identity_file.is_file() && !master_alive(state, target) {
+        key_login(state, target);
+    }
     let mut cmd = Command::new("ssh");
     cmd.args(ssh_args(state, target, false, true));
     cmd.arg(ssh_destination(target));
@@ -400,7 +803,10 @@ pub fn remote_command_with(
     if !output.status.success() {
         let stderr = safe_stderr(&output.stderr);
         if output.status.code() == Some(255) && stderr.contains("Permission denied") {
-            return Err("SSH 登录会话已结束（后台命令不会再次询问密码）。请到“终端”页点击连接并完成登录后再试。".into());
+            return Err(
+                "SSH 登录会话已结束（后台命令不会再次询问密码）。请点击“连接机器人”重新登录。"
+                    .into(),
+            );
         }
         let detail = if stderr.is_empty() {
             stdout.trim().to_string()
@@ -808,6 +1214,172 @@ mod tests {
         )
         .is_none());
         assert!(neighbor_hint(ip, "192.168.77.126 via 10.0.0.1 dev wlp2s0", "x FAILED").is_none());
+    }
+
+    fn target(id: &str, host: &str) -> Target {
+        Target {
+            id: id.into(),
+            name: "board".into(),
+            host: host.into(),
+            port: 22,
+            username: "robot".into(),
+            macs: vec![],
+            interface: None,
+            key_login: false,
+            hostname: None,
+            link: None,
+        }
+    }
+
+    #[test]
+    fn legacy_pins_are_rekeyed_to_devices_with_alias_lines() {
+        let targets = vec![target("a1", "192.168.1.10"), target("b2", "10.0.0.9")];
+        let pins = vec![
+            HostPin {
+                target_key: "192.168.1.10:22".into(),
+                fingerprints: vec!["ssh-ed25519 · SHA256:x".into()],
+                key_algorithm: "ssh-ed25519".into(),
+                known_hosts_lines: vec!["192.168.1.10 ssh-ed25519 AAAAC3".into()],
+            },
+            HostPin {
+                target_key: "172.16.0.1:22".into(),
+                fingerprints: vec!["ssh-ed25519 · SHA256:y".into()],
+                key_algorithm: "ssh-ed25519".into(),
+                known_hosts_lines: vec!["172.16.0.1 ssh-ed25519 BBBB".into()],
+            },
+        ];
+        let migrated = migrate_pin_list(pins, &targets);
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(migrated[0].target_key, "id:a1");
+        assert_eq!(
+            migrated[0].known_hosts_lines,
+            vec!["robolink-a1 ssh-ed25519 AAAAC3".to_string()]
+        );
+        // Already migrated pins pass through unchanged.
+        let again = migrate_pin_list(migrated.clone(), &targets);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].known_hosts_lines, migrated[0].known_hosts_lines);
+    }
+
+    #[test]
+    fn key_blob_ignores_the_host_field() {
+        assert_eq!(
+            key_blob("[10.0.0.2]:2222 ssh-ed25519 AAAA comment"),
+            key_blob("robolink-x ssh-ed25519 AAAA")
+        );
+        assert!(key_blob("broken").is_none());
+    }
+
+    #[test]
+    fn neighbor_lines_yield_mac_and_interface() {
+        assert_eq!(
+            parse_neighbor_line("192.168.1.10 dev enp3s0 lladdr AA:BB:CC:00:11:22 REACHABLE"),
+            Some(("aa:bb:cc:00:11:22".into(), "enp3s0".into()))
+        );
+        assert!(parse_neighbor_line("192.168.1.10 dev enp3s0 FAILED").is_none());
+        assert!(parse_neighbor_line("").is_none());
+    }
+
+    /// End-to-end check against a real sshd. Run with a throw-away config dir:
+    /// `XDG_CONFIG_HOME=$(mktemp -d) ROBOLINK_TEST_SSH=root@127.0.0.1:2222
+    ///  ROBOLINK_TEST_BOOTSTRAP_KEY=/path/to/key cargo test live_ -- --ignored`
+    #[test]
+    #[ignore]
+    fn live_device_pin_and_key_channel() {
+        let spec = std::env::var("ROBOLINK_TEST_SSH").expect("ROBOLINK_TEST_SSH");
+        let bootstrap = std::env::var("ROBOLINK_TEST_BOOTSTRAP_KEY").expect("bootstrap key");
+        let (user, rest) = spec.split_once('@').unwrap();
+        let (host, port) = rest.rsplit_once(':').unwrap();
+        let state = AppState::new().unwrap();
+        let mut t = target("live1", host);
+        t.username = user.into();
+        t.port = port.parse().unwrap();
+
+        let status = host_key_status(&state, &t).unwrap();
+        assert!(!status.trusted && !status.changed);
+        assert!(!channel_status(&state, &t).pinned);
+        trust_host_key(&state, &t, &status.fingerprints[0]).unwrap();
+        let known = std::fs::read_to_string(&state.known_hosts_file).unwrap();
+        assert!(known.starts_with("robolink-live1 "), "{known}");
+        assert!(host_key_status(&state, &t).unwrap().trusted);
+
+        // Stand-in for the user's terminal login: a master opened with another key.
+        let mut login = Command::new("ssh");
+        login.args(["-o", "ControlMaster=yes", "-o"]);
+        login.arg(format!("IdentityFile={bootstrap}"));
+        login.args(["-f", "-N"]);
+        login.args(ssh_args(&state, &t, false, true));
+        login.arg(ssh_destination(&t));
+        assert!(login.status().unwrap().success());
+        let via_session = channel_status(&state, &t);
+        assert!(via_session.ready && via_session.via == "session");
+        assert_eq!(remote_command(&state, &t, "echo hi").unwrap().trim(), "hi");
+
+        install_app_key(&state, &t).unwrap();
+        install_app_key(&state, &t).unwrap(); // idempotent
+        drop_channel(&state, &t);
+        assert!(
+            !channel_status(&state, &t).ready,
+            "no key login until enabled"
+        );
+        t.key_login = true;
+        let via_key = channel_status(&state, &t);
+        assert!(via_key.ready && via_key.via == "key");
+        assert_eq!(
+            remote_command(&state, &t, "echo again").unwrap().trim(),
+            "again"
+        );
+
+        // Same board behind another address: the pin follows the device, no re-trust needed.
+        drop_channel(&state, &t);
+        t.host = "localhost".into();
+        assert!(host_key_status(&state, &t).unwrap().trusted);
+        assert!(channel_status(&state, &t).ready);
+        drop_channel(&state, &t);
+
+        // A different device id has no pin, even at the same address.
+        let other = Target {
+            id: "live2".into(),
+            ..t.clone()
+        };
+        assert!(!host_key_status(&state, &other).unwrap().trusted);
+        assert!(remote_command(&state, &other, "true").is_err());
+    }
+
+    /// Password login through RoboLink's askpass, then key install, over an IPv6 destination.
+    /// `ROBOLINK_TEST_SSH=user@[::1]:2222 ROBOLINK_TEST_PASSWORD=… ROBOLINK_TEST_ASKPASS_PROGRAM=
+    /// target/debug/robot-link-console cargo test live_password -- --ignored`
+    #[test]
+    #[ignore]
+    fn live_password_login_then_key() {
+        let spec = std::env::var("ROBOLINK_TEST_SSH").expect("ROBOLINK_TEST_SSH");
+        let password = std::env::var("ROBOLINK_TEST_PASSWORD").expect("password");
+        let (user, rest) = spec.split_once('@').unwrap();
+        let (host, port) = rest.rsplit_once(':').unwrap();
+        let state = AppState::new().unwrap();
+        let mut t = target("pw1", host.trim_matches(['[', ']']));
+        t.username = user.into();
+        t.port = port.parse().unwrap();
+        let status = host_key_status(&state, &t).unwrap();
+        trust_host_key(&state, &t, &status.fingerprints[0]).unwrap();
+        let wrong = password_login(&state, &t, "definitely-wrong").unwrap_err();
+        assert!(wrong.starts_with(PASSWORD_MARK), "{wrong}");
+        password_login(&state, &t, &password).unwrap();
+        assert!(master_alive(&state, &t));
+        assert_eq!(remote_command(&state, &t, "echo pw").unwrap().trim(), "pw");
+        install_app_key(&state, &t).unwrap();
+        drop_channel(&state, &t);
+        assert!(key_login(&state, &t));
+        drop_channel(&state, &t);
+        let leftovers = std::fs::read_dir(&state.config_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with("askpass-") || name.starts_with("ssh-login-")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[test]

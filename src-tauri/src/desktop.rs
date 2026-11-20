@@ -378,12 +378,37 @@ done
 umask 077
 LOG="$DIR/robolink-x11vnc.log"
 : > "$LOG"
-# Try the display manager's authority first, then an X server without access control.
-for AUTH in guess none; do
+DISP='{display}'
+# X cookies to try. `-auth guess` only reads the X server's own `-auth` argument, which misses
+# servers started without it (startx, some lightdm/gdm setups); so also take the -auth of every X
+# server, XAUTHORITY of processes on this display, and the usual per-user/display-manager files.
+find_auths() {{
+  for p in /proc/[0-9]*; do
+    c=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
+    case "$c" in *Xorg*|*Xwayland*|X\ *|*/X\ *) printf '%s\n' "$c" | sed -n 's/.* -auth \([^ ]*\).*/\1/p';; esac
+  done
+  for p in /proc/[0-9]*; do
+    e=$(tr '\0' '\n' < "$p/environ" 2>/dev/null) || continue
+    printf '%s\n' "$e" | grep -qxE "DISPLAY=$DISP(\.0)?" || continue
+    printf '%s\n' "$e" | sed -n 's/^XAUTHORITY=//p'
+  done
+  ls -d /run/user/*/gdm/Xauthority /var/run/lightdm/root/"$DISP" /var/lib/lightdm/.Xauthority /home/*/.Xauthority /root/.Xauthority 2>/dev/null
+}}
+AUTHS=$( {{ echo guess; find_auths 2>/dev/null; echo none; }} | awk 'NF && !s[$0]++' | head -n 16)
+NL='
+'
+OLDIFS=$IFS; IFS=$NL
+for AUTH in $AUTHS; do
+  IFS=$OLDIFS
+  case "$AUTH" in
+    guess) set -- -auth guess;;
+    none) set --;;
+    *) [ -f "$AUTH" ] && [ -r "$AUTH" ] || continue; set -- -auth "$AUTH";;
+  esac
+  echo "== try -auth $AUTH" >> "$LOG"
   PF=$(mktemp "$DIR/robolink-vnc-""pass.XXXXXX") || exit 5
   printf '%s\n' "$P" > "$PF"
-  if [ "$AUTH" = guess ]; then set -- -auth guess; else set --; fi
-  x11vnc -display {display} "$@" -localhost -noipv6 -rfbport "$PORT" -passwdfile "rm:$PF" -shared -forever -xkb -repeat -noxdamage -norc -bg -o "$LOG" </dev/null >/dev/null 2>&1
+  x11vnc -display "$DISP" "$@" -localhost -noipv6 -rfbport "$PORT" -passwdfile "rm:$PF" -shared -forever -xkb -repeat -noxdamage -norc -bg -o "$LOG" </dev/null >/dev/null 2>&1
   for i in 1 2 3 4 5 6 7 8; do
     if listening "$PORT" lo; then
       PID=$(pgrep -f "rfbport $PORT" | head -1)
@@ -395,8 +420,10 @@ for AUTH in guess none; do
   done
   rm -f "$PF"
 done
+IFS=$OLDIFS
 echo ERR=START
 echo "UID=$(id -u)"
+echo "TRIED=$(printf '%s' "$AUTHS" | tr '\n' ' ')"
 # Keep the lines that explain why (auth/display/root), not just the generic help at the end.
 {{ grep -iE 'auth|xopendisplay|display|root|permission|refused|error|fail' "$LOG" | tail -n 6; tail -n 2 "$LOG"; }} 2>/dev/null
 exit 6"#
@@ -429,7 +456,12 @@ fn start_failure(output: &str) -> String {
     }
     let log = output
         .lines()
-        .filter(|l| !l.starts_with("ERR=") && !l.starts_with("UID="))
+        .filter(|l| {
+            !l.starts_with("ERR=")
+                && !l.starts_with("UID=")
+                && !l.starts_with("TRIED=")
+                && !l.starts_with("== try")
+        })
         .collect::<Vec<_>>()
         .join(" ");
     let lower = log.to_ascii_lowercase();
@@ -448,6 +480,17 @@ fn start_failure(output: &str) -> String {
         return format!(
             "{}x11vnc 无法打开开发板桌面（没有读取桌面授权的权限）：{}",
             ssh::SUDO_MARK,
+            log.trim()
+        );
+    }
+    let tried = output
+        .lines()
+        .find_map(|l| l.strip_prefix("TRIED="))
+        .map(str::trim)
+        .unwrap_or_default();
+    if as_root && !tried.is_empty() {
+        return format!(
+            "x11vnc 以 root 运行，试过这些 X 授权都打不开桌面：{tried}。请确认开发板桌面是 X11（不是 Wayland）且显示编号正确。日志：{}",
             log.trim()
         );
     }

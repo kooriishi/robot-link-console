@@ -97,7 +97,7 @@ pub fn get_host_info() -> Result<HostInfo, String> {
     })
 }
 
-fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
+pub(crate) fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
     let out = Command::new(program)
         .args(args)
         .output()
@@ -128,14 +128,37 @@ pub fn save_target(state: State<'_, AppState>, draft: TargetDraft) -> Result<Tar
         .id
         .filter(|id| Uuid::parse_str(id).is_ok())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let mut targets = state.load_targets()?;
+    let previous = targets.iter().find(|t| t.id == id).cloned();
+    let mut macs = previous
+        .as_ref()
+        .map(|t| t.macs.clone())
+        .unwrap_or_default();
+    if let Some(mac) = draft.mac.as_deref().and_then(normalize_mac) {
+        remember_mac(&mut macs, mac);
+    }
+    let interface = match draft.interface.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => {
+            validate_ifname(name)?;
+            Some(name.to_string())
+        }
+        _ => previous.as_ref().and_then(|t| t.interface.clone()),
+    };
     let target = Target {
         id,
         name: name.into(),
         host,
         port: draft.port,
         username,
+        macs,
+        interface,
+        // The key was installed for one account; another login user has to enable it again.
+        key_login: previous
+            .as_ref()
+            .is_some_and(|t| t.key_login && t.username == draft.username.trim()),
+        hostname: previous.as_ref().and_then(|t| t.hostname.clone()),
+        link: previous.as_ref().and_then(|t| t.link.clone()),
     };
-    let mut targets = state.load_targets()?;
     if let Some(existing) = targets.iter_mut().find(|t| t.id == target.id) {
         *existing = target.clone();
     } else {
@@ -181,7 +204,459 @@ pub fn trust_host_key(
 ) -> Result<bool, String> {
     let target = ssh::lookup_target(&state, &target_id)?;
     ssh::trust_host_key(&state, &target, &fingerprint)?;
+    // The user has just vouched for whatever answers at this address: remember its MAC so the
+    // board can be found again after its IP changes.
+    learn_mac(&state, &target);
     Ok(true)
+}
+
+const MAX_MACS: usize = 6;
+
+fn remember_mac(macs: &mut Vec<String>, mac: String) -> bool {
+    if macs.contains(&mac) {
+        return false;
+    }
+    if macs.len() >= MAX_MACS {
+        macs.remove(0);
+    }
+    macs.push(mac);
+    true
+}
+
+/// Records the MAC (and host interface) currently answering for the target's address. Only called
+/// when the device behind that address has been verified by its pinned SSH host key.
+fn learn_mac(state: &AppState, target: &Target) {
+    let Some((mac, interface)) = ssh::observed_mac(target) else {
+        return;
+    };
+    if target.macs.contains(&mac) && target.interface.as_deref() == Some(interface.as_str()) {
+        return;
+    }
+    let Ok(mut targets) = state.load_targets() else {
+        return;
+    };
+    if let Some(entry) = targets.iter_mut().find(|t| t.id == target.id) {
+        remember_mac(&mut entry.macs, mac);
+        entry.interface = Some(interface);
+        let _ = state.save_targets(&targets);
+    }
+}
+
+#[tauri::command(async)]
+pub fn get_channel_status(
+    state: State<'_, AppState>,
+    target_id: String,
+) -> Result<ChannelStatus, String> {
+    let target = ssh::lookup_target(&state, &target_id)?;
+    let status = ssh::channel_status(&state, &target);
+    if status.ready {
+        learn_mac(&state, &target);
+    }
+    Ok(status)
+}
+
+#[tauri::command(async)]
+pub fn drop_channel(state: State<'_, AppState>, target_id: String) -> Result<(), String> {
+    let target = ssh::lookup_target(&state, &target_id)?;
+    ssh::drop_channel(&state, &target);
+    Ok(())
+}
+
+/// Turns password-free background access on (installs RoboLink's public key over the session the
+/// user has already logged in with) or off (removes it again when the board is reachable).
+#[tauri::command(async)]
+pub fn set_key_login(
+    state: State<'_, AppState>,
+    target_id: String,
+    enabled: bool,
+) -> Result<Target, String> {
+    let target = ssh::lookup_target(&state, &target_id)?;
+    if enabled {
+        ssh::install_app_key(&state, &target)?;
+    } else if let Ok(key) = ssh::app_public_key(&state) {
+        let script = format!(
+            "f=\"$HOME/.ssh/authorized_keys\"; [ -f \"$f\" ] && grep -vxF {key} \"$f\" > \"$f.robolink\"; [ -f \"$f.robolink\" ] && cat \"$f.robolink\" > \"$f\"; rm -f \"$f.robolink\"",
+            key = ssh::shell_quote(&key)
+        );
+        let _ = ssh::remote_command(&state, &target, &script);
+    }
+    let mut targets = state.load_targets()?;
+    let entry = targets
+        .iter_mut()
+        .find(|t| t.id == target.id)
+        .ok_or("找不到所选机器人")?;
+    entry.key_login = enabled;
+    let updated = entry.clone();
+    state.save_targets(&targets)?;
+    if !enabled {
+        ssh::drop_channel(&state, &target);
+    }
+    Ok(updated)
+}
+
+fn move_target(
+    targets: &mut [Target],
+    index: usize,
+    address: Ipv4Addr,
+    interface: Option<&str>,
+) -> Option<TargetMove> {
+    let new_host = address.to_string();
+    let current = &targets[index];
+    if current.host == new_host || current.host.parse::<Ipv4Addr>().is_err() {
+        return None;
+    }
+    // Never create two entries for the same login.
+    if targets.iter().enumerate().any(|(i, t)| {
+        i != index && t.host == new_host && t.port == current.port && t.username == current.username
+    }) {
+        return None;
+    }
+    let entry = &mut targets[index];
+    let old_host = std::mem::replace(&mut entry.host, new_host.clone());
+    if let Some(interface) = interface {
+        entry.interface = Some(interface.to_string());
+    }
+    Some(TargetMove {
+        target_id: entry.id.clone(),
+        name: entry.name.clone(),
+        old_host,
+        new_host,
+        interface: entry.interface.clone(),
+    })
+}
+
+/// Follows boards whose IP changed: a discovered device whose MAC belongs to a saved robot updates
+/// that robot's address. The pinned host key still decides at connect time whether it is the same
+/// board, so a spoofed MAC cannot get any further than a "host key changed" refusal.
+fn apply_seen_devices(targets: &mut [Target], seen: &[SeenDevice]) -> Vec<TargetMove> {
+    let mut moves = Vec::new();
+    for index in 0..targets.len() {
+        if targets[index].macs.is_empty() {
+            continue;
+        }
+        let matches = seen
+            .iter()
+            .filter_map(|device| {
+                let mac = normalize_mac(&device.mac)?;
+                let address = device.address.parse::<Ipv4Addr>().ok()?;
+                targets[index]
+                    .macs
+                    .contains(&mac)
+                    .then_some((address, device.interface.as_str()))
+            })
+            .collect::<Vec<_>>();
+        // Still visible at its saved address (possibly next to a second address): nothing to do.
+        if matches.is_empty()
+            || matches
+                .iter()
+                .any(|(address, _)| address.to_string() == targets[index].host)
+        {
+            continue;
+        }
+        let (address, interface) = matches[0];
+        let interface = validate_ifname(interface).is_ok().then_some(interface);
+        if let Some(moved) = move_target(targets, index, address, interface) {
+            moves.push(moved);
+        }
+    }
+    moves
+}
+
+#[tauri::command(async)]
+pub fn sync_targets_with_discovery(
+    state: State<'_, AppState>,
+    seen: Vec<SeenDevice>,
+) -> Result<Vec<TargetMove>, String> {
+    if seen.len() > 512 {
+        return Err("发现结果过多".into());
+    }
+    let mut targets = state.load_targets()?;
+    let moves = apply_seen_devices(&mut targets, &seen);
+    if !moves.is_empty() {
+        state.save_targets(&targets)?;
+    }
+    Ok(moves)
+}
+
+/// Unprivileged "where did the board go": nudges every address of the directly connected subnets so
+/// the kernel resolves them, then looks for the robot's MAC in the neighbour table.
+#[tauri::command(async)]
+pub fn relocate_target(
+    state: State<'_, AppState>,
+    target_id: String,
+) -> Result<Option<TargetMove>, String> {
+    let target = ssh::lookup_target(&state, &target_id)?;
+    if let Some(moved) = relocate_by_ipv4(&state, &target)? {
+        return Ok(Some(moved));
+    }
+    // The robot may have left its IPv4 subnet altogether (or the PC lost its address there): its
+    // MAC still answers on the IPv6 all-nodes group.
+    Ok(crate::link::relocate_by_link_local(&state, &target))
+}
+
+fn relocate_by_ipv4(state: &AppState, target: &Target) -> Result<Option<TargetMove>, String> {
+    if target.macs.is_empty() || target.host.parse::<Ipv4Addr>().is_err() {
+        return Ok(None);
+    }
+    let host = get_host_info()?;
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    let _ = socket.set_nonblocking(true);
+    let mut sent = 0usize;
+    for interface in host
+        .interfaces
+        .iter()
+        .filter(|item| item.carrier && item.kind != "其他")
+    {
+        for cidr in &interface.ipv4 {
+            let Some((ip, prefix)) = cidr.split_once('/') else {
+                continue;
+            };
+            let (Ok(ip), Ok(prefix)) = (ip.parse::<Ipv4Addr>(), prefix.parse::<u32>()) else {
+                continue;
+            };
+            // Larger subnets (and 169.254/16) would mean tens of thousands of probes.
+            if !(22..=30).contains(&prefix) {
+                continue;
+            }
+            let mask = u32::MAX << (32 - prefix);
+            let base = u32::from(ip) & mask;
+            for offset in 1..(!mask) {
+                let candidate = Ipv4Addr::from(base | offset);
+                if candidate != ip {
+                    let _ = socket.send_to(&[0], SocketAddrV4::new(candidate, 9));
+                    sent += 1;
+                    if sent % 64 == 0 {
+                        thread::sleep(Duration::from_millis(15));
+                    }
+                }
+            }
+        }
+    }
+    if sent > 0 {
+        thread::sleep(Duration::from_millis(1300));
+    }
+    let rows = Command::new("ip")
+        .args(["-j", "-4", "neigh", "show"])
+        .output()
+        .ok()
+        .and_then(|out| serde_json::from_slice::<Vec<Value>>(&out.stdout).ok())
+        .unwrap_or_default();
+    let seen = fresh_neighbors(&rows);
+    let mut targets = state.load_targets()?;
+    let moves = apply_seen_devices(&mut targets, &seen);
+    if moves.is_empty() {
+        return Ok(None);
+    }
+    state.save_targets(&targets)?;
+    let Some(moved) = moves.into_iter().find(|m| m.target_id == target.id) else {
+        return Ok(None);
+    };
+    ssh::drop_channel(state, target);
+    Ok(Some(moved))
+}
+
+/// Neighbours that answered just now. STALE/DELAY entries are leftovers that prove nothing.
+fn fresh_neighbors(rows: &[Value]) -> Vec<SeenDevice> {
+    rows.iter()
+        .filter_map(|row| {
+            let reachable = row
+                .get("state")
+                .and_then(Value::as_array)
+                .is_some_and(|states| states.iter().any(|s| s.as_str() == Some("REACHABLE")));
+            reachable.then(|| {
+                Some(SeenDevice {
+                    address: row.get("dst")?.as_str()?.to_string(),
+                    mac: row.get("lladdr")?.as_str()?.to_string(),
+                    interface: row.get("dev")?.as_str()?.to_string(),
+                })
+            })?
+        })
+        .collect()
+}
+
+/// One-click direct link: lets the helper pick a free local address next to the discovered board.
+#[tauri::command(async)]
+pub fn auto_direct_address(
+    state: State<'_, AppState>,
+    interface: String,
+    peer: String,
+    prefix: Option<u8>,
+    avoid: Option<Vec<String>>,
+) -> Result<AutoAddress, String> {
+    validate_ifname(&interface)?;
+    let peer_ip = peer
+        .parse::<Ipv4Addr>()
+        .map_err(|_| "候选设备必须是 IPv4 地址".to_string())?;
+    let mut arguments = vec![
+        "add-address-auto".to_string(),
+        interface.clone(),
+        peer_ip.to_string(),
+    ];
+    // The robot told us its real prefix and which addresses it already uses.
+    if let Some(prefix) = prefix.filter(|p| (16..=30).contains(p)) {
+        arguments.push(prefix.to_string());
+        let avoid = avoid
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
+            .take(200)
+            .map(|ip| ip.to_string())
+            .collect::<Vec<_>>();
+        if !avoid.is_empty() {
+            arguments.push(avoid.join(","));
+        }
+    }
+    let output = run_network_helper(&arguments)?;
+    let reply: Value = output
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str(line).ok())
+        .ok_or("网络助手没有返回地址")?;
+    let cidr = reply
+        .get("cidr")
+        .and_then(Value::as_str)
+        .ok_or("网络助手没有返回地址")?
+        .to_string();
+    let existing = reply
+        .get("existing")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let host_route = reply
+        .get("hostRoute")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut owned = state.load_network_addresses()?;
+    if !existing {
+        owned.retain(|item| item.interface != interface || item.cidr != cidr);
+        owned.push(OwnedNetworkAddress {
+            interface: interface.clone(),
+            cidr: cidr.clone(),
+            peer: peer_ip.to_string(),
+            persistent: false,
+        });
+        if let Err(error) = state.save_network_addresses(&owned) {
+            let _ = run_network_helper(&["remove-address".into(), interface, cidr]);
+            return Err(format!(
+                "网络地址已添加，但无法记录归属；已尝试立即撤销：{error}"
+            ));
+        }
+    }
+    Ok(AutoAddress {
+        interface,
+        cidr,
+        peer: peer_ip.to_string(),
+        existing,
+        host_route,
+        owned,
+    })
+}
+
+/// Reboots or powers off the board. The command is detached so the SSH call returns before the
+/// link goes down.
+#[tauri::command(async)]
+pub fn power_action(
+    state: State<'_, AppState>,
+    target_id: String,
+    action: String,
+    sudo_password: Option<String>,
+) -> Result<String, String> {
+    let verb = match action.as_str() {
+        "reboot" => "reboot",
+        "poweroff" => "poweroff",
+        _ => return Err("不支持的电源操作".into()),
+    };
+    let target = ssh::lookup_target(&state, &target_id)?;
+    let detached = format!("nohup sh -c 'sleep 1; systemctl {verb}' >/dev/null 2>&1 &");
+    let has_password = sudo_password.as_deref().is_some_and(|p| !p.is_empty());
+    let script = if has_password {
+        detached
+    } else {
+        format!(
+            "if [ \"$(id -u)\" = 0 ]; then {detached}\nelif sudo -n true 2>/dev/null; then sudo -n sh -c {quoted}\nelse echo 'interactive authentication required' >&2; exit 1; fi",
+            quoted = ssh::shell_quote(&detached)
+        )
+    };
+    ssh::remote_command_with(&state, &target, &script, sudo_options(&sudo_password))?;
+    Ok(if verb == "reboot" {
+        "已让开发板重启".into()
+    } else {
+        "已让开发板关机".into()
+    })
+}
+
+const DIAGNOSTICS_SCRIPT: &str = r#"
+s() { printf '\n===== %s =====\n' "$1"; }
+r() { if [ "$(id -u)" = 0 ]; then "$@"; elif sudo -n true 2>/dev/null; then sudo -n "$@"; else "$@"; fi; }
+export LC_ALL=C
+s "基本信息"; date; uname -a; uptime; (grep -E '^(PRETTY_NAME|VERSION)=' /etc/os-release) 2>&1
+s "磁盘 df -h"; df -h 2>&1
+s "内存 free -m"; free -m 2>&1
+s "温度"; for z in /sys/class/thermal/thermal_zone*; do [ -r "$z/temp" ] && echo "$(cat "$z/type" 2>/dev/null): $(cat "$z/temp")"; done 2>&1
+s "ip a"; ip a 2>&1
+s "ip route"; ip route 2>&1
+s "nmcli device"; nmcli device status 2>&1
+s "nmcli connection"; nmcli -f NAME,TYPE,DEVICE,STATE connection show 2>&1
+s "rfkill"; rfkill list 2>&1
+s "失败的服务"; systemctl --failed --no-pager 2>&1
+s "dmesg（最后 200 行）"; r dmesg 2>&1 | tail -n 200
+s "journalctl -b（最后 400 行）"; r journalctl -b -n 400 --no-pager 2>&1
+exit 0
+"#;
+
+/// Collects the usual "what is wrong with this board" outputs into one text file on this PC.
+#[tauri::command(async)]
+pub fn collect_diagnostics(
+    state: State<'_, AppState>,
+    target_id: String,
+    sudo_password: Option<String>,
+) -> Result<DiagnosticsReport, String> {
+    let target = ssh::lookup_target(&state, &target_id)?;
+    let mut options = sudo_options(&sudo_password);
+    options.timeout_secs = Some(60);
+    let body = ssh::remote_command_with(&state, &target, DIAGNOSTICS_SCRIPT, options)?;
+    let stamp = command_text("date", &["+%Y%m%d-%H%M%S"]).unwrap_or_else(|_| "report".into());
+    let safe_name = target
+        .name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(40)
+        .collect::<String>();
+    let directory = dirs::home_dir()
+        .ok_or("找不到用户主目录")?
+        .join("RoboLink-diagnostics");
+    fs::create_dir_all(&directory).map_err(|e| format!("无法创建诊断目录：{e}"))?;
+    let path = directory.join(format!("{safe_name}-{stamp}.txt"));
+    let header = format!(
+        "RoboLink 诊断报告\n设备：{}（{}@{}:{}）\n",
+        target.name, target.username, target.host, target.port
+    );
+    let contents = format!("{header}{body}");
+    fs::write(&path, &contents).map_err(|e| format!("写入诊断文件失败：{e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    let preview = if contents.chars().count() > 30_000 {
+        let tail = contents
+            .chars()
+            .skip(contents.chars().count() - 30_000)
+            .collect::<String>();
+        format!("…（只显示最后一部分，完整内容见文件）\n{tail}")
+    } else {
+        contents.clone()
+    };
+    Ok(DiagnosticsReport {
+        path: path.display().to_string(),
+        bytes: contents.len(),
+        preview,
+    })
 }
 
 #[tauri::command(async)]
@@ -425,7 +900,7 @@ fn trusted_network_helper() -> Result<std::path::PathBuf, String> {
     Ok(helper)
 }
 
-fn run_network_helper(arguments: &[String]) -> Result<String, String> {
+pub(crate) fn run_network_helper(arguments: &[String]) -> Result<String, String> {
     let helper = trusted_network_helper()?;
     let output = Command::new("/usr/bin/pkexec")
         .arg(helper)
@@ -520,7 +995,7 @@ fn route_details(address: &str, interface: &str) -> Option<String> {
 /// Interface the kernel actually uses for this address. Unlike `ip route get ... oif`, this shows
 /// when a candidate would leave through Wi-Fi or another NIC, which is the usual reason a discovered
 /// board still cannot be reached over the direct cable.
-fn route_interface(address: &str) -> Option<String> {
+pub(crate) fn route_interface(address: &str) -> Option<String> {
     let ip = address
         .split('%')
         .next()
@@ -966,7 +1441,7 @@ pub fn discover_direct_devices(
     }
     for (address, dev) in wrong_route {
         report.warnings.push(format!(
-            "候选 {address} 的流量目前会经 {dev}，不是扫描到它的直连网卡；请在该候选上“配置本机 IP 后添加”，让直连网卡拥有同网段地址后再连接。"
+            "候选 {address} 的流量目前会经 {dev}，不是扫描到它的直连网卡；点该候选上的“自动配置本机 IP 并添加”即可：RoboLink 会只给这台设备加一条走直连网卡的主机路由，不影响 {dev} 上的其他网络。"
         ));
     }
     Ok(report)
@@ -2315,6 +2790,81 @@ pub fn close_ssh_terminal(state: State<'_, AppState>, session_id: String) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn robot(id: &str, host: &str, macs: &[&str]) -> Target {
+        Target {
+            id: id.into(),
+            name: id.into(),
+            host: host.into(),
+            port: 22,
+            username: "robot".into(),
+            macs: macs.iter().map(|m| m.to_string()).collect(),
+            interface: None,
+            key_login: false,
+            hostname: None,
+            link: None,
+        }
+    }
+
+    fn seen(address: &str, mac: &str) -> SeenDevice {
+        SeenDevice {
+            address: address.into(),
+            mac: mac.into(),
+            interface: "enp3s0".into(),
+        }
+    }
+
+    #[test]
+    fn a_known_mac_at_a_new_address_moves_the_robot() {
+        let mut targets = vec![
+            robot("a", "192.168.1.10", &["aa:bb:cc:00:00:01"]),
+            robot("b", "192.168.1.20", &["aa:bb:cc:00:00:02"]),
+            robot("c", "board.local", &["aa:bb:cc:00:00:03"]),
+            robot("d", "192.168.1.40", &[]),
+        ];
+        let moves = apply_seen_devices(
+            &mut targets,
+            &[
+                seen("10.42.0.57", "AA:BB:CC:00:00:01"),
+                // b is still at its saved address and merely has a second one.
+                seen("192.168.1.20", "aa:bb:cc:00:00:02"),
+                seen("169.254.3.4", "aa:bb:cc:00:00:02"),
+                // Host names are the user's choice and never rewritten.
+                seen("10.42.0.99", "aa:bb:cc:00:00:03"),
+            ],
+        );
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].target_id, "a");
+        assert_eq!(moves[0].old_host, "192.168.1.10");
+        assert_eq!(targets[0].host, "10.42.0.57");
+        assert_eq!(targets[0].interface.as_deref(), Some("enp3s0"));
+        assert_eq!(targets[1].host, "192.168.1.20");
+        assert_eq!(targets[2].host, "board.local");
+    }
+
+    #[test]
+    fn a_move_never_duplicates_another_robot() {
+        let mut targets = vec![
+            robot("a", "192.168.1.10", &["aa:bb:cc:00:00:01"]),
+            robot("b", "192.168.1.20", &[]),
+        ];
+        let moves = apply_seen_devices(&mut targets, &[seen("192.168.1.20", "aa:bb:cc:00:00:01")]);
+        assert!(moves.is_empty());
+        assert_eq!(targets[0].host, "192.168.1.10");
+    }
+
+    #[test]
+    fn only_reachable_neighbours_count_as_seen() {
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[{"dst":"10.0.0.2","dev":"eth0","lladdr":"aa:bb:cc:00:00:01","state":["REACHABLE"]},
+                {"dst":"10.0.0.3","dev":"eth0","lladdr":"aa:bb:cc:00:00:02","state":["STALE"]},
+                {"dst":"10.0.0.4","dev":"eth0","state":["FAILED"]}]"#,
+        )
+        .unwrap();
+        let seen = fresh_neighbors(&rows);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].address, "10.0.0.2");
+    }
     #[test]
     fn wifi_scan_keeps_cached_rows_when_rescan_is_refused() {
         let ok = parse_wifi_scan("APS\n*:Lab\\:Robot:80:WPA2\n:Guest:40:\n");

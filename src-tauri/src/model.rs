@@ -9,6 +9,47 @@ pub struct Target {
     pub host: String,
     pub port: u16,
     pub username: String,
+    /// MAC addresses this device has been seen with (wired NIC, USB NIC, Wi-Fi…). The device, not its
+    /// current IP, is the identity: discovery uses these to follow the board to a new address.
+    #[serde(default)]
+    pub macs: Vec<String>,
+    /// Local interface the device was last reached through.
+    #[serde(default)]
+    pub interface: Option<String>,
+    /// RoboLink's own SSH key has been installed on the device, so background commands do not need
+    /// the interactive terminal's login.
+    #[serde(default)]
+    pub key_login: bool,
+    /// Host name the device answered with (mDNS / `hostname`). Robots built from one image share
+    /// their SSH host key, so the host name is what tells them apart.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// How the cabled link to this robot was set up (see link_ipv4.rs), remembered for next time.
+    #[serde(default)]
+    pub link: Option<LinkRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkRecord {
+    /// The robot's IPv6 link-local address on the cabled port (without the zone).
+    pub link_local: String,
+    /// This PC's interface the cable is in.
+    pub pc_interface: String,
+    /// The robot's NIC that owns the link-local address.
+    #[serde(default)]
+    pub robot_device: Option<String>,
+    /// IPv4/prefix the robot has on that NIC, if any.
+    #[serde(default)]
+    pub ipv4: Option<String>,
+    /// "existing" | "dhcp" | "temporary" | "ipv6".
+    pub source: String,
+    /// Address RoboLink added on the robot with `ip addr add`; gone after the robot reboots.
+    #[serde(default)]
+    pub temp_cidr: Option<String>,
+    /// `Host` alias RoboLink wrote to ~/.ssh/config for the link-local address.
+    #[serde(default)]
+    pub ssh_alias: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -19,6 +60,61 @@ pub struct TargetDraft {
     pub host: String,
     pub port: u16,
     pub username: String,
+    #[serde(default)]
+    pub mac: Option<String>,
+    #[serde(default)]
+    pub interface: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelStatus {
+    /// A host key is pinned for this device.
+    pub pinned: bool,
+    /// Background commands can run right now.
+    pub ready: bool,
+    /// "session" (terminal login is being reused), "key" (RoboLink key) or "none".
+    pub via: String,
+    pub key_login: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetMove {
+    pub target_id: String,
+    pub name: String,
+    pub old_host: String,
+    pub new_host: String,
+    pub interface: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeenDevice {
+    pub address: String,
+    pub mac: String,
+    pub interface: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoAddress {
+    pub interface: String,
+    pub cidr: String,
+    pub peer: String,
+    /// The interface already had an address in the peer's subnet; nothing was added.
+    pub existing: bool,
+    /// The board's subnet is routed through another NIC; only a /32 route to the board was added.
+    pub host_route: bool,
+    pub owned: Vec<crate::state::OwnedNetworkAddress>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsReport {
+    pub path: String,
+    pub bytes: usize,
+    pub preview: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -141,6 +237,11 @@ pub struct HostKeyStatus {
     pub pinned_fingerprints: Vec<String>,
     pub trusted: bool,
     pub changed: bool,
+    /// MAC currently answering at the target address (direct links only).
+    pub observed_mac: Option<String>,
+    /// The address is now answered by a MAC this device was never seen with: most likely another
+    /// board took over the IP.
+    pub other_device: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -250,6 +351,31 @@ pub struct AudioSnapshot {
     pub default_sink_volume: Option<u8>,
     pub default_source_volume: Option<u8>,
     pub note: Option<String>,
+}
+
+/// Lower-case `aa:bb:cc:dd:ee:ff`, rejecting broadcast/multicast/zero addresses.
+pub fn normalize_mac(value: &str) -> Option<String> {
+    let parts = value.trim().split(':').collect::<Vec<_>>();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut bytes = [0_u8; 6];
+    for (slot, part) in bytes.iter_mut().zip(&parts) {
+        if part.len() != 2 {
+            return None;
+        }
+        *slot = u8::from_str_radix(part, 16).ok()?;
+    }
+    if bytes == [0; 6] || bytes == [0xff; 6] || bytes[0] & 1 == 1 {
+        return None;
+    }
+    Some(
+        bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
 }
 
 pub fn validate_host(value: &str) -> Result<String, String> {

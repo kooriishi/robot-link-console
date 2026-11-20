@@ -1,5 +1,7 @@
 mod commands;
 mod desktop;
+mod link;
+mod link_ipv4;
 mod model;
 mod ssh;
 mod state;
@@ -7,11 +9,19 @@ mod state;
 use state::AppState;
 use tauri::Manager;
 
+pub fn askpass_main(socket: &str) -> ! {
+    ssh::askpass_main(socket)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let state = AppState::new().map_err(std::io::Error::other)?;
+            // Host-key pins used to be stored per address; they now belong to the device.
+            if let Err(error) = ssh::migrate_pins(&state) {
+                eprintln!("RoboLink: 迁移主机指纹失败：{error}");
+            }
             app.manage(state);
             Ok(())
         })
@@ -24,6 +34,25 @@ pub fn run() {
             commands::trust_host_key,
             commands::forget_host_key,
             commands::ssh_connection_ready,
+            commands::get_channel_status,
+            link::find_link_peers,
+            link::link_prepare,
+            link::link_login,
+            link::link_robot_ipv4,
+            link::link_finish,
+            link_ipv4::link_ipv4_probe,
+            link_ipv4::link_ipv4_dhcp,
+            link_ipv4::link_ipv4_propose,
+            link_ipv4::link_ipv4_temp_add,
+            link_ipv4::link_ipv4_temp_remove,
+            link_ipv4::link_use_ipv6,
+            commands::drop_channel,
+            commands::set_key_login,
+            commands::sync_targets_with_discovery,
+            commands::relocate_target,
+            commands::auto_direct_address,
+            commands::power_action,
+            commands::collect_diagnostics,
             commands::scan_direct_interface,
             commands::scan_direct_interfaces,
             commands::discover_direct_devices,

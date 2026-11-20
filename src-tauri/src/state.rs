@@ -31,6 +31,8 @@ pub struct AppState {
     pub pins_file: PathBuf,
     pub known_hosts_file: PathBuf,
     pub network_addresses_file: PathBuf,
+    /// RoboLink's own SSH key pair (private key 0600, never leaves this machine).
+    pub identity_file: PathBuf,
     pub sessions: Mutex<HashMap<String, TerminalSession>>,
     persistence_lock: Mutex<()>,
 }
@@ -48,6 +50,7 @@ impl AppState {
             pins_file: config_dir.join("host-pins.json"),
             known_hosts_file: config_dir.join("known_hosts"),
             network_addresses_file: config_dir.join("owned-network-addresses.json"),
+            identity_file: config_dir.join("id_ed25519"),
             config_dir,
             sessions: Mutex::new(HashMap::new()),
             persistence_lock: Mutex::new(()),

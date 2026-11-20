@@ -911,3 +911,86 @@ html[data-theme] .content-wrap { padding-bottom: 36px; }
   html[data-theme] .runtime-tag { font-size: 11px; padding: 5px 9px; }
   html[data-theme] .button { font-size: 12px; padding: 7px 12px; }
 }
+
+/* ---------- 0.7.0: one-click link, recovery banner, diagnostics ---------- */
+html[data-theme] .inline-progress {
+  display: flex; align-items: center; gap: 10px;
+  margin: 0 0 14px; padding: 13px 14px;
+  border-radius: var(--a-radius-md);
+  background: var(--a-accent-soft); color: var(--a-ink-2);
+  font-size: 13px; line-height: 1.5;
+}
+html[data-theme] .inline-progress > svg { flex: none; color: var(--a-accent); }
+html[data-theme] .inline-progress > span { flex: 1; min-width: 0; }
+html[data-theme] .inline-progress button {
+  flex: none; border: 0; background: transparent; padding: 0;
+  color: var(--a-accent); font-size: 12px; cursor: pointer;
+}
+html[data-theme] .inline-progress button:hover { text-decoration: underline; text-underline-offset: 3px; }
+html[data-theme] .connection-footer .footer-actions { display: inline-flex; align-items: center; gap: 18px; }
+html[data-theme] .connection-footer .footer-actions svg { color: currentColor; }
+html[data-theme] .connection-footer button:disabled { opacity: .45; cursor: default; text-decoration: none; }
+html[data-theme] .first-run-actions { display: inline-flex; gap: 8px; flex-wrap: wrap; }
+html[data-theme] .logs-toolbar .inline-actions { margin-top: 0; }
+html[data-theme] .modal-card.diagnostics-modal { width: min(860px, 100%); }
+html[data-theme] .diagnostics-preview {
+  margin: 12px 0 0; padding: 14px; max-height: 52vh; overflow: auto;
+  border-radius: var(--a-radius-md); background: #1d1d1f; color: #f5f5f7;
+  font-family: var(--a-mono); font-size: 12px; line-height: 1.55;
+  white-space: pre-wrap; word-break: break-word;
+}
+html[data-theme] .diagnostics-modal .modal-intro code { word-break: break-all; }
+html[data-theme] .discovered-copy small.requested-note { color: var(--a-orange-text); }
+
+/* ---------- 0.8.0: find robots over IPv6 link-local ---------- */
+html[data-theme] .link-finder .panel-heading { align-items: center; }
+html[data-theme] .link-finder-sub { margin: 4px 0 0; color: var(--a-muted); font-size: 13px; line-height: 1.5; }
+html[data-theme] .link-peers { display: flex; flex-direction: column; margin-top: 14px; }
+html[data-theme] .link-peer {
+  display: flex; align-items: center; gap: 14px; padding: 14px 0;
+  border-top: 1px solid var(--a-divider);
+}
+html[data-theme] .link-peer-icon {
+  flex: none; width: 38px; height: 38px; border-radius: 11px; display: grid; place-items: center;
+  background: var(--a-fill); color: var(--a-muted);
+}
+html[data-theme] .link-peer.robot .link-peer-icon { background: var(--a-accent-soft); color: var(--a-accent); }
+html[data-theme] .link-peer-copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+html[data-theme] .link-peer-copy strong { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 15px; font-weight: 600; color: var(--a-ink); }
+html[data-theme] .link-peer-copy small { color: var(--a-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+html[data-theme] .current-badge.muted-badge { background: var(--a-fill); color: var(--a-muted); }
+html[data-theme] .legacy-scan { margin-top: 16px; border-top: 1px solid var(--a-divider); padding-top: 12px; }
+html[data-theme] .legacy-scan > summary { cursor: pointer; color: var(--a-muted); font-size: 13px; font-weight: 600; list-style-position: inside; }
+html[data-theme] .legacy-scan-body { display: flex; flex-direction: column; gap: 14px; margin-top: 14px; }
+html[data-theme] .link-dialog .link-facts { margin: 12px 0 4px; }
+html[data-theme] .link-dialog .inline-progress,
+html[data-theme] .link-dialog .inline-error { margin: 12px 0 0; }
+
+/* ---------- 0.8.3: get-robot-IPv4 wizard ---------- */
+html[data-theme] .wizard-steps { list-style: none; margin: 14px 0 0; padding: 0; display: flex; flex-direction: column; }
+html[data-theme] .wizard-step { position: relative; display: flex; gap: 12px; padding: 0 0 14px; }
+html[data-theme] .wizard-step:not(:last-child)::before {
+  content: ''; position: absolute; left: 11px; top: 26px; bottom: 2px; width: 1px; background: var(--a-divider);
+}
+html[data-theme] .wizard-icon {
+  flex: none; width: 23px; height: 23px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--a-fill); color: var(--a-muted); font-size: 11px; font-weight: 600;
+}
+html[data-theme] .wizard-step.running .wizard-icon { background: var(--a-accent-soft); color: var(--a-accent); }
+html[data-theme] .wizard-step.done .wizard-icon { background: rgba(52, 199, 89, .14); color: #248a3d; }
+html[data-theme] .wizard-step.fail .wizard-icon { background: rgba(255, 59, 48, .12); color: #d70015; }
+html[data-theme] .wizard-dash { width: 8px; height: 1.5px; border-radius: 1px; background: currentColor; }
+html[data-theme] .wizard-copy { display: flex; flex-direction: column; gap: 3px; min-width: 0; padding-top: 2px; }
+html[data-theme] .wizard-copy strong { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--a-ink); }
+html[data-theme] .wizard-step.pending .wizard-copy strong,
+html[data-theme] .wizard-step.skip .wizard-copy strong { color: var(--a-muted); font-weight: 500; }
+html[data-theme] .wizard-copy small { color: var(--a-muted); font-size: 12px; line-height: 1.5; word-break: break-all; }
+html[data-theme] .wizard-step.fail .wizard-copy small { color: #d70015; }
+html[data-theme] .wizard-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 4px; }
+html[data-theme] .wizard-ipv6 { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+html[data-theme] .wizard-ipv6 code { display: block; padding: 7px 10px; border-radius: 8px; background: var(--a-fill); font-size: 12px; overflow-x: auto; white-space: nowrap; }
+html[data-theme] .temp-address-strip { display: flex; align-items: center; gap: 10px; padding: 12px 18px; font-size: 13px; color: var(--a-ink); }
+html[data-theme] .temp-address-strip .current-badge { margin-left: 8px; }
+html[data-theme] .temp-dialog-text { margin: 4px 0 8px; font-size: 14px; line-height: 1.6; color: var(--a-ink); }
+html[data-theme="dark"] .wizard-step.done .wizard-icon { color: #30d158; }
+html[data-theme="dark"] .wizard-step.fail .wizard-icon, html[data-theme="dark"] .wizard-step.fail .wizard-copy small { color: #ff6961; }
